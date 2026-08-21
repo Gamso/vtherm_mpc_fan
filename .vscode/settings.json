@@ -1,0 +1,20 @@
+{
+    "[python]": {
+        "editor.defaultFormatter": "ms-python.black-formatter",
+        "editor.formatOnSave": true,
+        "editor.formatOnSaveMode": "modifications"
+    },
+    "files.associations": {
+        "*.yaml": "home-assistant"
+    },
+    "python.testing.pytestArgs": [
+        "-vv"
+    ],
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": true,
+    "python.analysis.extraPaths": [
+        //    "/home/vscode/core",
+        "/workspaces/vtherm_mpc_fan/custom_components/vtherm_mpc_fan",
+        "/home/vscode/.local/lib/python3.13/site-packages/homeassistant"
+    ]
+}

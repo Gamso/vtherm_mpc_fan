@@ -1,0 +1,182 @@
+# Dev Home Assistant configuration for the VTherm MPC Fan plugin.
+#
+# What this builds:
+#   climate.mock_ac      a fake AC exposing five manual fan speeds
+#   sensor.room_temp     the simulated room, driven by the thermal model below
+#   sensor.outdoor_temp  the outdoor conditions the room leaks towards
+#   climate.mock_room    a Versatile Thermostat over_climate on the mock AC
+#   -> this plugin, attached to that VTherm
+#
+# The last two are config-entry integrations and cannot be declared in YAML, so
+# `dev_bootstrap` below creates them through Home Assistant's config-entry API
+# on first start. Delete them in the UI and they come back on the next restart;
+# edit them and the edits are kept.
+
+default_config:
+
+# Dev-only: creates the VTherm over climate.mock_ac and attaches this plugin to
+# it, so a fresh container is a running controller rather than two UI steps.
+dev_bootstrap:
+
+logger:
+  default: warning
+  logs:
+    custom_components.vtherm_mpc_fan: debug
+    custom_components.versatile_thermostat: info
+
+# doc: https://www.home-assistant.io/integrations/debugpy/
+debugpy:
+  start: true
+  wait: false
+  port: 5678
+
+input_number:
+  # Written by the thermal model below; also draggable to inject a disturbance.
+  sim_room_temp:
+    name: "Simulated Room Temperature"
+    initial: 24.0
+    min: 10
+    max: 40
+    step: 0.01
+    unit_of_measurement: "°C"
+    mode: box
+
+  sim_outdoor_temp:
+    name: "Simulated Outdoor Temperature"
+    initial: 32.0
+    min: -10
+    max: 45
+    step: 0.1
+    unit_of_measurement: "°C"
+
+  # Setpoint the mock AC has been told to hold. VTherm writes it through
+  # climate.set_temperature; the thermal model reads it back.
+  sim_ac_setpoint:
+    name: "Mock AC Setpoint"
+    initial: 22.0
+    min: 16
+    max: 30
+    step: 0.1
+    unit_of_measurement: "°C"
+
+  # Envelope conductance, in 1/h. The room leaks towards outdoor at this rate,
+  # so a weak fan genuinely fails to hold the setpoint on a hot day -- which is
+  # what makes the fan ladder worth learning at all.
+  sim_k_env:
+    name: "Simulated Envelope Conductance"
+    initial: 0.08
+    min: 0.0
+    max: 0.5
+    step: 0.01
+
+input_select:
+  sim_hvac_mode:
+    name: "Mock AC HVAC Mode"
+    options: ["off", "cool", "heat", "fan_only", "dry"]
+    initial: "cool"
+  sim_fan_mode:
+    name: "Mock AC Fan Mode"
+    options: ["auto", "silent", "low", "medium", "high", "turbo"]
+    initial: "medium"
+
+template:
+  - sensor:
+      - name: "Room Temp"
+        unique_id: sim_room_temp_sensor
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state_class: measurement
+        state: "{{ states('input_number.sim_room_temp') | float(24.0) | round(2) }}"
+
+      - name: "Outdoor Temp"
+        unique_id: sim_outdoor_temp_sensor
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state_class: measurement
+        state: "{{ states('input_number.sim_outdoor_temp') | float(32.0) | round(2) }}"
+
+      # The cooling power the mock AC currently delivers, in °C/h. Exposed as a
+      # sensor so the ladder the plugin is supposed to learn can be compared
+      # against the ladder actually being simulated.
+      - name: "Sim Cooling Power"
+        unique_id: sim_cooling_power
+        unit_of_measurement: "°C/h"
+        state_class: measurement
+        state: >
+          {% set rates = {
+              'silent': 0.15, 'low': 0.35, 'medium': 0.60,
+              'high': 0.90, 'turbo': 1.30, 'auto': 0.60 } %}
+          {% set fan = states('input_select.sim_fan_mode') %}
+          {% set room = states('input_number.sim_room_temp') | float(24.0) %}
+          {% set setpoint = states('input_number.sim_ac_setpoint') | float(22.0) %}
+          {% if states('input_select.sim_hvac_mode') != 'cool' %}
+            0
+          {% elif room <= setpoint - 0.1 %}
+            0
+          {% else %}
+            {{ -(rates.get(fan, 0.6)) }}
+          {% endif %}
+
+climate:
+  - platform: climate_template
+    name: Mock AC
+    unique_id: mock_ac
+    modes: ["off", "cool", "heat", "fan_only", "dry"]
+    fan_modes: ["auto", "silent", "low", "medium", "high", "turbo"]
+    min_temp: 16
+    max_temp: 30
+    precision: 0.1
+    temp_step: 0.1
+
+    current_temperature_template: "{{ states('sensor.room_temp') }}"
+    target_temperature_template: "{{ states('input_number.sim_ac_setpoint') | float(22) }}"
+    hvac_mode_template: "{{ states('input_select.sim_hvac_mode') }}"
+    fan_mode_template: "{{ states('input_select.sim_fan_mode') }}"
+
+    set_temperature:
+      service: input_number.set_value
+      data:
+        entity_id: input_number.sim_ac_setpoint
+        value: "{{ temperature }}"
+
+    set_hvac_mode:
+      service: input_select.select_option
+      data:
+        entity_id: input_select.sim_hvac_mode
+        option: "{{ hvac_mode }}"
+
+    set_fan_mode:
+      service: input_select.select_option
+      data:
+        entity_id: input_select.sim_fan_mode
+        option: "{{ fan_mode }}"
+
+automation:
+  # Thermal model, ticked every 30 s:
+  #   dT/dt = k_env * (T_outdoor - T_room) + cooling(fan)
+  #
+  # The fan ladder is deliberately spaced so the weak speeds cannot hold the
+  # setpoint against the envelope on a 32 °C day: at k_env=0.08 the room leaks
+  # ~0.64 °C/h across an 8 °C gap, which `silent` (0.15) and `low` (0.35) lose to
+  # while `high` (0.90) wins. That is exactly the situation the MPC's step-down
+  # guard exists for, so the bench reproduces it instead of making every speed
+  # adequate.
+  - alias: "Simulate room thermal response"
+    id: sim_thermal_model
+    mode: single
+    trigger:
+      - platform: time_pattern
+        seconds: "/30"
+    action:
+      - variables:
+          room: "{{ states('input_number.sim_room_temp') | float(24.0) }}"
+          outdoor: "{{ states('input_number.sim_outdoor_temp') | float(32.0) }}"
+          k_env: "{{ states('input_number.sim_k_env') | float(0.08) }}"
+          cooling: "{{ states('sensor.sim_cooling_power') | float(0) }}"
+      - variables:
+          # °C per hour, converted to the 30 s tick.
+          delta: "{{ ((k_env * (outdoor - room)) + cooling) / 120.0 }}"
+      - service: input_number.set_value
+        data:
+          entity_id: input_number.sim_room_temp
+          value: "{{ [10, [40, room + delta] | min] | max | round(3) }}"

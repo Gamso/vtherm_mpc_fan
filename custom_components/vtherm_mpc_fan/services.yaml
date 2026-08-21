@@ -1,0 +1,103 @@
+apply_learned_settings:
+  name: Apply learned settings
+  description: Apply optimal parameters computed from the learning algorithm. Specify the target VTherm when several are managed.
+  fields:
+    target_vtherm:
+      name: Versatile Thermostat
+      description: Optional when only one VTherm MPC Fan controller is running. Required when several VTherms are managed.
+      required: false
+      example: "climate.living_room"
+      selector:
+        entity:
+          domain: climate
+          integration: versatile_thermostat
+
+reset_learning:
+  name: Reset learning
+  description: Clear all learning data and restart the learning process from scratch. Specify the target VTherm when several are managed.
+  fields:
+    target_vtherm:
+      name: Versatile Thermostat
+      description: Optional when only one VTherm MPC Fan controller is running. Required when several VTherms are managed.
+      required: false
+      example: "climate.living_room"
+      selector:
+        entity:
+          domain: climate
+          integration: versatile_thermostat
+
+set_effective_slope:
+  name: Set effective slope
+  description: Manually set the effective slope for a specific fan mode / HVAC mode profile. Replaces existing samples for that profile with synthetic ones so the learned value matches the provided slope.
+  fields:
+    target_vtherm:
+      name: Versatile Thermostat
+      description: Optional when only one VTherm MPC Fan controller is running. Required when several VTherms are managed.
+      required: false
+      example: "climate.living_room"
+      selector:
+        entity:
+          domain: climate
+          integration: versatile_thermostat
+    hvac_mode:
+      name: HVAC mode
+      description: The HVAC mode (heat or cool).
+      required: true
+      example: "heat"
+      selector:
+        select:
+          options:
+            - heat
+            - cool
+    fan_mode:
+      name: Fan mode
+      description: The fan mode name (e.g. silent, low, med, high, superhigh).
+      required: true
+      example: "silent"
+      selector:
+        text:
+    effective_slope:
+      name: Effective slope
+      description: The desired effective slope value in °C/h (positive = towards target).
+      required: true
+      example: 0.15
+      selector:
+        number:
+          min: -2.0
+          max: 5.0
+          step: 0.001
+          mode: box
+          unit_of_measurement: "°C/h"
+
+force_fan:
+  name: Force fan mode
+  description: Force a specific fan mode for a fixed duration, overriding the MPC. Set the duration to 0 to cancel an active override and hand control back to the MPC.
+  fields:
+    target_vtherm:
+      name: Versatile Thermostat
+      description: Optional when only one VTherm MPC Fan controller is running. Required when several VTherms are managed.
+      required: false
+      example: "climate.living_room"
+      selector:
+        entity:
+          domain: climate
+          integration: versatile_thermostat
+    fan_mode:
+      name: Fan mode
+      description: The fan mode to force (e.g. silent, low, med, high, superhigh).
+      required: true
+      example: "high"
+      selector:
+        text:
+    duration_minutes:
+      name: Duration (minutes)
+      description: How long to hold the forced fan mode. Use 0 to cancel an active override.
+      required: true
+      example: 30
+      selector:
+        number:
+          min: 0
+          max: 1440
+          step: 1
+          mode: box
+          unit_of_measurement: "min"

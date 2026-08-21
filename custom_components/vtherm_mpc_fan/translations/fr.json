@@ -1,0 +1,63 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "title": "Ajouter Versatile Thermostat MPC Fan",
+                "description": "Choisissez le Versatile Thermostat dont la vitesse de ventilation sera pilotée par le MPC. Ce doit être un VTherm over_climate dont l'entité climate sous-jacente expose des modes de ventilation.",
+                "data": {
+                    "target_vtherm": "Versatile Thermostat",
+                    "deadband": "Bande morte (°C)",
+                    "min_interval": "Intervalle minimum (minutes)",
+                    "data_collection": "Activer la collecte de données (bêta)",
+                    "defrost_entity": "Entité dégivrage (optionnel)"
+                },
+                "data_description": {
+                    "target_vtherm": "Le VTherm auquel se rattacher. Son cycle de contrôle cadence ce contrôleur, et c'est la vitesse de ventilation de son climate sous-jacent qui sera pilotée.",
+                    "deadband": "Plage : 0.0-5.0 °C. Défaut : 0.2 °C.",
+                    "min_interval": "Plage : 1-60 min. Défaut : 10 min. Sert à la fois de plancher et (x3) de plafond à l'intervalle adaptatif déduit du temps mort appris.",
+                    "data_collection": "Enregistre une ligne CSV par cycle de contrôle dans le dossier de configuration Home Assistant, à côté de configuration.yaml : vtherm_mpc_fan_data_XXXXXXXX.csv (max 10 Mo, rotation automatique). Utile pour reproduire le comportement de l'algorithme et identifier des améliorations pendant la phase bêta.",
+                    "defrost_entity": "Optionnel : binary sensor, sensor ou input_boolean indiquant quand la PAC est en dégivrage. VTherm ne remonte pas cette information, elle doit donc être fournie ici. L'activité du compresseur et la température extérieure sont lues directement depuis VTherm et ne demandent aucune configuration."
+                }
+            }
+        },
+        "error": {
+            "invalid_entity": "Cette entité n'est pas dans le registre d'entités.",
+            "not_a_vtherm": "Cette entité ne provient pas de Versatile Thermostat.",
+            "fan_already_driven": "Un autre plugin (par exemple Versatile Thermostat Auto Fan) pilote déjà la ventilation de ce thermostat. Un seul contrôleur peut piloter une vitesse de ventilation. Supprimez d'abord l'autre."
+        },
+        "abort": {
+            "already_configured": "Ce Versatile Thermostat a déjà un contrôleur MPC de ventilation."
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "Modifier Versatile Thermostat MPC Fan",
+                "description": "Le contrôleur considère la position d'une vitesse dans le classement ci-dessous comme sa puissance : elle pilote le coût énergétique, la garde de sécurité sur les baisses de régime, et l'estimation utilisée pour les vitesses pas encore apprises. Par défaut, l'ordre remonté par l'entité climate sous-jacente est utilisé, et il est généralement correct — ne le modifiez que si une vitesse est mal placée. Le rang 1 est la vitesse la plus faible.",
+                "data": {
+                    "deadband": "Bande morte (°C)",
+                    "min_interval": "Intervalle minimum (minutes)",
+                    "data_collection": "Activer la collecte de données (bêta)",
+                    "defrost_entity": "Entité dégivrage (optionnel)",
+                    "fan_mode_order_0": "Vitesse — rang 1 (la plus faible)",
+                    "fan_mode_order_1": "Vitesse — rang 2",
+                    "fan_mode_order_2": "Vitesse — rang 3",
+                    "fan_mode_order_3": "Vitesse — rang 4",
+                    "fan_mode_order_4": "Vitesse — rang 5",
+                    "fan_mode_order_5": "Vitesse — rang 6",
+                    "fan_mode_order_6": "Vitesse — rang 7",
+                    "fan_mode_order_7": "Vitesse — rang 8 (la plus forte, si 8 vitesses)"
+                },
+                "data_description": {
+                    "deadband": "Plage : 0.0-5.0 °C. Défaut : 0.2 °C.",
+                    "min_interval": "Plage : 1-60 min. Défaut : 10 min. Sert à la fois de plancher et (x3) de plafond à l'intervalle adaptatif déduit du temps mort appris.",
+                    "data_collection": "Enregistre une ligne CSV par cycle de contrôle dans le dossier de configuration Home Assistant, à côté de configuration.yaml : vtherm_mpc_fan_data_XXXXXXXX.csv (max 10 Mo, rotation automatique). Utile pour reproduire le comportement de l'algorithme et identifier des améliorations pendant la phase bêta.",
+                    "defrost_entity": "Optionnel : binary sensor, sensor ou input_boolean indiquant quand la PAC est en dégivrage."
+                },
+                "error": {
+                    "base": "Chaque vitesse doit être choisie à un seul rang — la même vitesse a été sélectionnée deux fois."
+                }
+            }
+        }
+    }
+}

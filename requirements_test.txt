@@ -1,0 +1,8 @@
+# Development and Testing Requirements
+pytest
+pytest-asyncio
+pytest-homeassistant-custom-component
+vtherm_api>=0.4.0
+# Declared explicitly: test_services_yaml.py imports it directly, rather than
+# relying on it arriving as homeassistant's own transitive dependency.
+pyyaml

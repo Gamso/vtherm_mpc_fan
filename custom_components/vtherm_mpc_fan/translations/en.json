@@ -1,0 +1,63 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "title": "Add Versatile Thermostat MPC Fan",
+                "description": "Pick the Versatile Thermostat whose fan speed should be driven by the MPC. It must be an over_climate VTherm whose underlying climate exposes fan modes.",
+                "data": {
+                    "target_vtherm": "Versatile Thermostat",
+                    "deadband": "Deadband (°C)",
+                    "min_interval": "Min Interval (minutes)",
+                    "data_collection": "Enable Data Collection (beta)",
+                    "defrost_entity": "Defrost Entity (optional)"
+                },
+                "data_description": {
+                    "target_vtherm": "The VTherm to attach to. Its control cycle drives this controller, and its underlying climate is the one whose fan speed gets set.",
+                    "deadband": "Range: 0.0-5.0 °C. Default: 0.2 °C.",
+                    "min_interval": "Range: 1-60 min. Default: 10 min. Acts as both the floor and (x3) the cap on the adaptive interval derived from the learned dead time.",
+                    "data_collection": "Records one CSV row per control cycle in the Home Assistant config folder, alongside configuration.yaml: vtherm_mpc_fan_data_XXXXXXXX.csv (max 10 MB, auto-rotated). Useful for reproducing algorithm behaviour and identifying improvements during the beta phase.",
+                    "defrost_entity": "Optional: binary sensor, sensor or input_boolean that indicates when the heat pump is in defrost mode. VTherm does not report this, so it has to be supplied here. Compressor activity and outdoor temperature are read from VTherm directly and need no configuration."
+                }
+            }
+        },
+        "error": {
+            "invalid_entity": "This entity is not in the entity registry.",
+            "not_a_vtherm": "This entity does not come from Versatile Thermostat.",
+            "fan_already_driven": "Another plugin (such as Versatile Thermostat Auto Fan) is already driving this thermostat's fan. Only one controller can own a fan speed. Remove the other one first."
+        },
+        "abort": {
+            "already_configured": "This Versatile Thermostat already has an MPC fan controller."
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "Edit Versatile Thermostat MPC Fan",
+                "description": "The controller treats a speed's position in the ranking below as its strength: it drives the energy cost, the step-down safety guard, and the estimate used for speeds not yet learned. This defaults to the order the underlying climate reports, which is usually right — only change it if a speed is in the wrong position. Rank 1 is the weakest speed.",
+                "data": {
+                    "deadband": "Deadband (°C)",
+                    "min_interval": "Min Interval (minutes)",
+                    "data_collection": "Enable Data Collection (beta)",
+                    "defrost_entity": "Defrost Entity (optional)",
+                    "fan_mode_order_0": "Fan speed — rank 1 (weakest)",
+                    "fan_mode_order_1": "Fan speed — rank 2",
+                    "fan_mode_order_2": "Fan speed — rank 3",
+                    "fan_mode_order_3": "Fan speed — rank 4",
+                    "fan_mode_order_4": "Fan speed — rank 5",
+                    "fan_mode_order_5": "Fan speed — rank 6",
+                    "fan_mode_order_6": "Fan speed — rank 7",
+                    "fan_mode_order_7": "Fan speed — rank 8 (strongest, if 8 speeds)"
+                },
+                "data_description": {
+                    "deadband": "Range: 0.0-5.0 °C. Default: 0.2 °C.",
+                    "min_interval": "Range: 1-60 min. Default: 10 min. Acts as both the floor and (x3) the cap on the adaptive interval derived from the learned dead time.",
+                    "data_collection": "Records one CSV row per control cycle in the Home Assistant config folder, alongside configuration.yaml: vtherm_mpc_fan_data_XXXXXXXX.csv (max 10 MB, auto-rotated). Useful for reproducing algorithm behaviour and identifying improvements during the beta phase.",
+                    "defrost_entity": "Optional: binary sensor, sensor or input_boolean that indicates when the heat pump is in defrost mode."
+                },
+                "error": {
+                    "base": "Each fan speed must be picked at exactly one rank — the same speed was selected twice."
+                }
+            }
+        }
+    }
+}

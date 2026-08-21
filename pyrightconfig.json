@@ -1,0 +1,28 @@
+{
+    "include": [
+        "custom_components/vtherm_mpc_fan/**",
+        "homeassistant/**",
+        "tests/**",
+    ],
+    "reportShadowedImports": false,
+    "reportOptionalMemberAccess": false,
+    "reportAssignmentType": "warning",
+    "reportIncompatibleVariableOverride": false,
+    "reportIncompatibleMethodOverride": false,
+    "reportAttributeAccessIssue": "warning",
+    "reportArgumentType": "information",
+    "reportPrivateImportUsage": false,
+    "reportGeneralTypeIssues": false,
+    "reportReturnType": "information",
+    "executionEnvironments": [
+        {
+            "root": "tests",
+            "reportAttributeAccessIssue": "none",
+            "reportMissingImports": false,
+            // because import * is not supported
+            "reportUndefinedVariable": false,
+            "reportOperatorIssue": "warning",
+            "reportArgumentType": "warning",
+        }
+    ]
+}
