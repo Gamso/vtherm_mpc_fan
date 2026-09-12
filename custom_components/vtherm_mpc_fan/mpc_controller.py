@@ -9,6 +9,7 @@ from .const import (
     DEAD_TIME_SAFETY_FACTOR,
     DEFAULT_DEAD_TIME,
     DEFAULT_CYCLE_MINUTES,
+    MIN_ESTABLISHED_RATIO,
     PHASE_DEAD_TIME,
     PHASE_ESTABLISHED,
     PHASE_TRANSIENT,
@@ -70,6 +71,32 @@ MIN_RESPONSE_EVENTS_FOR_ADAPTIVE_INTERVAL = 5
 # this much growth, an *escalation only* (never a step-down) is allowed to
 # bypass the lock.
 DEAD_TIME_ESCALATION_GROWTH = 0.15  # degC comfort error allowed to worsen since the change
+
+# --- Exploration: give an unmeasured speed the time it needs to be measured ---
+# The learning gate only accepts slope samples once a fan mode has been active
+# for MIN_ESTABLISHED_RATIO x dead_time, while the change gate above re-opens at
+# 1 x dead_time. A speed with no measured profile could therefore be left before
+# its first sample was recordable -- and a speed that is never measured is never
+# credible on cost, so it is never chosen again: a loop closed on itself. While
+# the current speed has no measured profile, the dwell is raised to the learning
+# gate plus this much time for samples to land. In minutes, not control cycles:
+# VTherm recomputes the slope on sensor events, so the sampling rate is the
+# room sensor's, whatever cadence the controller is driven at. Comfort keeps its
+# escape hatches: the emergency escalation (error growing past
+# DEAD_TIME_ESCALATION_GROWTH) and its mirror for overshoot (see
+# _learning_hold_active) both release the hold.
+LEARNING_HOLD_EXTRA_MINUTES = 10.0
+
+# Rank jumps toward a speed *above* the current one may not skip over an
+# intermediate rung that has no measured profile and looks viable (positive
+# estimated slope): that rung must be tried first, since it can only ever be
+# measured under load and load is exactly what a rising error means. Two
+# exceptions keep recovery direct: a comfort error beyond this many degrees
+# (a setpoint step -- the evening pre-cool on the production trace runs at
+# +1.7 degC and belongs on the strongest speed at once), and the emergency
+# escalation. Measured on 23 days of production: 26 of 29 climbs to the top
+# speed came straight from the two weakest ones.
+MULTI_RANK_JUMP_ERROR = 1.0  # degC
 
 # --- Hold-equilibrium (economic) mode -------------------------------------
 # When enabled, near the setpoint the controller matches fan output to the
@@ -262,6 +289,18 @@ class MPCController:
             return None
         return self._last_mode_slopes["slopes"].get(fan_mode)
 
+    def notify_fan_change(self) -> None:
+        """Tell the controller the fan mode just changed (by us or externally).
+
+        The comfort-error baseline used by the emergency escalation is
+        re-snapshotted on the next evaluate() call. Relying on
+        ``minutes_since_change < cycle_minutes`` alone to detect a fresh hold was
+        fragile: the first cycle after a change lands within milliseconds of
+        that bound, and a cycle skipped for missing inputs keeps a stale
+        baseline for the whole hold.
+        """
+        self._error_at_lock_start = None
+
     def _dead_time_is_trusted(self) -> bool:
         """True when the learned dead time rests on enough real response events.
 
@@ -360,20 +399,35 @@ class MPCController:
         # pooling here either -- get_dead_time() already falls back to the pooled
         # set on its own when the requested mode has no events yet.
         dead_time = self._learning.get_dead_time(hvac_mode)
-        effective_min_interval = self._effective_min_interval(dead_time)
-        change_allowed = minutes_since_change >= effective_min_interval
         # Snapshot the comfort error at the start of each hold so growth since
         # the fan last changed can be measured (see DEAD_TIME_ESCALATION_GROWTH).
+        # notify_fan_change() clears the snapshot explicitly; the time-based
+        # test remains as a fallback for callers that never notify.
         if minutes_since_change < self._cycle_minutes or self._error_at_lock_start is None:
             self._error_at_lock_start = current_error
         error_growth_since_change = current_error - self._error_at_lock_start
-        phase = self._detect_phase(minutes_since_change, dead_time)
+        effective_min_interval = self._effective_min_interval(dead_time)
+        learning_hold_minutes = dead_time * MIN_ESTABLISHED_RATIO + LEARNING_HOLD_EXTRA_MINUTES
+        learning_hold = self._learning_hold_active(
+            active_fan=active_fan,
+            hvac_mode=hvac_mode,
+            minutes_since_change=minutes_since_change,
+            learning_hold_minutes=learning_hold_minutes,
+            current_error=current_error,
+            error_growth_since_change=error_growth_since_change,
+        )
+        if learning_hold:
+            effective_min_interval = max(effective_min_interval, learning_hold_minutes)
+        change_allowed = minutes_since_change >= effective_min_interval
+        phase = self.detect_phase(minutes_since_change, dead_time)
+        monotone_slopes = self.build_monotone_slopes(fan_modes, hvac_mode)
         current_mode_slope, current_known_profile = self._get_mode_slope(
             active_fan,
             hvac_mode,
             active_fan,
             current_effective_slope,
             fan_modes,
+            monotone_slopes,
         )
         # Compare the observed slope against what the gap-dependent model expects
         # *at the current error*, not at the reference gap. This keeps the
@@ -432,11 +486,10 @@ class MPCController:
         worst_spread = 0.0
         current_index = fan_modes.index(active_fan)
 
-        # Build monotone-enforced slope map so higher fan modes are never
-        # assigned a lower slope than lower modes.  Only applied when ALL
-        # profiles are learned; on a fresh install (partial profiles) the
-        # raw learned / fallback values are used as-is.
-        monotone_slopes = self.build_monotone_slopes(fan_modes, hvac_mode)
+        # Monotone-enforced slope map (built above, before the current mode's own
+        # slope was resolved): higher fan modes are never assigned a lower slope
+        # than lower modes. Modes without a learned profile are absent and fall
+        # back to an estimate anchored on their nearest learned neighbour.
         _LOGGER.debug(
             "MPC %s profiles: fan_mode_order=%s effective_slopes_used=%s",
             hvac_mode,
@@ -489,28 +542,51 @@ class MPCController:
         current_simulation = next(sim for sim in simulations if sim.fan_mode == active_fan)
         unfiltered_best = min(simulations, key=lambda item: item.total_cost)
 
-        def _stepdown_capable(sim: ModeSimulation) -> bool:
+        def _skipped_unmeasured_rung(candidate_index: int) -> str | None:
+            """Return the first viable-looking, unmeasured rung a climb would skip."""
+            if candidate_index <= current_index + 1:
+                return None
+            if current_error > MULTI_RANK_JUMP_ERROR or error_growth_since_change > DEAD_TIME_ESCALATION_GROWTH:
+                return None
+            for rung in fan_modes[current_index + 1 : candidate_index]:
+                rung_slope, _ = mode_slopes_snapshot[rung]
+                if rung_slope > 0 and not self._learning.has_measured_profile(rung, hvac_mode):
+                    return rung
+            return None
+
+        def _rank_move_capable(sim: ModeSimulation) -> bool:
             candidate_index = fan_modes.index(sim.fan_mode)
             if candidate_index >= current_index:
-                return True  # upward / same rank is always allowed
+                # Upward: never skip an intermediate speed that has not been
+                # measured yet and looks able to do the job -- see
+                # MULTI_RANK_JUMP_ERROR.
+                return _skipped_unmeasured_rung(candidate_index) is None
             if current_index - candidate_index <= 1:
                 return True
             raw_slope = self._learning.get_mode_effective_slope(sim.fan_mode, hvac_mode)
             return raw_slope is None or raw_slope > MIN_VIABLE_MULTI_RANK_STEPDOWN_SLOPE
 
-        eligible_simulations = [sim for sim in simulations if _stepdown_capable(sim)]
+        eligible_simulations = [sim for sim in simulations if _rank_move_capable(sim)]
         best = min(eligible_simulations, key=lambda item: item.total_cost)
         selection_note = ""
         blocked_note = ""
 
         if unfiltered_best.fan_mode != best.fan_mode:
             blocked_index = fan_modes.index(unfiltered_best.fan_mode)
-            ranks = current_index - blocked_index
-            blocked_slope = self._learning.get_mode_effective_slope(unfiltered_best.fan_mode, hvac_mode)
-            blocked_note = (
-                f"Blocked {ranks}-rank drop to {unfiltered_best.fan_mode}: "
-                f"its own profile ({blocked_slope:.2f}C/h) can't sustain progress"
-            )
+            if blocked_index > current_index:
+                ranks = blocked_index - current_index
+                rung = _skipped_unmeasured_rung(blocked_index)
+                blocked_note = (
+                    f"Blocked {ranks}-rank jump to {unfiltered_best.fan_mode}: "
+                    f"{rung} has no measured profile yet and must be tried first"
+                )
+            else:
+                ranks = current_index - blocked_index
+                blocked_slope = self._learning.get_mode_effective_slope(unfiltered_best.fan_mode, hvac_mode)
+                blocked_note = (
+                    f"Blocked {ranks}-rank drop to {unfiltered_best.fan_mode}: "
+                    f"its own profile ({blocked_slope:.2f}C/h) can't sustain progress"
+                )
 
         if not change_allowed and best.fan_mode != active_fan:
             best_index = fan_modes.index(best.fan_mode)
@@ -588,6 +664,8 @@ class MPCController:
                 f" | Min interval active ({minutes_since_change:.1f}/"
                 f"{effective_min_interval:.1f} min)"
             )
+            if learning_hold:
+                reason += f" | Learning hold: {active_fan} has no measured profile yet"
 
         return self._payload(
             status=status,
@@ -602,6 +680,38 @@ class MPCController:
             known_profiles=known_profiles,
             disturbance_bias=self._disturbance_bias,
         )
+
+    def _learning_hold_active(
+        self,
+        *,
+        active_fan: str,
+        hvac_mode: str,
+        minutes_since_change: float,
+        learning_hold_minutes: float,
+        current_error: float,
+        error_growth_since_change: float,
+    ) -> bool:
+        """True while the current speed should be kept so it can be measured.
+
+        Applies only to a speed without a measured profile (seeded values do not
+        count: they are what the user guessed, not what the room did), and only
+        until the learning gate has had LEARNING_HOLD_EXTRA_MINUTES to record
+        samples. Released when the room is far off target (past
+        MULTI_RANK_JUMP_ERROR: that is a recovery, and a speed that leaves the
+        room there has already told us what it can do) or overshooting *and*
+        getting worse -- the downward mirror of the emergency escalation, which
+        is evaluated separately and releases the hold upward.
+        """
+        if self._learning.has_measured_profile(active_fan, hvac_mode):
+            return False
+        if minutes_since_change >= learning_hold_minutes:
+            return False
+        if current_error > MULTI_RANK_JUMP_ERROR:
+            return False
+        overshooting_and_worsening = (
+            current_error < -self._deadband and error_growth_since_change < -DEAD_TIME_ESCALATION_GROWTH
+        )
+        return not overshooting_and_worsening
 
     def _count_known_profiles(self, fan_modes: list[str], hvac_mode: str) -> int:
         """Return how many fan modes have a learned profile for this hvac mode.
@@ -641,10 +751,45 @@ class MPCController:
             )
             return learned, True
 
+        if fan_mode == current_fan:
+            # The speed that is running right now has no profile, but it has
+            # something better for the next dead time: the slope the room is
+            # actually showing. Flooring it at +0.2 degC/h modelled a speed that
+            # was observably losing ground as one gaining it, and on a learned
+            # dead time of 25 min that kept the controller on it until the room
+            # was 2 degC off target.
+            _LOGGER.debug(
+                "MPC slope model: using observed slope for current unlearned %s/%s = %.3f",
+                hvac_mode,
+                fan_mode,
+                current_effective_slope,
+            )
+            return current_effective_slope, False
+
+        candidate_rank = fan_modes.index(fan_mode)
+        if monotone_slopes:
+            # Anchor on the nearest learned neighbour and step along the ladder,
+            # rather than scaling the current speed's slope by rank ratio -- which
+            # near equilibrium (slope ~0, floored to 0.2) rated every unlearned
+            # speed at 0.04-0.16 degC/h against a learned 1.0 and made them all
+            # look useless.
+            anchor = min(monotone_slopes, key=lambda fm: abs(fan_modes.index(fm) - candidate_rank))
+            anchor_rank = fan_modes.index(anchor)
+            scaled = monotone_slopes[anchor]
+            for _ in range(abs(candidate_rank - anchor_rank)):
+                scaled = self._one_rank_stronger(scaled) if candidate_rank > anchor_rank else self._one_rank_weaker(scaled)
+            _LOGGER.debug(
+                "MPC slope model: using ladder estimate for %s/%s = %.3f (anchor=%s)",
+                hvac_mode,
+                fan_mode,
+                scaled,
+                anchor,
+            )
+            return scaled, False
+
         baseline_slope = max(current_effective_slope, 0.2)
         current_rank = fan_modes.index(current_fan) + 1
-        candidate_rank = fan_modes.index(fan_mode) + 1
-        scaled = baseline_slope * (candidate_rank / max(current_rank, 1))
+        scaled = baseline_slope * ((candidate_rank + 1) / max(current_rank, 1))
         _LOGGER.debug(
             "MPC slope model: using fallback for %s/%s = %.3f (baseline=%.3f current_fan=%s)",
             hvac_mode,
@@ -662,16 +807,25 @@ class MPCController:
         ``reference_slope`` is the representative slope at REFERENCE_SLOPE_ERROR
         (a + b·REF) and ``gain`` is b, so the model at ``error`` is
         reference_slope + b·(error − REF). The error is floored at 0 (no driving
-        force at/below setpoint) and the result is floored at 0 so the model never
-        projects active cooling/heating away from the setpoint; the additive
-        disturbance bias is applied separately by the caller.
+        force at/below setpoint). The result is floored at 0 for a speed that
+        moves the room toward target, so the gap term never projects active
+        cooling/heating away from the setpoint -- but a *negative* reference
+        slope is a speed known (learned, seeded or observed) to lose ground, and
+        that loss must reach the simulator: flooring it to 0 made a seeded
+        silent = -0.5 degC/h look neutral and an observed -0.3 look harmless. The
+        additive disturbance bias is applied separately by the caller.
         """
         modelled = reference_slope + gain * (max(error, 0.0) - REFERENCE_SLOPE_ERROR)
-        return max(0.0, modelled)
+        return max(min(0.0, reference_slope), modelled)
 
     @staticmethod
-    def _detect_phase(minutes_since_change: float, dead_time: float) -> str:
-        """Classify the current prediction phase without relying on the live controller."""
+    def detect_phase(minutes_since_change: float, dead_time: float) -> str:
+        """Classify the response phase since the last fan change.
+
+        Public because the feature manager gates slope-sample collection on the
+        same phase: one clock for the controller and the learner, so a sample is
+        never taken while the MPC still considers the room in its dead time.
+        """
         effective_dead_time = DEFAULT_DEAD_TIME if dead_time <= 0 else dead_time
         if minutes_since_change < effective_dead_time:
             return PHASE_DEAD_TIME

@@ -204,6 +204,8 @@ Each candidate fan mode is scored with:
 - **Hysteresis**: a recommendation that changes the fan must beat the current mode by a minimum cost margin. The margin is larger when near the target (0.30) and smaller when far away (0.10).
 - **Step-down hold**: blocks a jump of more than one rank down to a fan mode whose own learned profile cannot sustain progress at the current comfort error — this is what stops the controller diving straight to a speed with no track record of actually holding the room.
 - **Min interval**: non-emergency changes respect the configured minimum interval between fan changes.
+- **Learning hold**: while the *current* speed has no measured profile (seeded values do not count), the dwell is raised to the learning gate (1.5× dead time) plus 10 minutes so the speed can actually be sampled before it is left. A speed that is never measured is never credible on cost and never chosen again, which is how intermediate speeds stayed unknown. The hold yields to comfort: it is released by the escalation guard, by an overshoot that keeps worsening, and it never applies more than 1 °C from target.
+- **Climb guard**: rising more than one rank may not skip over an intermediate speed that has no measured profile and looks viable — that rung is tried first, because a speed can only be measured under load and load is exactly what a rising error means. Recoveries stay direct: past 1 °C of error (a setpoint step) or when the escalation guard fires, the jump goes straight to the strongest speed.
 
 ### Phase Detection
 
@@ -215,7 +217,7 @@ After each fan speed change, the controller classifies elapsed time into three p
 | **TRANSIENT**   | `dead_time ≤ elapsed < dead_time × 1.5` | Sensor starting to respond          |
 | **ESTABLISHED** | `elapsed ≥ dead_time × 1.5`             | Slope reflects the current fan regime |
 
-The default dead time is 10 minutes. Once the learning system is ready, it is replaced by the learned median response time.
+The default dead time is 10 minutes, replaced by the learned median response time as soon as response events exist. The controller and the learner share this one clock: a slope sample is never taken while the MPC still considers the room in its dead time or transient.
 
 An escalation guard sits on top of this lock: if the comfort error keeps worsening since the last fan change (by more than 0.15°C), an *escalation only* (never a step-down) is allowed to bypass the phase lock, even mid dead-time — this is what protects against getting stuck above setpoint with no way out if an earlier decision turns out to be too weak.
 
@@ -255,7 +257,7 @@ If a speed is in the wrong position, the options flow (available once the underl
 
 ## Learning System
 
-The plugin includes an **automatic learning system** that collects data during normal operation and computes optimal parameters after enough samples accumulate (≥240 slope samples).
+The plugin includes an **automatic learning system** that collects data during normal operation and computes optimal parameters after enough samples accumulate (≥120 slope samples — sized to what the 7-day window can hold on a 0.2 °C room sensor).
 
 **Data collected, once per control cycle**:
 - Temperature slope and active fan mode
@@ -278,14 +280,18 @@ Once learning is ready, computed parameters are reported via the `learning_statu
 
 The learning system tracks the **effective slope per fan mode and HVAC mode** (e.g. "medium in heat" vs "high in cool"). This provides visibility into which fan speeds are actually effective in each mode.
 
-Profiles require at least 10 samples per mode to be considered reliable. Samples are filtered out when:
+Profiles require at least 10 samples per mode to be considered reliable, and at least 10 **measured** samples (as opposed to the synthetic ones written when you set a value by hand) before the MPC treats the speed as known rather than guessed — see the `real_samples` and `value_source` attributes below. Each profile keeps its 40 newest samples however old they are, so a speed measured a few times a week accumulates across weeks instead of losing to the 7-day window what it gathered the week before.
+
+Samples are filtered out when:
 - A window is open, or the compressor is idle, or defrost is active (see the detection sections above)
 - A large setpoint drop occurred (night mode) — including a **30-minute cooldown** after the drop
-- The fan mode hasn't been active long enough (**2× dead time**) for the room's response to fully reflect the current mode
+- The fan mode hasn't been active long enough (**1.5× dead time**, the `ESTABLISHED` phase) for the room's response to fully reflect the current mode
 - The phase is not yet `ESTABLISHED`
 - The reading duplicates the last one accepted for that fan mode — see [Duplicate-Reading Filtering](#duplicate-reading-filtering)
 
-The effective slope is computed as the **median** (not mean) of collected samples, for robustness against occasional outlier readings caused by thermal inertia from a previous, different fan speed.
+A near-zero slope is **not** filtered out: a speed that holds the room at the setpoint produces exactly that, and it is the measurement of the profile's intercept. (An earlier 0.15 °C/h stagnation cut censored the bottom of the distribution, which both over-estimated the weak speeds and starved the intermediate ones of the few samples they get.)
+
+The effective slope is computed as the **median** (not mean) of collected samples, for robustness against occasional outlier readings caused by thermal inertia from a previous, different fan speed. While a hand-set profile has fewer than 10 measured samples, the two medians are weighted by their counts, so every measurement visibly pulls the value instead of hiding behind the seeded one.
 
 When two fan speeds' learned slopes are out of order (e.g. a rarely-used speed's small sample happens to read stronger than a well-sampled one above it), the better-sampled profile is trusted: the rejected estimate is not clamped onto its neighbour (which would make the two speeds thermally indistinguishable to the cost function) but re-synthesized one ladder step away from it, calibrated on the spacing of the profiles that *are* well sampled.
 
@@ -293,7 +299,9 @@ When two fan speeds' learned slopes are out of order (e.g. a rarely-used speed's
 
 The system measures the **thermal response time** — the delay between a fan speed change and the first observable slope change at the sensor. This median value replaces the default 10-minute dead time, letting the controller be patient during the actual thermal lag and reactive once the effect materializes.
 
-Response events are only recorded when the delay is between 2 and 60 minutes (filtering sensor noise and system-off periods).
+Response events are only recorded when the delay is between 2 and 60 minutes (filtering sensor noise and system-off periods), and **once per fan change**: the first significant slope move after a change is the response, later ones inside the window are not counted again (they used to be, which drifted the median toward the middle of the window).
+
+A fan change made outside the plugin — remote control, another automation — counts as a change too: the dead time, the response event and the learning gate all restart from it. To try a speed by hand and have it learned, prefer the `force_fan` service, which also holds it for the duration you choose.
 
 ### Duplicate-Reading Filtering
 
@@ -331,7 +339,7 @@ The VTherm entity itself also gains a `mpc_fan` attribute section with the same 
 
 | Entity                                                          | Unit  | Description                                          |
 | -------------------------------------------------------------------- | ----- | ------------------------------------------------------- |
-| `sensor.vtherm_mpc_fan_living_room_learning_progress`                | %     | Learning completion (100% = ≥240 samples)              |
+| `sensor.vtherm_mpc_fan_living_room_learning_progress`                | %     | Learning completion (100% = ≥120 samples)              |
 | `sensor.vtherm_mpc_fan_living_room_learning_status`                  | —     | `"Learning (45%)"` or `"Ready"`                        |
 | `sensor.vtherm_mpc_fan_living_room_learning_samples`                 | count | Number of slope samples collected                      |
 | `sensor.vtherm_mpc_fan_living_room_learning_response_events`         | count | Number of thermal response time measurements           |
@@ -353,7 +361,7 @@ Once fan modes are detected, the plugin creates per-HVAC-mode profile summary se
 | `number.vtherm_mpc_fan_living_room_cool_low_effective_slope`        | °C/h | Effective slope for `low` in cool mode              |
 | … (one per fan mode × HVAC mode combination)                       | …    | …                                                    |
 
-These entities appear once the underlying's fan modes become known. Each shows a real learned value once the profile has at least 10 samples; below that, there is no fixed default — the field instead shows the live rank-scaled estimate the MPC is substituting for that speed right now (what it actually bases decisions on), so it is never blank. The `value_source` attribute (`learned` or `live_fallback_estimate`) says which one you're looking at, and `ready` mirrors the 10-sample threshold.
+These entities appear once the underlying's fan modes become known. Each shows a real learned value once the profile has at least 10 samples; below that, there is no fixed default — the field instead shows the live rank-scaled estimate the MPC is substituting for that speed right now (what it actually bases decisions on), so it is never blank. The `value_source` attribute says which one you're looking at: `learned` (10+ measured samples), `seeded` (a value you set, no measurement yet), `seeded_blended` (a value you set, already pulled by a few measurements) or `live_fallback_estimate`. `ready` mirrors the 10-sample threshold and `real_samples` counts the measured ones.
 
 Click the value to edit it directly — this replaces the profile's samples with synthetic ones producing exactly the value you enter (the same effect as the `set_effective_slope` service, which remains available for automations/scripts). Real samples collected afterwards blend in and gradually refine the value; they don't reset it.
 

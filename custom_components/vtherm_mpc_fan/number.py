@@ -201,7 +201,10 @@ class EffectiveSlopeNumber(NumberEntity):
         Replaces this profile's samples with synthetic ones producing exactly
         `value` (the same call the ``set_effective_slope`` service makes), so
         the profile becomes immediately "ready" -- real samples collected from
-        here on blend in and gradually refine it, they don't reset it.
+        here on blend in and gradually refine it, they don't reset it. The MPC
+        still treats the profile as *unmeasured* until MIN_MODE_PROFILE_SAMPLES
+        real samples exist (see ``value_source``): a seeded value is what the
+        user believes, and the exploration guards exist to check it.
         """
         self._controller.learning.set_mode_effective_slope(self._fan_mode, self._hvac_mode, value)
         if self._on_change is not None:
@@ -217,7 +220,16 @@ class EffectiveSlopeNumber(NumberEntity):
         """Expose sampling and model details for this profile."""
         learning = self._controller.learning
         samples = self._sample_count()
+        real_samples = learning.get_mode_real_sample_count(self._fan_mode, self._hvac_mode)
         ready = samples >= MIN_MODE_PROFILE_SAMPLES
+        if not ready:
+            value_source = "live_fallback_estimate"
+        elif real_samples >= MIN_MODE_PROFILE_SAMPLES:
+            value_source = "learned"
+        elif real_samples > 0:
+            value_source = "seeded_blended"
+        else:
+            value_source = "seeded"
         spread = learning.get_profile_spread(self._fan_mode, self._hvac_mode)
         if spread is None:
             quality = "unknown"
@@ -242,11 +254,17 @@ class EffectiveSlopeNumber(NumberEntity):
             "hvac_mode": self._hvac_mode,
             "fan_mode": self._fan_mode,
             "samples": samples,
+            # Measured samples only: the count that moves the value and that the
+            # MPC's exploration guards read. ``samples`` also includes synthetic
+            # ones written by set_effective_slope.
+            "real_samples": real_samples,
             "min_samples_required": MIN_MODE_PROFILE_SAMPLES,
             "ready": ready,
-            # Tells apart a real measurement from the live guess shown in its
-            # place -- the state alone can't, since both are plain numbers.
-            "value_source": "learned" if ready else "live_fallback_estimate",
+            # Tells apart a real measurement ("learned"), a user-seeded value
+            # ("seeded"), a seeded value already pulled by a few measurements
+            # ("seeded_blended") and the live guess shown while nothing is known
+            # -- the state alone can't, since all are plain numbers.
+            "value_source": value_source,
             "spread": spread,
             "quality": quality,
             "slope_intercept": slope_intercept,

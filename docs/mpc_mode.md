@@ -93,7 +93,9 @@ The model reuses the current learning subsystem:
 - `learning.get_dead_time()` for thermal delay
 - `learning.get_mode_slope_model(fan_mode, hvac_mode)` for reliable per-mode profiles
 
-If a reliable profile is not yet available for a fan mode, the MPC model falls back to a coarse rank-based estimate derived from the current slope. Confidence is lowered accordingly.
+If a reliable profile is not yet available for a fan mode, the MPC model falls back to an estimate: for the speed currently running, the slope the room is actually showing (never floored — a speed losing ground must lose ground in the simulation); for the other candidates, the nearest learned profile stepped along the ladder by `LADDER_CAPACITY_RATIO`, or a coarse rank scaling of the current slope when nothing is learned at all. Confidence is lowered accordingly.
+
+A profile seeded by hand (`set_effective_slope`, or the number entities) counts as *known* for the slope but not as *measured*: the exploration guards below only trust `ThermalLearning.has_measured_profile()`, i.e. `MIN_MODE_PROFILE_SAMPLES` samples that carry a comfort error.
 
 ### Gap-Dependent Slope Model
 
@@ -168,6 +170,13 @@ In addition, the current implementation applies a mode-independent floor penalty
 
 The selected mode is the one with the lowest total cost.
 To avoid fan yo-yo near the setpoint, a recommendation that changes the fan must also beat the current mode by a minimum gain. If the gain is only marginal, the MPC controller keeps the current fan and reports that hysteresis blocked the switch.
+
+### Exploration guards
+
+A purely cost-driven controller never visits a speed it has no profile for, and a speed that is never visited never gets a profile. Two guards break that loop; both are diagnosed in `mpc_reason`.
+
+- **Learning hold** — while the current speed has no measured profile, the change interval is raised to `dead_time × MIN_ESTABLISHED_RATIO + LEARNING_HOLD_EXTRA_MINUTES`, so the learning gate has time to record samples before the speed is left. Released by the emergency escalation (error growing past `DEAD_TIME_ESCALATION_GROWTH`), by an overshoot that keeps worsening, and not applied at all past `MULTI_RANK_JUMP_ERROR`.
+- **Climb guard** — a move of more than one rank *up* may not skip an intermediate speed that has no measured profile and a positive estimated slope: that rung is selected instead, because it can only be measured under load. Exceptions: comfort error above `MULTI_RANK_JUMP_ERROR` (a setpoint step is a recovery and belongs on the strongest speed at once) and the emergency escalation. The pre-existing step-down guard (no multi-rank drop to a profile that cannot sustain progress) is unchanged.
 
 ## Diagnostics
 
