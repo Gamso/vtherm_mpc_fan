@@ -245,3 +245,85 @@ class TestThermalLearning:
         assert learning.get_dead_time("cool") == 8.0
         # Unknown fallback behavior (uses joint / all response times)
         assert learning.get_dead_time("unknown") == 11.0
+# --- Audit 2026-09: learning-data integrity --------------------------------
+def test_near_zero_slopes_are_learned_as_a_holding_profile() -> None:
+    """A speed that holds the room shows |slope| ~ 0 and must still build a profile.
+
+    The old 0.15 degC/h stagnation cut rejected 8 of these 10 readings, which is
+    how an intermediate speed that only ever runs near the setpoint could never
+    reach MIN_MODE_PROFILE_SAMPLES (22 of high's 27 distinct readings on the
+    production trace).
+    """
+    learning = ThermalLearning()
+    for slope in [-0.05, -0.1, -0.12, 0.05, -0.08, -0.14, 0.02, -0.16, -0.2, -0.11]:
+        learning.add_slope_sample("medium", slope, 0.1, hvac_mode="cool")
+
+    assert learning.get_mode_sample_count("medium", "cool") == 10
+    assert learning.get_mode_effective_slope("medium", "cool") == pytest.approx(0.105, abs=0.01)
+
+
+def test_seeded_profile_moves_with_each_measurement() -> None:
+    """Measurements pull a seeded value visibly, instead of hiding behind its median.
+
+    Ten identical synthetic samples are the median of any mixed set of fewer
+    than twenty, so the displayed value used to sit at the seeded number until
+    the measurements outnumbered them -- on a speed collecting three a week,
+    indefinitely.
+    """
+    learning = ThermalLearning()
+    learning.set_mode_effective_slope("high", "cool", 0.6)
+    for _ in range(3):
+        learning.add_slope_sample("high", -0.1, 0.3, hvac_mode="cool")  # measured: 0.1 towards target
+
+    blended = learning.get_mode_effective_slope("high", "cool")
+    assert blended == pytest.approx(0.6 + (3 / 13) * (0.1 - 0.6), abs=0.001)
+    assert learning.get_mode_real_sample_count("high", "cool") == 3
+    assert learning.has_measured_profile("high", "cool") is False
+
+    for _ in range(7):
+        learning.add_slope_sample("high", -0.1, 0.3, hvac_mode="cool")
+
+    # Ten measurements: the profile rests on them alone, the seed is gone.
+    assert learning.has_measured_profile("high", "cool") is True
+    assert learning.get_mode_effective_slope("high", "cool") == pytest.approx(0.1, abs=0.001)
+
+
+def test_rare_profile_keeps_measurements_older_than_the_window() -> None:
+    """A speed measured a few times a week accumulates across weeks.
+
+    Expiring by date alone kept only MIN_MODE_PROFILE_SAMPLES of them, so the
+    week-old samples a rare speed needed to ever reach the gate were the first
+    to go.
+    """
+    import time
+
+    now = time.time()
+    old = [(now - 8 * 24 * 3600 - i, "high", -0.3, "cool", 0.4) for i in range(25)]
+    fresh = [(now - i, "superhigh", -1.0, "cool", 1.0) for i in range(5)]
+
+    restored = ThermalLearning.from_dict({"slope_samples": old + fresh, "response_events": []})
+
+    assert restored.get_mode_sample_count("high", "cool") == 25
+    assert restored.get_mode_sample_count("superhigh", "cool") == 5
+
+
+def test_storage_cap_keeps_rare_profile_samples() -> None:
+    """The persisted tail cut must not drop the retained samples of a rare speed.
+
+    Those are by construction the oldest rows, so a plain ``[-N:]`` removed
+    exactly what the per-profile retention had kept.
+    """
+    import time
+
+    from custom_components.vtherm_mpc_fan import thermal_learning as tl_module
+
+    now = time.time()
+    learning = ThermalLearning()
+    rare = [(now - 10_000 - i, "high", -0.3, "cool", 0.4) for i in range(12)]
+    bulk = [(now - i, "superhigh", -1.0, "cool", 1.0) for i in range(tl_module.MAX_STORED_SLOPE_SAMPLES + 50)]
+    learning.slope_samples = rare + bulk
+
+    data = learning.to_dict()
+
+    assert sum(1 for s in data["slope_samples"] if s[1] == "high") == 12
+    assert len(data["slope_samples"]) <= tl_module.MAX_STORED_SLOPE_SAMPLES + len(rare)

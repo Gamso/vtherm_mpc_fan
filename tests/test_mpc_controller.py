@@ -373,7 +373,10 @@ async def test_setting_the_number_persists_a_ready_synthetic_profile() -> None:
     on_change.assert_awaited_once()
     assert number.native_value == 0.42
     assert number.extra_state_attributes["ready"] is True
-    assert number.extra_state_attributes["value_source"] == "learned"
+    # Ready, but on the user's word rather than on measurements: the MPC's
+    # exploration guards still treat this speed as unmeasured.
+    assert number.extra_state_attributes["value_source"] == "seeded"
+    assert number.extra_state_attributes["real_samples"] == 0
 
 
 def test_get_live_mode_slope_is_none_before_any_cycle_ran() -> None:
@@ -1074,7 +1077,11 @@ def _build_hold_cool_mpc() -> MPCController:
     """Build an MPC with cool profiles where low barely conditions and med/high hold."""
     learning = ThermalLearning()
     learning.set_mode_effective_slope("low", "cool", 0.05)
-    learning.set_mode_effective_slope("medium", "cool", 0.9)
+    # medium is *measured*, not merely seeded: a climb from low to high may not
+    # skip over an unmeasured intermediate rung (see MULTI_RANK_JUMP_ERROR), and
+    # these tests are about the hold-equilibrium trade-off, not exploration.
+    for _ in range(12):
+        learning.add_slope_sample("medium", -0.9, 0.3, "cool")
     learning.set_mode_effective_slope("high", "cool", 1.8)
     learning.add_response_event(10.0, "cool")
     return MPCController(
@@ -1335,4 +1342,158 @@ def test_multi_rank_stepdown_blocked_when_candidate_cannot_sustain_progress() ->
         minutes_since_change=300.0,
     )
     assert "Blocked" not in decision2["mpc_reason"]
+# --- Audit 2026-09: exploration and unmeasured speeds ----------------------
+def test_current_unmeasured_speed_is_modelled_on_the_observed_slope() -> None:
+    """A speed with no profile that is losing ground must not be modelled as gaining.
 
+    Production scenario: learned superhigh, unmeasured high, room warming at
+    0.3 degC/h in cool. The +0.2 degC/h floor on the fallback kept the
+    controller on high until the room was 2 degC off target; with the observed
+    slope as the fallback it escalates while the error is still 0.6.
+    """
+    fan_modes = ["silent", "low", "med", "high", "superhigh"]
+    learning = ThermalLearning()
+    _seed_gap_profile(learning, "superhigh", "cool", a=0.4, b=0.6)
+    for _ in range(5):
+        learning.add_response_event(25.0, "cool")
+    mpc = MPCController(learning=learning, deadband=0.2, min_interval=10, fan_modes=fan_modes)
+
+    result = mpc.evaluate(
+        current_temp=24.6,
+        target_temp=24.0,
+        vtherm_slope=0.3,  # raw slope positive in cool: the room is warming
+        hvac_mode="cool",
+        current_fan="high",
+        minutes_since_change=60.0,
+    )
+
+    assert mpc.get_live_mode_slope("high", "cool") == (pytest.approx(-0.3), False)
+    assert result["mpc_fan_mode"] == "superhigh"
+    assert result["mpc_would_change_now"] == "yes"
+
+
+def test_a_negative_seeded_slope_reaches_the_simulator() -> None:
+    """A speed seeded as losing ground must be simulated as losing ground.
+
+    ``_gap_slope`` floored every modelled slope at 0, so a silent seeded at
+    -0.5 degC/h was simulated as neutral -- the only place the negative value
+    ever mattered was the multi-rank step-down guard.
+    """
+    learning = ThermalLearning()
+    learning.set_mode_effective_slope("silent", "cool", -0.5)
+    learning.add_response_event(10.0, "cool")
+    mpc = MPCController(learning=learning, deadband=0.2, min_interval=10, fan_modes=["silent"])
+
+    result = mpc.evaluate(
+        current_temp=24.0,
+        target_temp=24.0,
+        vtherm_slope=0.0,
+        hvac_mode="cool",
+        current_fan="silent",
+        minutes_since_change=60.0,
+    )
+
+    assert result["mpc_predicted_temperature_30m"] > 24.1
+
+
+def _learning_with_measured_medium_and_high() -> ThermalLearning:
+    """Measured medium/high profiles, nothing known about low, default dead time."""
+    learning = ThermalLearning()
+    for _ in range(12):
+        learning.add_slope_sample("medium", 0.9, 0.8, "heat")
+        learning.add_slope_sample("high", 1.5, 0.8, "heat")
+    return learning
+
+
+def test_learning_hold_keeps_an_unmeasured_speed_until_it_can_be_sampled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dwell on a speed without a measured profile covers the learning gate.
+
+    Otherwise the change gate (1 x dead time) re-opens before the first sample
+    is recordable (1.5 x dead time) and the speed is left unmeasured -- hence
+    never credible on cost, hence never chosen again. Dead time here is the
+    10-minute default: hold = 15 + LEARNING_HOLD_EXTRA_MINUTES = 25 min.
+    """
+    mpc = _build_mpc(_learning_with_measured_medium_and_high())
+    kwargs = dict(current_temp=19.4, target_temp=20.0, vtherm_slope=0.0, hvac_mode="heat", current_fan="low")
+
+    held = mpc.evaluate(**kwargs, minutes_since_change=20.0)
+    assert held["mpc_would_change_now"] == "no"
+    assert "Learning hold: low has no measured profile yet" in held["mpc_reason"]
+
+    released = mpc.evaluate(**kwargs, minutes_since_change=30.0)
+    assert released["mpc_would_change_now"] == "yes"
+
+    # Control: without the hold the very same cycle would have switched.
+    monkeypatch.setattr(mpc_module, "LEARNING_HOLD_EXTRA_MINUTES", -100.0)
+    assert mpc.evaluate(**kwargs, minutes_since_change=20.0)["mpc_would_change_now"] == "yes"
+
+
+def test_learning_hold_yields_to_comfort() -> None:
+    """The hold never keeps a speed that is failing the room.
+
+    Released by the emergency escalation when the error grows past the budget,
+    and not applied at all past MULTI_RANK_JUMP_ERROR (a recovery, where the
+    speed has already shown what it can do).
+    """
+    mpc = _build_mpc(_learning_with_measured_medium_and_high())
+    kwargs = dict(target_temp=20.0, vtherm_slope=0.0, hvac_mode="heat", current_fan="low")
+
+    mpc.evaluate(current_temp=19.6, minutes_since_change=6.0, **kwargs)  # baseline: error 0.4
+    drifting = mpc.evaluate(current_temp=19.4, minutes_since_change=12.0, **kwargs)  # grew 0.2
+    assert drifting["mpc_would_change_now"] == "yes"
+    assert "Emergency escalation" in drifting["mpc_reason"]
+
+    far_off = _build_mpc(_learning_with_measured_medium_and_high()).evaluate(
+        current_temp=18.5, minutes_since_change=20.0, **kwargs
+    )
+    assert far_off["mpc_would_change_now"] == "yes"
+    assert "Learning hold" not in far_off["mpc_reason"]
+
+
+def test_a_climb_does_not_skip_an_unmeasured_rung() -> None:
+    """Rising past an intermediate speed nobody has measured is not allowed.
+
+    On 23 days of production, 26 of 29 climbs to superhigh came straight from
+    silent or low, so med and high were only ever run while the room was
+    already too cold -- where their slope is ~0 and says nothing. The rung is
+    tried first, unless the error is a recovery (> MULTI_RANK_JUMP_ERROR).
+    """
+    learning = ThermalLearning()
+    for _ in range(12):
+        learning.add_slope_sample("low", 0.2, 0.8, "heat")
+        learning.add_slope_sample("high", 1.5, 0.8, "heat")
+    learning.set_mode_effective_slope("medium", "heat", 0.9)  # seeded, never measured
+    mpc = _build_mpc(learning)
+    kwargs = dict(target_temp=20.0, vtherm_slope=0.2, hvac_mode="heat", current_fan="low", minutes_since_change=60.0)
+
+    stepped = mpc.evaluate(current_temp=19.1, **kwargs)
+    assert stepped["mpc_fan_mode"] == "medium"
+    assert "Blocked 2-rank jump to high: medium has no measured profile yet" in stepped["mpc_reason"]
+
+    recovery = mpc.evaluate(current_temp=18.5, **kwargs)
+    assert recovery["mpc_fan_mode"] == "high"
+    assert "Blocked" not in recovery["mpc_reason"]
+
+
+def test_notify_fan_change_resets_the_escalation_baseline() -> None:
+    """A fan change reported explicitly starts a fresh comfort-error baseline.
+
+    The time-based detection (first cycle within one cycle length of the
+    change) is a fallback only; a skipped cycle or an externally changed fan
+    left the escalation comparing against a baseline from a previous hold.
+    """
+    learning = _ready_learning_with_dead_time(20.0)
+    mpc = _build_mpc(learning, min_interval=10)
+    mpc.evaluate(current_temp=19.8, target_temp=20.0, vtherm_slope=0.25, hvac_mode="heat", current_fan="low", minutes_since_change=1.0)
+
+    # Without notification the old 0.2 baseline is kept: 0.4 reads as +0.2 growth.
+    stale = mpc.evaluate(current_temp=19.6, target_temp=20.0, vtherm_slope=0.25, hvac_mode="heat", current_fan="low", minutes_since_change=8.0)
+    assert "Emergency escalation" in stale["mpc_reason"]
+
+    # The same room state right after a (reported) change is a fresh baseline.
+    mpc.notify_fan_change()
+    fresh = mpc.evaluate(current_temp=19.6, target_temp=20.0, vtherm_slope=0.25, hvac_mode="heat", current_fan="low", minutes_since_change=8.0)
+    assert "Emergency escalation" not in fresh["mpc_reason"]
+    assert fresh["mpc_would_change_now"] == "no"

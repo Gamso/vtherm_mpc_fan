@@ -95,14 +95,19 @@ bash validate.sh                     # syntax/JSON/required-file checks (mirrors
 - `CONF_DEFROST_ENTITY` — optional entity for external defrost signal; fallback only, the underlying's own `hvac_action` is checked first
 - `CONF_FAN_MODE_ORDER` — optional explicit weakest-to-strongest fan speed order, overrides what the underlying climate reports
 - `SETPOINT_DROP_LEARNING_COOLDOWN = 30.0` — minutes to suppress learning after a large setpoint drop
-- `MIN_ESTABLISHED_RATIO = 2.0` — multiplier on dead_time; fan mode must be active this long before learning
-- `MIN_MODE_PROFILE_SAMPLES = 10` — minimum samples per fan mode before its profile is trusted
+- `MIN_ESTABLISHED_RATIO = 1.5` (= `DEAD_TIME_SAFETY_FACTOR`) — multiplier on dead_time; fan mode must be active this long before learning. Deliberately equal to the `ESTABLISHED` phase threshold: a stricter factor pushed the first sample past the point where the controller may change speed again
+- `MIN_MODE_PROFILE_SAMPLES = 10` — minimum samples per fan mode before its profile is trusted; the exploration guards count *measured* samples only (`has_measured_profile()`), seeded ones do not qualify
+- `PROFILE_RETENTION_SAMPLES = 40` — newest samples kept per profile regardless of age, so rare speeds accumulate across 7-day windows
+- `MIN_SAMPLES_LEARNING = 120` — global readiness; sized to what the window can hold (the old 240 was unreachable on real hardware)
+- `LEARNING_HOLD_EXTRA_MINUTES`, `MULTI_RANK_JUMP_ERROR` (mpc_controller.py) — the exploration guards: hold an unmeasured current speed until it can be sampled; never climb past an unmeasured, viable-looking rung unless the error is a recovery (> 1 °C) or the escalation guard fires
 
 ## Important Constraints
 
 - **Avoid over-engineering**: only add code that directly addresses the requirement
 - **No second-order slope terms**: VTherm slope is already EMA-smoothed; parabolic projection amplifies noise
-- **Learning data integrity**: exclude window-open, defrost, hvac-idle, setpoint-drop cooldown (30 min), and insufficiently-stable periods (< 2× dead_time) from slope samples
+- **Learning data integrity**: exclude window-open, defrost, hvac-idle, setpoint-drop cooldown (30 min), and insufficiently-stable periods (< 1.5× dead_time, the same `detect_phase()` the MPC uses) from slope samples. Do **not** filter near-zero slopes: a speed holding the room produces them, and they measure its intercept
+- **Exploration is a control concern**: a speed that is never measured is never credible on cost and never chosen, so the controller must create the observations (learning hold, climb guard) — no estimator can synthesise them. A fan change made outside the plugin restarts the dead time like one of ours (`_register_fan_change`)
+- **The current unmeasured speed is modelled on its observed slope**, never floored: a speed observably losing ground must lose ground in the simulation, and a negative reference slope (learned, seeded or observed) passes through `_gap_slope`
 - **Monotone constraint**: when all fan-mode profiles are learned, MPC enforces slope(mode_i) ≤ slope(mode_i+1) via isotonic forward pass; partial profiles skip the constraint
 - **Idle/defrost detection**: never fall back to VTherm's `is_device_active`/simulated `hvac_action` as the primary signal for pausing control — it is wrong precisely at equilibrium (see vocabulary above). Read the underlying's own `hvac_action` first.
 - **Never gate on `is_ready()` for anything but overall learning progress**: it counts slope samples against a global threshold and lags far behind per-mode profiles and the dead time, both of which mature much earlier. Confidence (`_compute_confidence`) and the adaptive interval (`_dead_time_is_trusted`) each had to be moved off it after it left them stuck at their fallback values indefinitely on real hardware.
