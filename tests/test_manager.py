@@ -403,10 +403,10 @@ class TestShouldCollectSlopeSample:
 
     @pytest.mark.asyncio
     async def test_not_stable_long_enough_skipped(self):
-        """15 min is below the 2 x 10 min dead-time settling window."""
+        """12 min is below the 1.5 x 10 min dead-time settling window."""
         manager = await self._manager()
         assert (
-            manager._should_collect_slope_sample(**self._kwargs(minutes_since_change=15.0))  # noqa: SLF001
+            manager._should_collect_slope_sample(**self._kwargs(minutes_since_change=12.0))  # noqa: SLF001
             is False
         )
 
@@ -551,3 +551,81 @@ async def test_manager_publishes_its_diagnostics_into_the_vtherm_state() -> None
     assert section["fan_mode_order"] == FAN_MODES
     assert "mpc_status" in section
     assert section["learning_ready"] is False
+
+
+
+# --- Audit 2026-09: what counts as a fan change ----------------------------
+@pytest.mark.asyncio
+async def test_an_external_fan_change_restarts_the_dead_time() -> None:
+    """A speed changed from the remote or an automation is still a change.
+
+    Only the plugin's own commands used to reset the change clock, so a manual
+    switch was immediately ESTABLISHED: its dead-time slopes were learned under
+    the new speed and the MPC was free to override it on the next cycle.
+    Another plugin owns the fan here so that no command of ours can be the
+    cause of the change.
+    """
+    import time
+
+    runtime = _make_runtime()
+    hass = _hass_with_auto_fan("vtherm-uid")
+    manager = await _build_manager(runtime, hass=hass)
+    await manager.refresh_state()
+    assert manager._last_change_time == 0.0  # noqa: SLF001
+
+    hass.states.get(runtime.entity_id).attributes["fan_mode"] = "high"
+    await manager.refresh_state()
+
+    assert manager._last_change_time == pytest.approx(time.time(), abs=5)  # noqa: SLF001
+    assert manager._response_armed is True  # noqa: SLF001
+    assert manager.last_decision["minutes_since_last_change"] < 1.0
+
+
+@pytest.mark.asyncio
+async def test_only_the_first_slope_move_after_a_change_is_a_response_event() -> None:
+    """One fan change, one response event.
+
+    Every slope jump inside the 60-minute window used to be recorded as another
+    response to the same change, so the median dead time drifted toward the
+    middle of the window -- and everything gated on it (change interval,
+    learning gate, simulated delay) stretched with it.
+    """
+    import time
+
+    runtime = _make_runtime(last_temperature_slope=-0.2)
+    manager = await _build_manager(runtime, hass=_hass_with_auto_fan("vtherm-uid"))
+    await manager.refresh_state()
+    manager._last_change_time = time.time() - 10 * 60  # noqa: SLF001
+    manager._response_armed = True  # noqa: SLF001
+
+    runtime.last_temperature_slope = -0.5
+    await manager.refresh_state()
+    assert manager.learning.response_event_count() == 1
+
+    runtime.last_temperature_slope = -0.9
+    await manager.refresh_state()
+    assert manager.learning.response_event_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_slope_samples_wait_for_the_learned_dead_time() -> None:
+    """The learner runs on the same dead time as the controller.
+
+    Gating the learner's dead time on is_ready() left it on the 10-minute
+    default while the MPC worked with a measured 24 minutes: samples were taken
+    20 minutes after a change, inside the real transient, labelled ESTABLISHED.
+    """
+    import time
+
+    runtime = _make_runtime()
+    manager = await _build_manager(runtime, hass=_hass_with_auto_fan("vtherm-uid"))
+    for _ in range(20):
+        manager.learning.add_response_event(24.0, "cool")
+
+    manager._last_change_time = time.time() - 20 * 60  # noqa: SLF001
+    await manager.refresh_state()
+    assert manager.learning.slope_sample_count() == 0
+
+    manager._last_change_time = time.time() - 40 * 60  # noqa: SLF001  (>= 1.5 x 24)
+    await manager.refresh_state()
+    assert manager.learning.slope_sample_count() == 1

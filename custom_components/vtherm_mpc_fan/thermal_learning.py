@@ -6,8 +6,12 @@ from .const import (
     MIN_SAMPLES_LEARNING,
     MIN_MODE_PROFILE_SAMPLES,
     DEFAULT_DEAD_TIME,
+    PROFILE_RETENTION_SAMPLES,
     REFERENCE_SLOPE_ERROR,
 )
+
+#: Cap on persisted slope samples (see to_dict). ~7 days at 2-min intervals.
+MAX_STORED_SLOPE_SAMPLES = 5000
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -52,7 +56,16 @@ class ThermalLearning:
         Samples are filtered out when:
         - Setpoint drop / night mode (error < -1°C)
         - Window is open (external disturbance, not representative)
-        - Slope is stagnant (no useful data)
+
+        A near-zero slope is deliberately *not* filtered out. The learned model
+        is ``slope(error) = a + b*error``, and a speed that holds the room at the
+        setpoint produces exactly that: slope ~0 at error ~0, which is the
+        measurement of its intercept ``a``. Rejecting |slope| below a threshold
+        censored the bottom of the distribution and biased ``a`` upward -- the
+        over-estimated low-speed profiles seen in production -- while starving
+        the intermediate speeds, whose only visits happen near equilibrium, of
+        the few samples they get (on a 23-day trace, 22 of high's 27 distinct
+        readings fell under the old 0.15 degC/h cut).
 
         Note: re-reading the *same* measurement because the control loop polled
         faster than the temperature source updates is a sampling artifact, not a
@@ -66,10 +79,6 @@ class ThermalLearning:
 
         if is_window_open:
             _LOGGER.debug("Learning: Skipped sample (window open)")
-            return
-
-        if abs(slope) < 0.15:
-            _LOGGER.debug("Learning: Skipped sample (stagnation, slope=%.2f)", slope)
             return
 
         self._slope_samples.append((time.time(), fan_mode, slope, hvac_mode, temperature_error))
@@ -105,12 +114,12 @@ class ThermalLearning:
                 f"{effective_slope:.3f}" if effective_slope is not None else "n/a",
             )
 
-        # Cleanup: keep only data within sliding window (7 days),
-        # but retain at least MIN_MODE_PROFILE_SAMPLES per profile so a rarely-used
-        # mode does not silently lose its learned profile after a quiet week.
+        # Cleanup: keep only data within sliding window (7 days), but retain the
+        # PROFILE_RETENTION_SAMPLES newest per profile so a rarely-used mode keeps
+        # accumulating measurements across weeks instead of losing them.
         cutoff_time = time.time() - (self._learning_window_hours * 3600)
         before = len(self._slope_samples)
-        self._slope_samples = self.trim_with_min_retention(self._slope_samples, cutoff_time, MIN_MODE_PROFILE_SAMPLES)
+        self._slope_samples = self.trim_with_min_retention(self._slope_samples, cutoff_time, PROFILE_RETENTION_SAMPLES)
 
         if len(self._slope_samples) < before:
             self.recompute_slope_stats()
@@ -326,12 +335,27 @@ class ThermalLearning:
         if len(matching) < MIN_MODE_PROFILE_SAMPLES:
             return None
 
-        median_eff = sign * statistics.median([s[2] for s in matching])
-
-        # Only samples that carry a stored error can drive the regression.
+        # Only samples that carry a stored error are measurements; the others are
+        # synthetic (set_mode_effective_slope) or predate the error column.
         points = [(s[4], sign * s[2]) for s in matching if len(s) > 4 and s[4] is not None]
+        constants = [sign * s[2] for s in matching if len(s) <= 4 or s[4] is None]
         if len(points) < MIN_MODE_PROFILE_SAMPLES:
-            return (median_eff, 0.0, None)
+            # Not enough measurements for a regression. A plain median over the
+            # mixed set would return the seeded value unchanged until the real
+            # samples outnumber the synthetic ones (ten identical values are the
+            # median of any set of fewer than twenty), hiding every bit of
+            # progress. Weight the two medians by their counts instead, so each
+            # measurement visibly pulls the profile toward what was observed.
+            median_constant = statistics.median(constants) if constants else None
+            median_measured = statistics.median([y for _, y in points]) if points else None
+            if median_constant is None:
+                return (median_measured, 0.0, None)
+            if median_measured is None:
+                return (median_constant, 0.0, None)
+            weight = len(points) / (len(points) + len(constants))
+            return (median_constant + weight * (median_measured - median_constant), 0.0, None)
+
+        median_eff = statistics.median([y for _, y in points])
 
         n = len(points)
         mean_x = sum(x for x, _ in points) / n
@@ -480,6 +504,25 @@ class ThermalLearning:
         """Return the number of collected samples for one fan/HVAC profile."""
         return sum(1 for s in self._slope_samples if s[1] == fan_mode and s[3] == hvac_mode)
 
+    def get_mode_real_sample_count(self, fan_mode: str, hvac_mode: str) -> int:
+        """Return how many of a profile's samples are actual measurements.
+
+        Synthetic samples (``set_mode_effective_slope``) and pre-schema ones carry
+        no comfort error. Only measured samples can drive the regression, so this
+        is the count that says whether the profile is *learned* rather than
+        merely *seeded* -- the distinction the exploration guards in the MPC and
+        the ``value_source`` attribute of the number entities rely on.
+        """
+        return sum(
+            1
+            for s in self._slope_samples
+            if s[1] == fan_mode and s[3] == hvac_mode and len(s) > 4 and s[4] is not None
+        )
+
+    def has_measured_profile(self, fan_mode: str, hvac_mode: str) -> bool:
+        """True once a profile rests on MIN_MODE_PROFILE_SAMPLES real measurements."""
+        return self.get_mode_real_sample_count(fan_mode, hvac_mode) >= MIN_MODE_PROFILE_SAMPLES
+
     def get_known_fan_modes(self) -> list[str]:
         """Return unique fan modes seen in slope samples, preserving first-seen order."""
         seen: dict[str, None] = {}
@@ -510,6 +553,7 @@ class ThermalLearning:
                 "r_squared": round(r_squared, 3) if r_squared is not None else None,
                 "thermal_time_constant_h": round(time_constant, 2) if time_constant is not None else None,
                 "samples": sample_count,
+                "real_samples": self.get_mode_real_sample_count(fan_mode, hvac_mode),
                 "ready": fit is not None,
             }
         return profiles
@@ -567,11 +611,18 @@ class ThermalLearning:
         """Serialize for storage.
 
         Both collections are capped to prevent unbounded storage growth:
-        - slope_samples: last 5 000 entries (~7 days at 2-min intervals)
+        - slope_samples: newest MAX_STORED_SLOPE_SAMPLES entries, plus whatever
+          older ones the per-profile retention keeps -- a plain tail cut dropped
+          exactly the retained samples of rarely-used speeds, since those are by
+          construction the oldest
         - response_events: last 100 entries (more than enough for statistics)
         """
+        samples = self._slope_samples
+        if len(samples) > MAX_STORED_SLOPE_SAMPLES:
+            cutoff = sorted(s[0] for s in samples)[-MAX_STORED_SLOPE_SAMPLES]
+            samples = self.trim_with_min_retention(samples, cutoff, PROFILE_RETENTION_SAMPLES)
         return {
-            "slope_samples": self._slope_samples[-5000:],
+            "slope_samples": samples,
             "response_events": self._response_events[-100:],
             "slope_count": self._slope_count,
             "slope_mean": self._slope_mean,
@@ -636,10 +687,11 @@ class ThermalLearning:
             else:
                 instance._response_events.append(tuple(event))
 
-        # Apply sliding window cleanup on restore, keeping at least MIN_MODE_PROFILE_SAMPLES
-        # per profile so learned modes survive a quiet week without new samples.
+        # Apply sliding window cleanup on restore, keeping the newest
+        # PROFILE_RETENTION_SAMPLES per profile so rarely-used modes keep what
+        # they gathered across weeks.
         cutoff_time = time.time() - (instance._learning_window_hours * 3600)
-        instance._slope_samples = ThermalLearning.trim_with_min_retention(instance._slope_samples, cutoff_time, MIN_MODE_PROFILE_SAMPLES)
+        instance._slope_samples = ThermalLearning.trim_with_min_retention(instance._slope_samples, cutoff_time, PROFILE_RETENTION_SAMPLES)
         instance._response_events = [item for item in instance._response_events if item[0] > cutoff_time]
 
         # Rebuild stats from cleaned window

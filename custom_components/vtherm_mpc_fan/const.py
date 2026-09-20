@@ -76,14 +76,28 @@ PHASE_TRANSIENT = "TRANSIENT"
 PHASE_ESTABLISHED = "ESTABLISHED"
 
 # Learning
-MIN_SAMPLES_LEARNING = 240  # Minimum slope samples required for initial readiness
-MIN_MODE_PROFILE_SAMPLES = 10  # Minimum samples per fan mode to consider profile reliable
+# Global readiness threshold. Sized against what the sliding window can actually
+# hold: with the duplicate filter below, a 0.2 degC room sensor yields roughly
+# 20-30 accepted samples per day, so a 7-day window tops out near 180 samples.
+# The previous 240 was unreachable on real hardware and is_ready() never flipped.
+MIN_SAMPLES_LEARNING = 120  # Minimum slope samples required for initial readiness
+MIN_MODE_PROFILE_SAMPLES = 10  # Minimum *measured* samples per fan mode to trust its profile
+# Newest samples always kept per (fan_mode, hvac_mode) profile, however old they
+# are. The reliability gate above counts measured samples, and a rarely-used
+# speed collects a handful per week: expiring them by date alone (the 7-day
+# window) meant a profile could never accumulate ten, and lost each week what it
+# had gathered the week before. Retention by count lets it build up across weeks.
+PROFILE_RETENTION_SAMPLES = 40
 REFERENCE_SLOPE_ERROR = 1.0  # °C – reference comfort error at which the representative
 # "working" effective slope is reported. The learned slope model is slope(error) = a + b·error;
 # evaluating it at this gap yields a value reflecting real cooling/heating power rather than the
 # near-equilibrium median, which is structurally diluted by samples taken close to the setpoint.
 SETPOINT_DROP_LEARNING_COOLDOWN = 30.0  # Minutes to block learning after a setpoint drop
-MIN_ESTABLISHED_RATIO = 2.0  # Minimum factor × dead_time the fan mode must be active before learning
+# Minimum factor x dead_time the fan mode must be active before learning. Equal to
+# DEAD_TIME_SAFETY_FACTOR on purpose: the phase gate already requires ESTABLISHED
+# (1.5 x dead_time), and a stricter second factor only pushed the first sample
+# past the point where the controller is allowed to change speed again.
+MIN_ESTABLISHED_RATIO = DEAD_TIME_SAFETY_FACTOR
 
 # VTherm recomputes its temperature slope only when the room sensor reports a new
 # value, so consecutive control cycles frequently observe the very same slope. A
