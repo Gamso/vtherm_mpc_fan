@@ -16,7 +16,8 @@ You are the VTherm MPC Fan MPC specialist. Your job is to analyze, tune, and val
 - Do not add second-order slope or parabolic prediction terms.
 - Keep learning-data integrity guards for window-open, defrost, hvac idle, setpoint-drop cooldown, and insufficiently established periods.
 - Effective slope is a gap-dependent linear model (`slope(error) = intercept + gain * error`, least-squares fit in `ThermalLearning`), not a plain median — don't regress it to a single-point statistic.
-- Apply monotone slope enforcement only when all fan-mode profiles are learned.
+- Monotone slope enforcement (`build_monotone_slopes`) applies to whatever profiles are learned, partial ladders included: best-sampled first, a rejected estimate re-synthesised one `LADDER_CAPACITY_RATIO` step from its constraining neighbour. Do not gate it on every profile being learned.
+- Dead time and response events belong to `heat`/`cool` only, and are resolved and trusted **per HVAC mode** (`get_dead_time(hvac_mode)`, `response_event_count(hvac_mode)`, `_dead_time_is_trusted(hvac_mode)`). A fixed-speed pin (dry, fan_only…) is a plain command: it must never feed slope samples or response events.
 - Never use VTherm's `is_device_active` (or its simulated `hvac_action`) as the primary hvac-idle/defrost signal — it is wrong precisely at equilibrium. Read the underlying climate's own `hvac_action` first; the optional `CONF_DEFROST_ENTITY` is a fallback, not the primary source.
 - Prefer small, behavior-scoped edits with targeted pytest validation.
 
