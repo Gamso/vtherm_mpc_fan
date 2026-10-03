@@ -1,6 +1,7 @@
 import logging
 import time
 import statistics
+from collections import Counter
 
 from .const import (
     MIN_SAMPLES_LEARNING,
@@ -37,6 +38,10 @@ class ThermalLearning:
 
         # Cache for computed optimal parameters (invalidated on each new sample)
         self._optimal_cache: dict | None = None
+        # Per-profile regression results, keyed (fan_mode, hvac_mode). Every
+        # entity and every MPC candidate reads the same few fits several times
+        # per cycle; they only change when the sample list does.
+        self._fit_cache: dict[tuple[str, str], tuple[float, float, float | None] | None] = {}
 
     def reset(self) -> None:
         """Reset all learning data and statistics."""
@@ -48,6 +53,7 @@ class ThermalLearning:
         self._slope_max = 0.0
         self._ready_once = False
         self._optimal_cache = None
+        self._fit_cache.clear()
         self._profile_ready_logged.clear()
         _LOGGER.info("Learning: reset requested; data cleared")
 
@@ -83,6 +89,7 @@ class ThermalLearning:
             return
 
         self._slope_samples.append((time.time(), fan_mode, slope, hvac_mode, temperature_error))
+        self._fit_cache.clear()
         profile_samples = self.get_mode_sample_count(fan_mode, hvac_mode)
         _LOGGER.debug(
             "Learning: Collected slope sample #%d (fan=%s, slope=%.2f, err=%.2f, hvac=%s, profile=%d/%d)",
@@ -121,6 +128,9 @@ class ThermalLearning:
         cutoff_time = time.time() - (self._learning_window_hours * 3600)
         before = len(self._slope_samples)
         self._slope_samples = self.trim_with_min_retention(self._slope_samples, cutoff_time, PROFILE_RETENTION_SAMPLES)
+        # The trim may reorder samples even when it drops none, and the
+        # regression sums in list order: never serve a fit from the old order.
+        self._fit_cache.clear()
 
         if len(self._slope_samples) < before:
             self.recompute_slope_stats()
@@ -290,6 +300,7 @@ class ThermalLearning:
     def slope_samples(self, value: list) -> None:
         self._slope_samples = value
         self._optimal_cache = None
+        self._fit_cache.clear()
 
     @property
     def response_events(self) -> list:
@@ -332,6 +343,17 @@ class ThermalLearning:
         return statistics.median(response_times)
 
     def _fit_mode_slope(self, fan_mode: str, hvac_mode: str) -> tuple[float, float, float | None] | None:
+        """Return the profile's fit, computed once per change of the sample list.
+
+        See :meth:`_compute_mode_fit` for the model. The result is a tuple (or
+        None) and is never mutated by callers, so it is safe to share.
+        """
+        key = (fan_mode, hvac_mode)
+        if key not in self._fit_cache:
+            self._fit_cache[key] = self._compute_mode_fit(fan_mode, hvac_mode)
+        return self._fit_cache[key]
+
+    def _compute_mode_fit(self, fan_mode: str, hvac_mode: str) -> tuple[float, float, float | None] | None:
         """Fit the gap-dependent slope model and return (intercept_a, gain_b, r_squared).
 
         The effective cooling/heating rate is not constant: it scales with the
@@ -513,6 +535,7 @@ class ThermalLearning:
         # Remove existing samples for this profile
         before = len(self._slope_samples)
         self._slope_samples = [s for s in self._slope_samples if not (s[1] == fan_mode and s[3] == hvac_mode)]
+        self._fit_cache.clear()
         removed = before - len(self._slope_samples)
 
         # Insert MIN_MODE_PROFILE_SAMPLES synthetic samples at current time.
@@ -665,10 +688,14 @@ class ThermalLearning:
         self._slope_m2 = 0.0
         self._slope_max = 0.0
         self._optimal_cache = None  # Invalidate cache when stats are rebuilt
+        self._fit_cache.clear()
+        # One counting pass: asking get_mode_sample_count() for every sample
+        # rescanned the whole list each time, O(n^2) on the event loop at load.
+        profile_counts = Counter((s[3], s[1]) for s in self._slope_samples)
         self._profile_ready_logged = {
-            (s[3], s[1])
-            for s in self._slope_samples
-            if s[3] != "unknown" and self.get_mode_sample_count(s[1], s[3]) >= MIN_MODE_PROFILE_SAMPLES
+            profile
+            for profile, count in profile_counts.items()
+            if profile[0] != "unknown" and count >= MIN_MODE_PROFILE_SAMPLES
         }
 
         for sample in self._slope_samples:
