@@ -12,10 +12,13 @@ from custom_components.vtherm_mpc_fan.config_flow import (
     _fan_order_field_key,
     _fan_order_schema,
     assemble_fan_order,
+    extract_all_fan_modes,
     extract_fan_modes,
+    extract_fixed_fan_hvac_modes,
     validate_fan_order,
+    validate_fixed_fan,
 )
-from custom_components.vtherm_mpc_fan.const import CONF_FAN_MODE_ORDER
+from custom_components.vtherm_mpc_fan.const import CONF_FAN_MODE_ORDER, CONF_FIXED_FAN_SPEED
 from custom_components.vtherm_mpc_fan.manager import apply_configured_fan_order
 from custom_components.vtherm_mpc_fan.registry import find_conflicting_plugin
 
@@ -177,3 +180,38 @@ def test_apply_configured_fan_order_tolerates_drift() -> None:
     configured = ["low", "med", "high", "retired"]  # 'retired' no longer exists
 
     assert apply_configured_fan_order(detected, configured) == ["low", "med", "high", "turbo"]
+
+
+def test_extract_fixed_fan_hvac_modes_drops_off_and_regulated_modes() -> None:
+    """Pinnable modes exclude off and the always-regulated heat/cool."""
+    state = MagicMock()
+    state.attributes = {"hvac_modes": ["off", "heat", "cool", "dry", "fan_only"]}
+    assert extract_fixed_fan_hvac_modes(state) == ["dry", "fan_only"]
+
+
+def test_extract_fixed_fan_hvac_modes_falls_back_when_nothing_is_reported() -> None:
+    """An unavailable climate still leaves the usual modes selectable."""
+    assert extract_fixed_fan_hvac_modes(None) == ["dry", "fan_only"]
+    state = MagicMock()
+    state.attributes = {}
+    assert extract_fixed_fan_hvac_modes(state) == ["dry", "fan_only"]
+
+
+def test_extract_all_fan_modes_keeps_auto() -> None:
+    """A pinned speed may be auto, unlike the MPC's manual-only ladder."""
+    state = MagicMock()
+    state.attributes = {"fan_modes": ["auto", "low", "superhigh"]}
+    assert extract_all_fan_modes(state) == ["auto", "low", "superhigh"]
+    assert extract_all_fan_modes(None) == []
+
+
+def test_validate_fixed_fan_accepts_valid_choices() -> None:
+    """A speed with modes, or no pinned modes at all, is valid."""
+    assert validate_fixed_fan(["dry", "fan_only"], "superhigh") == {}
+    assert validate_fixed_fan([], None) == {}
+    assert validate_fixed_fan(None, None) == {}
+
+
+def test_validate_fixed_fan_requires_a_speed_for_fixed_modes() -> None:
+    """Pinning modes without a speed would silently do nothing."""
+    assert validate_fixed_fan(["dry"], None) == {CONF_FIXED_FAN_SPEED: "fixed_fan_speed_required"}

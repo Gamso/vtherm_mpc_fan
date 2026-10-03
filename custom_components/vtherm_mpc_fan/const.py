@@ -15,6 +15,8 @@ CONF_MIN_INTERVAL = "min_interval"
 CONF_DATA_COLLECTION = "data_collection"
 CONF_DEFROST_ENTITY = "defrost_entity"
 CONF_FAN_MODE_ORDER = "fan_mode_order"  # explicit weakest-to-strongest order, overrides the climate entity's
+CONF_FIXED_FAN_HVAC_MODES = "fixed_fan_hvac_modes"  # HVAC modes (other than heat/cool) in which the fan is pinned to a fixed speed
+CONF_FIXED_FAN_SPEED = "fixed_fan_speed"  # the speed pinned in CONF_FIXED_FAN_HVAC_MODES
 
 # Feature-manager identity registered with the VTherm API.
 FEATURE_MANAGER_MPC_FAN = "mpc_fan"
