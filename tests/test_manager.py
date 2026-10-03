@@ -904,3 +904,38 @@ async def test_a_real_setpoint_drop_in_heat_still_starts_the_cooldown() -> None:
     await manager.refresh_state()
 
     assert manager._last_setpoint_drop_time > 0.0  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "detected"),
+    [
+        ("Ready", True),
+        ("Low confidence", True),
+        ("Setpoint drop", True),
+        ("Forced", False),
+        ("Fixed", False),
+        ("Unavailable", False),
+        ("Idle", False),
+        ("Disturbed", False),
+        (None, False),
+    ],
+)
+async def test_is_detected_means_the_mpc_is_steering(status, detected) -> None:
+    """Forced and Fixed set the fan, but they are not MPC regulation."""
+    manager = await _build_manager()
+    manager._last_decision = {"mpc_status": status} if status else {}  # noqa: SLF001
+
+    assert manager.is_detected is detected
+
+
+@pytest.mark.asyncio
+async def test_is_detected_is_false_in_a_pinned_mode() -> None:
+    """End to end: a cycle in a fixed-speed mode does not report regulation."""
+    runtime = _make_runtime(vtherm_hvac_mode="dry")
+    manager = await _build_manager(runtime, **FIXED_FAN_CONFIG)
+
+    await manager.refresh_state()
+
+    assert manager.last_decision["mpc_status"] == "Fixed"
+    assert manager.is_detected is False

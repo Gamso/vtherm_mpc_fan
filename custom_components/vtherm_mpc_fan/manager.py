@@ -70,6 +70,10 @@ ATTR_MPC_FAN_SECTION = "mpc_fan"
 #: Statuses where the MPC declines to steer and the current fan must be held.
 MPC_PAUSED_STATUSES = frozenset({"Idle", "Disturbed", "Not ready"})
 
+#: Statuses where the fan is set, or held, by something other than the MPC's
+#: own regulation: the force_fan override, the fixed-speed pin, or no ladder yet.
+NOT_MPC_DRIVEN_STATUSES = MPC_PAUSED_STATUSES | {"Forced", "Fixed", "Unavailable"}
+
 #: Defrost is inferred from an external entity and then held for this long, since
 #: the heat pump keeps recovering after the flag itself clears.
 DEFROST_COOLDOWN_MINUTES = 20.0
@@ -350,9 +354,15 @@ class MpcFanFeatureManager:
 
     @property
     def is_detected(self) -> bool:
-        """True when the MPC is actively steering (not paused, not forced)."""
+        """True when the MPC is actively steering (not paused, forced or pinned).
+
+        This is the ``InterfaceFeatureManager`` "condition detected" flag: for
+        this plugin, that the fan speed is currently the MPC's decision. A
+        force_fan override or a fixed-speed pin also sets the fan, but neither
+        is regulation, so neither counts.
+        """
         status = self._last_decision.get("mpc_status")
-        return bool(status) and status not in MPC_PAUSED_STATUSES
+        return bool(status) and status not in NOT_MPC_DRIVEN_STATUSES
 
     # ------------------------------------------------------------------
     # Configuration
