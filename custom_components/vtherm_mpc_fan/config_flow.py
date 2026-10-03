@@ -16,15 +16,20 @@ from .const import (
     CONF_DEADBAND,
     CONF_DEFROST_ENTITY,
     CONF_FAN_MODE_ORDER,
+    CONF_FIXED_FAN_HVAC_MODES,
+    CONF_FIXED_FAN_SPEED,
     CONF_MIN_INTERVAL,
     CONF_TARGET_VTHERM,
     DEFAULT_DATA_COLLECTION,
     DEFAULT_DEADBAND,
     DEFAULT_MIN_INTERVAL,
     DOMAIN,
+    PROFILE_HVAC_MODES,
     VTHERM_DOMAIN,
 )
 from .registry import find_conflicting_plugin
+
+FALLBACK_FIXED_FAN_HVAC_MODES = ("dry", "fan_only")
 
 
 def extract_fan_modes(state) -> list[str]:
@@ -39,6 +44,79 @@ def extract_fan_modes(state) -> list[str]:
         for mode in raw_modes
         if isinstance(mode, str) and mode.lower() not in {"auto", "off"}
     ]
+
+
+def extract_fixed_fan_hvac_modes(state) -> list[str]:
+    """Return the HVAC modes a climate state offers for a fixed fan speed.
+
+    Excludes off, and heat/cool, which the MPC always regulates. Falls back to
+    the usual non-regulated modes when the entity does not (yet) report any, so
+    the option stays usable while the climate is unavailable.
+    """
+    raw_modes = state.attributes.get("hvac_modes") if state is not None else None
+    modes = [
+        mode
+        for mode in raw_modes or []
+        if isinstance(mode, str) and mode.lower() != "off" and mode not in PROFILE_HVAC_MODES
+    ]
+    return modes or list(FALLBACK_FIXED_FAN_HVAC_MODES)
+
+
+def extract_all_fan_modes(state) -> list[str]:
+    """Return every fan mode a climate state exposes, auto included.
+
+    A pinned speed has no need of the MPC's manual-only filter: "auto" is a
+    legitimate speed to hold in dry or fan-only mode.
+    """
+    raw_modes = state.attributes.get("fan_modes") if state is not None else None
+    return [mode for mode in raw_modes or [] if isinstance(mode, str)]
+
+
+def validate_fixed_fan(fixed: list[str] | None, fixed_speed: str | None) -> dict[str, str]:
+    """Return per-field error keys for the fixed-speed HVAC mode choice.
+
+    Pinning modes without saying which speed would do nothing, so that is
+    rejected rather than silently ignored.
+    """
+    if fixed and not fixed_speed:
+        return {CONF_FIXED_FAN_SPEED: "fixed_fan_speed_required"}
+    return {}
+
+
+def _fixed_fan_schema(
+    defaults: dict[str, Any], mode_choices: list[str], speed_choices: list[str]
+) -> dict:
+    """Build the fixed-speed fields: which HVAC modes pin the fan, and to what.
+
+    Already-stored choices stay selectable even if the climate stopped
+    reporting them, so a saved value is never defaulted outside its own options.
+    """
+    stored_modes = defaults.get(CONF_FIXED_FAN_HVAC_MODES) or []
+    mode_choices = mode_choices + [m for m in stored_modes if m not in mode_choices]
+    stored_speed = defaults.get(CONF_FIXED_FAN_SPEED)
+    if stored_speed and stored_speed not in speed_choices:
+        speed_choices = speed_choices + [stored_speed]
+
+    schema: dict[Any, Any] = {
+        vol.Optional(
+            CONF_FIXED_FAN_HVAC_MODES, default=stored_modes
+        ): selector.SelectSelector(
+            selector.SelectSelectorConfig(
+                options=mode_choices,
+                multiple=True,
+                mode=selector.SelectSelectorMode.LIST,
+            )
+        ),
+    }
+    if speed_choices:
+        schema[
+            vol.Optional(CONF_FIXED_FAN_SPEED, default=defaults.get(CONF_FIXED_FAN_SPEED, vol.UNDEFINED))
+        ] = selector.SelectSelector(
+            selector.SelectSelectorConfig(
+                options=speed_choices, mode=selector.SelectSelectorMode.DROPDOWN
+            )
+        )
+    return schema
 
 
 def _fan_order_field_key(rank: int) -> str:
@@ -223,13 +301,20 @@ class VThermMpcFanOptionsFlow(OptionsFlow):
         current = {**self.config_entry.data, **self.config_entry.options}
         errors: dict[str, str] = {}
 
-        detected = self._detected_fan_modes(current.get(CONF_TARGET_VTHERM))
+        state = self._target_state(current.get(CONF_TARGET_VTHERM))
+        detected = extract_fan_modes(state)
 
         if user_input is not None:
             fan_order = assemble_fan_order(user_input, detected)
             order_error = validate_fan_order(fan_order, detected)
             if order_error:
                 errors["base"] = order_error
+            errors.update(
+                validate_fixed_fan(
+                    user_input.get(CONF_FIXED_FAN_HVAC_MODES),
+                    user_input.get(CONF_FIXED_FAN_SPEED),
+                )
+            )
             if not errors:
                 data = {
                     key: value
@@ -242,23 +327,31 @@ class VThermMpcFanOptionsFlow(OptionsFlow):
 
             # Re-show exactly what was submitted (duplicates included) so the
             # mistake is visible in place, rather than resetting to the old order.
-            current = {**current, CONF_FAN_MODE_ORDER: fan_order}
+            current = {**current, CONF_FAN_MODE_ORDER: fan_order, **user_input}
 
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(
-                {**_settings_schema(current), **_fan_order_schema(current, detected)}
+                {
+                    **_settings_schema(current),
+                    **_fixed_fan_schema(
+                        current,
+                        extract_fixed_fan_hvac_modes(state),
+                        extract_all_fan_modes(state),
+                    ),
+                    **_fan_order_schema(current, detected),
+                }
             ),
             errors=errors,
         )
 
-    def _detected_fan_modes(self, target_unique_id: str | None) -> list[str]:
-        """Return the fan modes of the VTherm this entry targets."""
+    def _target_state(self, target_unique_id: str | None):
+        """Return the state of the VTherm this entry targets, or None."""
         if not target_unique_id:
-            return []
+            return None
         entity_id = er.async_get(self.hass).async_get_entity_id(
             CLIMATE_DOMAIN, VTHERM_DOMAIN, target_unique_id
         )
         if entity_id is None:
-            return []
-        return extract_fan_modes(self.hass.states.get(entity_id))
+            return None
+        return self.hass.states.get(entity_id)

@@ -629,3 +629,91 @@ async def test_slope_samples_wait_for_the_learned_dead_time() -> None:
     manager._last_change_time = time.time() - 40 * 60  # noqa: SLF001  (>= 1.5 x 24)
     await manager.refresh_state()
     assert manager.learning.slope_sample_count() == 1
+
+
+FIXED_FAN_CONFIG = {"fixed_fan_hvac_modes": ["dry", "fan_only"], "fixed_fan_speed": "superhigh"}
+
+
+@pytest.mark.asyncio
+async def test_fixed_fan_is_applied_on_entering_a_fixed_mode() -> None:
+    """In a fixed-speed mode the pinned speed is sent without waiting for the MPC."""
+    runtime = _make_runtime(vtherm_hvac_mode="dry")
+    manager = await _build_manager(runtime, **FIXED_FAN_CONFIG)
+
+    changed = await manager.refresh_state()
+
+    assert changed is True
+    runtime.async_set_underlying_fan_mode.assert_awaited_once_with("superhigh")
+    assert manager.last_decision["mpc_status"] == "Fixed"
+    assert manager.last_decision["mpc_fan_mode"] == "superhigh"
+
+
+@pytest.mark.asyncio
+async def test_fixed_fan_does_not_apply_in_a_regulated_mode() -> None:
+    """heat/cool stay with the MPC even when other modes are pinned."""
+    runtime = _make_runtime(vtherm_hvac_mode="cool")
+    manager = await _build_manager(runtime, **FIXED_FAN_CONFIG)
+
+    await manager.refresh_state()
+
+    assert manager.last_decision["mpc_status"] != "Fixed"
+
+
+@pytest.mark.asyncio
+async def test_unpinned_mode_without_regulation_leaves_the_fan_alone() -> None:
+    """A mode that is neither regulated nor pinned holds the current fan."""
+    runtime = _make_runtime(vtherm_hvac_mode="dry")
+    manager = await _build_manager(runtime)
+
+    changed = await manager.refresh_state()
+
+    assert changed is False
+    runtime.async_set_underlying_fan_mode.assert_not_awaited()
+    assert manager.last_decision["mpc_status"] == "Idle"
+
+
+@pytest.mark.asyncio
+async def test_fixed_fan_respects_the_min_interval_after_a_change() -> None:
+    """A manual change inside the mode is not reverted on the next cycle."""
+    import time
+
+    runtime = _make_runtime(vtherm_hvac_mode="dry")
+    manager = await _build_manager(runtime, min_interval=10, **FIXED_FAN_CONFIG)
+    await manager.refresh_state()
+    runtime.async_set_underlying_fan_mode.reset_mock()
+
+    await manager.refresh_state()  # same mode, change was just made
+    runtime.async_set_underlying_fan_mode.assert_not_awaited()
+
+    manager._last_change_time = time.time() - 11 * 60  # noqa: SLF001
+    await manager.refresh_state()
+    runtime.async_set_underlying_fan_mode.assert_awaited_once_with("superhigh")
+
+
+@pytest.mark.asyncio
+async def test_forced_fan_takes_precedence_over_the_fixed_fan() -> None:
+    """force_fan is an explicit, time-boxed override and wins over the pin."""
+    import time
+
+    runtime = _make_runtime(vtherm_hvac_mode="dry")
+    manager = await _build_manager(runtime, **FIXED_FAN_CONFIG)
+    manager.force = FanOverride(fan_mode="silent", until=time.time() + 600)
+
+    await manager.refresh_state()
+
+    assert manager.last_decision["mpc_status"] == "Forced"
+    runtime.async_set_underlying_fan_mode.assert_awaited_once_with("silent")
+
+
+@pytest.mark.asyncio
+async def test_fixed_fan_ignored_when_the_underlying_no_longer_offers_it() -> None:
+    """A pinned speed that vanished degrades to holding the current fan."""
+    runtime = _make_runtime(vtherm_hvac_mode="dry")
+    manager = await _build_manager(
+        runtime, fixed_fan_hvac_modes=["dry"], fixed_fan_speed="turbo"
+    )
+
+    changed = await manager.refresh_state()
+
+    assert changed is False
+    assert manager.last_decision["mpc_status"] == "Idle"

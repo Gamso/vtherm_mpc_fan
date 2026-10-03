@@ -372,11 +372,12 @@ class MPCController:
             is_window_open,
         )
 
-        if hvac_mode in ("off", "dry", "fan_only"):
+        # Only heat/cool have a defined comfort-error direction and learned profiles.
+        if hvac_mode not in PROFILE_HVAC_MODES:
             return self._payload(
                 status="Idle",
                 fan_mode=current_fan,
-                reason=f"HVAC mode '{hvac_mode}' is not simulated",
+                reason=f"HVAC mode '{hvac_mode}' is not regulated",
                 would_change_now="no",
             )
 

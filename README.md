@@ -135,6 +135,8 @@ All parameters can be changed at any time via **Settings → Devices & Services 
 | **Data Collection**    | `true`   | —                | Records one CSV row per control cycle in the HA config folder (`vtherm_mpc_fan_data_XXXXXXXX.csv`, max 10 MB, auto-rotated). Useful for offline analysis.               |
 | **Defrost Entity**     | *(none)* | —                | Optional entity (`binary_sensor`, `sensor`, or `input_boolean`) that reports when the heat pump is in a defrost cycle. VTherm does not report this itself. See [Defrost Detection](#defrost-detection). |
 | **Fan Speed Order**    | detected | —                | One dropdown per fan speed rank, only shown once the underlying's fan modes are known (options-flow only). See [Fan Speed Order](#fan-speed-order).                     |
+| **HVAC modes with a fixed fan speed** | *(none)* | modes the VTherm reports except `off`, `heat`, `cool` | In these modes the fan is pinned to the **Fixed fan speed** — e.g. `dry` and `fan_only` at `superhigh` (options-flow only). See [HVAC Modes](#hvac-modes). |
+| **Fixed fan speed**    | *(none)* | fan modes the underlying reports | The speed used in the fixed-speed modes. Required as soon as one fixed-speed mode is selected (options-flow only).                                    |
 
 There is no "operating entity" or "outdoor temperature" option to set: both come from the VTherm runtime automatically (`is_device_active`, `current_outdoor_temperature`) — see [HVAC Idle Detection](#hvac-idle-detection).
 
@@ -247,6 +249,12 @@ This is read straight from VTherm's own runtime (`is_device_active`) — **no co
 
 Also read straight from VTherm: when VTherm itself has stopped the underlying because a window is open (`hvac_off_reason == "hvac_off_window_detection"`), the MPC pauses (`Disturbed`) and learning is excluded — no separate configuration.
 
+### HVAC Modes
+
+The MPC regulates the fan only in `heat` and `cool` (not configurable): they are the only modes with a defined comfort direction and learned profiles. In every other mode (`off`, `dry`, `fan_only`, `heat_cool`, `auto`…) it is paused (`Idle`) and the fan is left untouched — unless that mode has a fixed fan speed.
+
+**Fixed fan speed per HVAC mode.** Pick the modes (for instance `dry` and `fan_only`) and the speed (for instance `superhigh`) in the options flow. When the thermostat enters one of those modes the speed is applied on the next control cycle. While it stays in the mode the plugin re-applies the speed only once **Min Interval** has elapsed since the last fan change, so a manual speed change is respected for that long before being reverted. `mpc_status` reports `Fixed` and `mpc_reason` names the mode. A `force_fan` override takes precedence over the pin.
+
 ### Fan Speed Order
 
 The controller treats a fan mode's position in its list as its strength: it drives the energy-cost term, the step-down safety guard, and the fallback estimate used for a speed that has not been learned yet. By default this order is whatever the underlying climate reports, which is usually correct.
@@ -321,7 +329,7 @@ Entity IDs are scoped by the VTherm you attached this plugin to (not the underly
 
 | Entity                                                                | Unit  | Description                                                        |
 | ----------------------------------------------------------------------- | ----- | --------------------------------------------------------------------- |
-| `sensor.vtherm_mpc_fan_living_room_mpc_status`                          | —     | MPC state (`Not ready`, `Ready`, `Disturbed`, `Idle`, `Forced`, etc.) |
+| `sensor.vtherm_mpc_fan_living_room_mpc_status`                          | —     | MPC state (`Not ready`, `Ready`, `Disturbed`, `Idle`, `Fixed`, `Forced`, etc.) |
 | `sensor.vtherm_mpc_fan_living_room_mpc_reason`                          | —     | Explanation of the current MPC recommendation                        |
 | `sensor.vtherm_mpc_fan_living_room_mpc_fan_mode`                        | —     | Fan mode chosen by the MPC                                            |
 | `sensor.vtherm_mpc_fan_living_room_mpc_would_change_now`                | —     | Whether the MPC would actively change the fan right now              |

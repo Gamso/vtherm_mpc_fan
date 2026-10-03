@@ -82,6 +82,29 @@ def test_mpc_idle_for_unsimulated_hvac_modes() -> None:
     assert result["mpc_would_change_now"] == "no"
 
 
+def test_mpc_idle_for_modes_without_a_comfort_direction() -> None:
+    """Only heat/cool are regulated; every other mode pauses the MPC."""
+    mpc = MPCController(
+        learning=ThermalLearning(),
+        deadband=0.3,
+        min_interval=10,
+        fan_modes=FAN_MODES,
+    )
+
+    for hvac_mode in ("dry", "fan_only", "heat_cool", "auto"):
+        result = mpc.evaluate(
+            current_temp=26.0,
+            target_temp=24.0,
+            vtherm_slope=0.0,
+            hvac_mode=hvac_mode,
+            current_fan="medium",
+        )
+
+        assert result["mpc_status"] == "Idle", hvac_mode
+        assert result["mpc_fan_mode"] == "medium"
+        assert "not regulated" in result["mpc_reason"]
+
+
 def test_mpc_prefers_stronger_fan_when_profiles_support_it() -> None:
     """MPC picks a stronger fan mode when learned profiles support it."""
     learning = ThermalLearning()

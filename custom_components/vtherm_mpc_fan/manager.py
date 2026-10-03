@@ -27,6 +27,8 @@ from .const import (
     CONF_DEADBAND,
     CONF_DEFROST_ENTITY,
     CONF_FAN_MODE_ORDER,
+    CONF_FIXED_FAN_HVAC_MODES,
+    CONF_FIXED_FAN_SPEED,
     CONF_MIN_INTERVAL,
     CONF_TARGET_VTHERM,
     DEFAULT_CYCLE_MINUTES,
@@ -711,7 +713,8 @@ class MpcFanFeatureManager:
 
         # Reset slope memory on HVAC mode switch: a heating slope tells us
         # nothing about the cooling response and vice versa.
-        if self._last_hvac_mode is not None and self._last_hvac_mode != hvac_mode:
+        hvac_mode_changed = self._last_hvac_mode != hvac_mode
+        if self._last_hvac_mode is not None and hvac_mode_changed:
             _LOGGER.info(
                 "HVAC mode changed %s -> %s: resetting slope memory",
                 self._last_hvac_mode,
@@ -746,6 +749,7 @@ class MpcFanFeatureManager:
         )
 
         active_force = self._resolve_active_force(now)
+        fixed_fan = self._resolve_fixed_fan(hvac_mode)
         if active_force is not None:
             forced_fan, deadline = active_force
             remaining_min = (deadline - now) / 60.0
@@ -757,6 +761,23 @@ class MpcFanFeatureManager:
                 "mpc_fan_mode": forced_fan,
                 "mpc_reason": effective_reason,
                 "mpc_would_change_now": "yes" if forced_fan != current_fan else "no",
+            }
+        elif fixed_fan is not None:
+            # Applied at once on entering the mode; afterwards the min interval
+            # applies, so a manual change (which restarts it) is not reverted on
+            # the very next cycle.
+            min_interval = self._config().get(CONF_MIN_INTERVAL, DEFAULT_MIN_INTERVAL)
+            apply_pin = hvac_mode_changed or minutes_since_change >= min_interval
+            effective_fan = fixed_fan if apply_pin else current_fan
+            effective_reason = f"Fixed fan '{fixed_fan}' for HVAC mode '{hvac_mode}'"
+            decision = {
+                **decision,
+                "mpc_status": "Fixed",
+                "mpc_fan_mode": fixed_fan,
+                "mpc_reason": effective_reason,
+                "mpc_would_change_now": (
+                    "yes" if apply_pin and fixed_fan != current_fan else "no"
+                ),
             }
         elif decision.get("mpc_status") not in MPC_PAUSED_STATUSES and decision.get(
             "mpc_fan_mode"
@@ -852,6 +873,27 @@ class MpcFanFeatureManager:
             return True
 
         return False
+
+    def _resolve_fixed_fan(self, hvac_mode: str) -> str | None:
+        """Return the speed pinned for *hvac_mode*, or None when no pin applies.
+
+        A speed the underlying no longer offers is ignored, so a renamed mode
+        degrades to "hold the current fan" rather than sending a command the
+        device would reject.
+        """
+        conf = self._config()
+        fixed_speed = conf.get(CONF_FIXED_FAN_SPEED)
+        if not fixed_speed or hvac_mode not in (conf.get(CONF_FIXED_FAN_HVAC_MODES) or []):
+            return None
+        available = self._vtherm.underlying_fan_modes
+        if available and fixed_speed not in available:
+            _LOGGER.debug(
+                "%s - fixed fan '%s' is not offered by the underlying; ignoring pin",
+                self._name,
+                fixed_speed,
+            )
+            return None
+        return fixed_speed
 
     def _is_external_fan_change(self, current_fan: str | None) -> bool:
         """True when the fan mode moved since last cycle without this plugin asking."""
