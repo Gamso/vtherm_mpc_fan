@@ -817,3 +817,61 @@ async def test_a_pending_response_does_not_cross_an_hvac_mode_change() -> None:
     await manager.refresh_state()
 
     assert manager.learning.response_event_count() == 0
+
+
+async def _pinned_manager_with_a_manual_speed(runtime, hass):
+    """Enter dry with a pin, then let the min interval lapse after a manual speed change.
+
+    Leaves the manager one cycle away from re-applying the pin, so a test only
+    has to add the disturbance and check that nothing is sent.
+    """
+    import time
+
+    manager = await _build_manager(runtime, hass=hass, min_interval=10, **FIXED_FAN_CONFIG)
+    await _enter_fixed_mode(runtime, manager)
+    runtime.async_set_underlying_fan_mode.reset_mock()
+    manager._last_change_time = time.time() - 11 * 60  # noqa: SLF001
+    return manager
+
+
+@pytest.mark.asyncio
+async def test_fixed_fan_is_held_while_a_window_is_open() -> None:
+    """No pinned command reaches a unit VTherm stopped for an open window."""
+    runtime = _make_runtime()
+    manager = await _pinned_manager_with_a_manual_speed(runtime, _make_hass())
+    runtime.hvac_off_reason = "hvac_off_window_detection"
+
+    assert await manager.refresh_state() is False
+    runtime.async_set_underlying_fan_mode.assert_not_awaited()
+    assert manager.last_decision["mpc_would_change_now"] == "no"
+    assert "window open" in manager.last_decision["mpc_reason"]
+
+    runtime.hvac_off_reason = None
+    await manager.refresh_state()
+    runtime.async_set_underlying_fan_mode.assert_awaited_once_with("superhigh")
+
+
+@pytest.mark.asyncio
+async def test_fixed_fan_is_held_while_the_underlying_is_off() -> None:
+    """Some IR/cloud climates read set_fan_mode as power-on: an off unit is left alone."""
+    runtime = _make_runtime()
+    hass = _make_hass()
+    manager = await _pinned_manager_with_a_manual_speed(runtime, hass)
+    hass.states.get(UNDERLYING_ENTITY).state = "off"
+
+    assert await manager.refresh_state() is False
+    runtime.async_set_underlying_fan_mode.assert_not_awaited()
+    assert "underlying off" in manager.last_decision["mpc_reason"]
+
+
+@pytest.mark.asyncio
+async def test_fixed_fan_is_held_during_defrost() -> None:
+    """A defrosting heat pump gets no fan command, pinned or not."""
+    runtime = _make_runtime()
+    hass = _make_hass()
+    manager = await _pinned_manager_with_a_manual_speed(runtime, hass)
+    hass.states.get(UNDERLYING_ENTITY).attributes["hvac_action"] = "defrosting"
+
+    assert await manager.refresh_state() is False
+    runtime.async_set_underlying_fan_mode.assert_not_awaited()
+    assert "defrost active" in manager.last_decision["mpc_reason"]
