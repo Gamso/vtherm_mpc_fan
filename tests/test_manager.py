@@ -133,11 +133,14 @@ async def test_manager_applies_the_fan_mode_through_the_runtime() -> None:
 
     changed = await manager.refresh_state()
 
-    if changed:
-        runtime.async_set_underlying_fan_mode.assert_awaited_once()
-        sent = runtime.async_set_underlying_fan_mode.await_args.args[0]
-        assert sent in FAN_MODES
-        assert manager._last_sent_fan_mode == sent  # noqa: SLF001
+    # 2 C above setpoint in cool on "low": the MPC must step up, so the command
+    # is asserted unconditionally -- an `if changed:` guard let this pass vacuously.
+    assert changed is True
+    runtime.async_set_underlying_fan_mode.assert_awaited_once()
+    sent = runtime.async_set_underlying_fan_mode.await_args.args[0]
+    assert sent in FAN_MODES
+    assert sent != "low"
+    assert manager._last_sent_fan_mode == sent  # noqa: SLF001
 
 
 @pytest.mark.asyncio
