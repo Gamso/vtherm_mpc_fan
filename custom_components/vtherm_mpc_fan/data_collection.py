@@ -68,7 +68,6 @@ def _coalesce(value, default):
     return value if value is not None else default
 
 
-
 class DataCollector:
     """Appends one CSV row per control cycle to a rotating log file."""
 
@@ -131,16 +130,10 @@ class DataCollector:
             mpc.get("mpc_would_change_now", "no"),
             round(mpc.get("mpc_cost", 0.0), 3) if mpc.get("mpc_cost") is not None else "",
             round(mpc.get("mpc_confidence", 0.0), 1) if mpc.get("mpc_confidence") is not None else "",
-            round(mpc.get("mpc_predicted_temperature_10m", 0.0), 3)
-            if mpc.get("mpc_predicted_temperature_10m") is not None
-            else "",
-            round(mpc.get("mpc_predicted_temperature_30m", 0.0), 3)
-            if mpc.get("mpc_predicted_temperature_30m") is not None
-            else "",
+            round(mpc.get("mpc_predicted_temperature_10m", 0.0), 3) if mpc.get("mpc_predicted_temperature_10m") is not None else "",
+            round(mpc.get("mpc_predicted_temperature_30m", 0.0), 3) if mpc.get("mpc_predicted_temperature_30m") is not None else "",
             mpc.get("mpc_known_profiles", 0),
-            round(mpc.get("mpc_disturbance_bias", 0.0), 3)
-            if mpc.get("mpc_disturbance_bias") is not None
-            else "",
+            round(mpc.get("mpc_disturbance_bias", 0.0), 3) if mpc.get("mpc_disturbance_bias") is not None else "",
             int(defrost_active),
             int(is_hvac_idle),
             round(outdoor_temp, 2) if outdoor_temp is not None else "",

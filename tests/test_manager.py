@@ -82,9 +82,7 @@ async def _build_manager(runtime=None, hass=None, **config):
     manager._config = MagicMock(return_value={"data_collection": False, **config})  # noqa: SLF001
     manager._entry_id = MagicMock(return_value="entry-1")  # noqa: SLF001
     manager.ensure_entities = MagicMock()
-    with patch(
-        "custom_components.vtherm_mpc_fan.manager.Store", return_value=_make_store()
-    ):
+    with patch("custom_components.vtherm_mpc_fan.manager.Store", return_value=_make_store()):
         await manager.start_listening()
     return manager
 
@@ -105,9 +103,7 @@ def test_apply_configured_fan_order_overrides_the_underlying() -> None:
 
 def test_apply_configured_fan_order_tolerates_drift() -> None:
     """A speed appearing later is appended; one that vanished is dropped."""
-    assert apply_configured_fan_order(
-        ["low", "med", "high", "turbo"], ["low", "med", "high", "retired"]
-    ) == ["low", "med", "high", "turbo"]
+    assert apply_configured_fan_order(["low", "med", "high", "turbo"], ["low", "med", "high", "retired"]) == ["low", "med", "high", "turbo"]
 
 
 @pytest.mark.asyncio
@@ -176,9 +172,7 @@ async def test_manager_treats_a_reported_idle_action_as_idle() -> None:
 @pytest.mark.asyncio
 async def test_manager_treats_an_off_underlying_as_idle() -> None:
     """An underlying that is off is off -- no hvac_action needed to know it."""
-    manager = await _build_manager(
-        hass=_make_hass(hvac_action=None, underlying_state="off")
-    )
+    manager = await _build_manager(hass=_make_hass(hvac_action=None, underlying_state="off"))
 
     assert manager._is_hvac_idle() is True  # noqa: SLF001
 
@@ -235,9 +229,7 @@ async def test_manager_adopts_fan_modes_published_after_startup() -> None:
 async def test_manager_honours_the_configured_fan_order() -> None:
     """A ladder corrected in the options must reach the controller."""
     runtime = _make_runtime(underlying_fan_modes=["high", "low", "med"])
-    manager = await _build_manager(
-        runtime, fan_mode_order=["low", "med", "high"]
-    )
+    manager = await _build_manager(runtime, fan_mode_order=["low", "med", "high"])
 
     assert manager.fan_modes == ["low", "med", "high"]
 
@@ -274,9 +266,7 @@ async def test_prediction_grid_is_independent_of_the_control_cadence() -> None:
             current_fan="low",
             minutes_since_change=30.0,
         )
-        predictions.append(
-            (decision["mpc_fan_mode"], decision["mpc_predicted_temperature_30m"])
-        )
+        predictions.append((decision["mpc_fan_mode"], decision["mpc_predicted_temperature_30m"]))
 
     assert SIMULATION_STEP_MINUTES == 2
     assert len(set(predictions)) == 1, f"cadence changed the forecast: {predictions}"
@@ -367,51 +357,34 @@ class TestShouldCollectSlopeSample:
         """off/dry/fan_only produce no meaningful thermal response."""
         manager = await self._manager()
         for hvac_mode in ("off", "dry", "fan_only"):
-            assert (
-                manager._should_collect_slope_sample(**self._kwargs(hvac_mode=hvac_mode))  # noqa: SLF001
-                is False
-            )
+            assert manager._should_collect_slope_sample(**self._kwargs(hvac_mode=hvac_mode)) is False  # noqa: SLF001
 
     @pytest.mark.asyncio
     async def test_cool_mode_collects(self):
         manager = await self._manager()
-        assert (
-            manager._should_collect_slope_sample(**self._kwargs(hvac_mode="cool")) is True  # noqa: SLF001
-        )
+        assert manager._should_collect_slope_sample(**self._kwargs(hvac_mode="cool")) is True  # noqa: SLF001
 
     @pytest.mark.asyncio
     async def test_no_fan_skipped(self):
         manager = await self._manager()
-        assert (
-            manager._should_collect_slope_sample(**self._kwargs(current_fan=None)) is False  # noqa: SLF001
-        )
+        assert manager._should_collect_slope_sample(**self._kwargs(current_fan=None)) is False  # noqa: SLF001
 
     @pytest.mark.asyncio
     async def test_defrost_or_idle_skipped(self):
         manager = await self._manager()
-        assert (
-            manager._should_collect_slope_sample(**self._kwargs(is_defrost_active=True))  # noqa: SLF001
-            is False
-        )
-        assert (
-            manager._should_collect_slope_sample(**self._kwargs(is_hvac_idle=True)) is False  # noqa: SLF001
-        )
+        assert manager._should_collect_slope_sample(**self._kwargs(is_defrost_active=True)) is False  # noqa: SLF001
+        assert manager._should_collect_slope_sample(**self._kwargs(is_hvac_idle=True)) is False  # noqa: SLF001
 
     @pytest.mark.asyncio
     async def test_non_established_phase_skipped(self):
         manager = await self._manager()
-        assert (
-            manager._should_collect_slope_sample(**self._kwargs(phase="DEAD_TIME")) is False  # noqa: SLF001
-        )
+        assert manager._should_collect_slope_sample(**self._kwargs(phase="DEAD_TIME")) is False  # noqa: SLF001
 
     @pytest.mark.asyncio
     async def test_not_stable_long_enough_skipped(self):
         """12 min is below the 1.5 x 10 min dead-time settling window."""
         manager = await self._manager()
-        assert (
-            manager._should_collect_slope_sample(**self._kwargs(minutes_since_change=12.0))  # noqa: SLF001
-            is False
-        )
+        assert manager._should_collect_slope_sample(**self._kwargs(minutes_since_change=12.0)) is False  # noqa: SLF001
 
     @pytest.mark.asyncio
     async def test_recent_setpoint_drop_skipped(self):
@@ -554,7 +527,6 @@ async def test_manager_publishes_its_diagnostics_into_the_vtherm_state() -> None
     assert section["fan_mode_order"] == FAN_MODES
     assert "mpc_status" in section
     assert section["learning_ready"] is False
-
 
 
 # --- Audit 2026-09: what counts as a fan change ----------------------------
@@ -728,9 +700,7 @@ async def test_forced_fan_takes_precedence_over_the_fixed_fan() -> None:
 async def test_fixed_fan_ignored_when_the_underlying_no_longer_offers_it() -> None:
     """A pinned speed that vanished degrades to holding the current fan."""
     runtime = _make_runtime(vtherm_hvac_mode="dry")
-    manager = await _build_manager(
-        runtime, fixed_fan_hvac_modes=["dry"], fixed_fan_speed="turbo"
-    )
+    manager = await _build_manager(runtime, fixed_fan_hvac_modes=["dry"], fixed_fan_speed="turbo")
 
     changed = await manager.refresh_state()
 

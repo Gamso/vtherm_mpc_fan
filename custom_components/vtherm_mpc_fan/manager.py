@@ -84,9 +84,7 @@ _TRUTHY = ("on", "true", "True", "1")
 _IDLE_ACTIONS = (HVACAction.IDLE, HVACAction.OFF)
 
 
-def apply_configured_fan_order(
-    detected: list[str], configured: list[str] | None
-) -> list[str]:
+def apply_configured_fan_order(detected: list[str], configured: list[str] | None) -> list[str]:
     """Reorder *detected* fan modes to follow the user's weakest-to-strongest order.
 
     A fan mode's index is treated as its strength throughout the controller: the
@@ -136,11 +134,7 @@ def build_data_collection_decision(
     projected_error = None
 
     if projected_temperature is not None:
-        projected_error = (
-            projected_temperature - target_temp
-            if hvac_mode == "cool"
-            else target_temp - projected_temperature
-        )
+        projected_error = projected_temperature - target_temp if hvac_mode == "cool" else target_temp - projected_temperature
 
     return {
         "fan_mode": effective_fan,
@@ -157,11 +151,7 @@ def filter_supported_fan_modes(raw_modes: list[str] | None) -> list[str]:
     """Keep only manual fan modes; ``auto``/``off`` are not strength levels."""
     if not raw_modes:
         return []
-    return [
-        mode
-        for mode in raw_modes
-        if isinstance(mode, str) and mode.lower() not in {"auto", "off"}
-    ]
+    return [mode for mode in raw_modes if isinstance(mode, str) and mode.lower() not in {"auto", "off"}]
 
 
 class MpcFanFeatureManager:
@@ -269,9 +259,7 @@ class MpcFanFeatureManager:
             new_entities = build(self)
             if new_entities:
                 add_entities(new_entities)
-                _LOGGER.info(
-                    "Created %d %s entities for %s", len(new_entities), platform, self._name
-                )
+                _LOGGER.info("Created %d %s entities for %s", len(new_entities), platform, self._name)
 
     def restore_state(self, old_state: Any) -> None:
         """No-op: the learned model is restored from this plugin's own Store."""
@@ -291,11 +279,7 @@ class MpcFanFeatureManager:
             # Non-null means another plugin owns the fan and this one is standing
             # down; surfaced here so a silent yield is still visible.
             "conflicting_plugin": self._conflict,
-            **{
-                key: value
-                for key, value in self._last_decision.items()
-                if key.startswith("mpc_")
-            },
+            **{key: value for key, value in self._last_decision.items() if key.startswith("mpc_")},
         }
 
     # ------------------------------------------------------------------
@@ -426,9 +410,7 @@ class MpcFanFeatureManager:
         )
 
         if conf.get(CONF_DATA_COLLECTION, DEFAULT_DATA_COLLECTION):
-            self._collector = DataCollector(
-                self._hass, self._hass.config.config_dir, entry_id
-            )
+            self._collector = DataCollector(self._hass, self._hass.config.config_dir, entry_id)
             await self._collector.async_initialize()
             _LOGGER.info("Data collection enabled, writing to %s", self._collector.path)
 
@@ -723,9 +705,7 @@ class MpcFanFeatureManager:
             )
             self._register_fan_change(now)
         self._last_observed_fan = current_fan
-        minutes_since_change = (
-            (now - self._last_change_time) / 60.0 if self._last_change_time else 1e6
-        )
+        minutes_since_change = (now - self._last_change_time) / 60.0 if self._last_change_time else 1e6
 
         # Reset slope memory on HVAC mode switch: a heating slope tells us
         # nothing about the cooling response and vice versa. The first cycle of
@@ -747,11 +727,7 @@ class MpcFanFeatureManager:
         slope_change = abs(vtherm_slope - self._previous_slope) > THRESHOLD_SLOPE
 
         # Signed comfort error (positive = needs more heating/cooling).
-        current_error = (
-            (current_temp - target_temp)
-            if hvac_mode == "cool"
-            else (target_temp - current_temp)
-        )
+        current_error = (current_temp - target_temp) if hvac_mode == "cool" else (target_temp - current_temp)
         # Only a regulated mode has an error direction. Read in dry or fan_only
         # with the heating convention, a warm summer room (27 C for a 24 C
         # setpoint) looked like a large setpoint drop on every cycle and blocked
@@ -792,11 +768,7 @@ class MpcFanFeatureManager:
             # clock starts at its first cycle: otherwise every restart or reload
             # would overwrite a speed the user had set by hand.
             min_interval = self._config().get(CONF_MIN_INTERVAL, DEFAULT_MIN_INTERVAL)
-            pin_clock = (
-                minutes_since_change
-                if self._last_change_time
-                else (now - self._first_cycle_time) / 60.0
-            )
+            pin_clock = minutes_since_change if self._last_change_time else (now - self._first_cycle_time) / 60.0
             apply_pin = hvac_mode_entered or pin_clock >= min_interval
             effective_reason = f"Fixed fan '{fixed_fan}' for HVAC mode '{hvac_mode}'"
             hold_reason = self._fixed_fan_hold_reason(is_window_open, is_defrost_active)
@@ -809,13 +781,9 @@ class MpcFanFeatureManager:
                 "mpc_status": "Fixed",
                 "mpc_fan_mode": fixed_fan,
                 "mpc_reason": effective_reason,
-                "mpc_would_change_now": (
-                    "yes" if apply_pin and fixed_fan != current_fan else "no"
-                ),
+                "mpc_would_change_now": ("yes" if apply_pin and fixed_fan != current_fan else "no"),
             }
-        elif decision.get("mpc_status") not in MPC_PAUSED_STATUSES and decision.get(
-            "mpc_fan_mode"
-        ):
+        elif decision.get("mpc_status") not in MPC_PAUSED_STATUSES and decision.get("mpc_fan_mode"):
             effective_fan = decision["mpc_fan_mode"]
             effective_reason = f"MPC: {decision.get('mpc_reason', 'MPC')}"
         else:
@@ -839,10 +807,10 @@ class MpcFanFeatureManager:
             minutes_since_change=minutes_since_change,
             learned_dead_time=learned_dead_time,
             now=now,
-        ) and not self._is_duplicate_slope(current_fan, hvac_mode, vtherm_slope):  # type: ignore[arg-type]
-            self._learning.add_slope_sample(
-                current_fan, vtherm_slope, current_error, hvac_mode, is_window_open  # type: ignore[arg-type]
-            )
+        ) and not self._is_duplicate_slope(
+            current_fan, hvac_mode, vtherm_slope
+        ):  # type: ignore[arg-type]
+            self._learning.add_slope_sample(current_fan, vtherm_slope, current_error, hvac_mode, is_window_open)  # type: ignore[arg-type]
 
         if hvac_mode not in PROFILE_HVAC_MODES:
             # Dead time is the heating/cooling lag. In dry or fan_only the slope
@@ -854,12 +822,7 @@ class MpcFanFeatureManager:
             if response_time > 60.0:
                 # Too late to be a response to the change: stop waiting for one.
                 self._response_armed = False
-            elif (
-                response_time >= 2.0
-                and not is_window_open
-                and not is_defrost_active
-                and not is_hvac_idle
-            ):
+            elif response_time >= 2.0 and not is_window_open and not is_defrost_active and not is_hvac_idle:
                 self._learning.add_response_event(response_time, hvac_mode)
                 self._response_armed = False
 
@@ -991,9 +954,7 @@ class MpcFanFeatureManager:
             is_window_open=kwargs["is_window_open"],
             decision=collector_decision,
             phase=kwargs["phase"],
-            effective_slope=(
-                -float(vtherm_slope) if hvac_mode == "cool" else float(vtherm_slope)
-            ),
+            effective_slope=(-float(vtherm_slope) if hvac_mode == "cool" else float(vtherm_slope)),
             effective_timeout=self._mpc.get_effective_timeout(hvac_mode),
             force=kwargs["forced"],
             learning_ready=self._learning.is_ready(),

@@ -68,9 +68,7 @@ class MpcFanManagerFactory:
             entries = config_entries.async_entries(DOMAIN)
         except Exception:  # pylint: disable=broad-except
             return False
-        return any(
-            entry.data.get(CONF_TARGET_VTHERM) == thermostat.unique_id for entry in entries
-        )
+        return any(entry.data.get(CONF_TARGET_VTHERM) == thermostat.unique_id for entry in entries)
 
     def create(
         self,

@@ -1,4 +1,5 @@
 """Constants for VTherm MPC Fan."""
+
 from datetime import timedelta
 
 from homeassistant.util import slugify

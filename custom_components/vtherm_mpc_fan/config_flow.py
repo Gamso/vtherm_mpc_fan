@@ -39,11 +39,7 @@ def extract_fan_modes(state) -> list[str]:
     raw_modes = state.attributes.get("fan_modes")
     if not raw_modes:
         return []
-    return [
-        mode
-        for mode in raw_modes
-        if isinstance(mode, str) and mode.lower() not in {"auto", "off"}
-    ]
+    return [mode for mode in raw_modes if isinstance(mode, str) and mode.lower() not in {"auto", "off"}]
 
 
 def extract_fixed_fan_hvac_modes(state) -> list[str]:
@@ -59,11 +55,7 @@ def extract_fixed_fan_hvac_modes(state) -> list[str]:
     raw_modes = state.attributes.get("hvac_modes") if state is not None else None
     if not raw_modes:
         return list(FALLBACK_FIXED_FAN_HVAC_MODES)
-    return [
-        mode
-        for mode in raw_modes
-        if isinstance(mode, str) and mode.lower() != "off" and mode not in PROFILE_HVAC_MODES
-    ]
+    return [mode for mode in raw_modes if isinstance(mode, str) and mode.lower() != "off" and mode not in PROFILE_HVAC_MODES]
 
 
 def extract_all_fan_modes(state) -> list[str]:
@@ -87,9 +79,7 @@ def validate_fixed_fan(fixed: list[str] | None, fixed_speed: str | None) -> dict
     return {}
 
 
-def _fixed_fan_schema(
-    defaults: dict[str, Any], mode_choices: list[str], speed_choices: list[str]
-) -> dict:
+def _fixed_fan_schema(defaults: dict[str, Any], mode_choices: list[str], speed_choices: list[str]) -> dict:
     """Build the fixed-speed fields: which HVAC modes pin the fan, and to what.
 
     Already-stored choices stay selectable even if the climate stopped
@@ -110,21 +100,15 @@ def _fixed_fan_schema(
         return {}
 
     schema: dict[Any, Any] = {
-        vol.Optional(
-            CONF_FIXED_FAN_HVAC_MODES, default=stored_modes
-        ): selector.SelectSelector(
+        vol.Optional(CONF_FIXED_FAN_HVAC_MODES, default=stored_modes): selector.SelectSelector(
             selector.SelectSelectorConfig(
                 options=mode_choices,
                 multiple=True,
                 mode=selector.SelectSelectorMode.LIST,
             )
         ),
-        vol.Optional(
-            CONF_FIXED_FAN_SPEED, default=defaults.get(CONF_FIXED_FAN_SPEED, vol.UNDEFINED)
-        ): selector.SelectSelector(
-            selector.SelectSelectorConfig(
-                options=speed_choices, mode=selector.SelectSelectorMode.DROPDOWN
-            )
+        vol.Optional(CONF_FIXED_FAN_SPEED, default=defaults.get(CONF_FIXED_FAN_SPEED, vol.UNDEFINED)): selector.SelectSelector(
+            selector.SelectSelectorConfig(options=speed_choices, mode=selector.SelectSelectorMode.DROPDOWN)
         ),
     }
     return schema
@@ -193,9 +177,7 @@ def _fan_order_schema(defaults: dict[str, Any], detected: list[str]) -> dict:
     for rank, mode in enumerate(detected):
         default = current[rank] if rank < len(current) else mode
         schema[vol.Required(_fan_order_field_key(rank), default=default)] = selector.SelectSelector(
-            selector.SelectSelectorConfig(
-                options=detected, mode=selector.SelectSelectorMode.DROPDOWN
-            )
+            selector.SelectSelectorConfig(options=detected, mode=selector.SelectSelectorMode.DROPDOWN)
         )
     return schema
 
@@ -203,21 +185,13 @@ def _fan_order_schema(defaults: dict[str, Any], detected: list[str]) -> dict:
 def _settings_schema(defaults: dict[str, Any]) -> dict:
     """Build the fixed settings fields, shared by the config and options flows."""
     return {
-        vol.Optional(
-            CONF_DEADBAND, default=defaults.get(CONF_DEADBAND, DEFAULT_DEADBAND)
-        ): selector.NumberSelector(
-            selector.NumberSelectorConfig(
-                min=0.0, max=5.0, step=0.1, unit_of_measurement="°C"
-            )
+        vol.Optional(CONF_DEADBAND, default=defaults.get(CONF_DEADBAND, DEFAULT_DEADBAND)): selector.NumberSelector(
+            selector.NumberSelectorConfig(min=0.0, max=5.0, step=0.1, unit_of_measurement="°C")
         ),
         vol.Optional(
             CONF_MIN_INTERVAL,
             default=defaults.get(CONF_MIN_INTERVAL, DEFAULT_MIN_INTERVAL),
-        ): selector.NumberSelector(
-            selector.NumberSelectorConfig(
-                min=1, max=60, step=1, unit_of_measurement="min"
-            )
-        ),
+        ): selector.NumberSelector(selector.NumberSelectorConfig(min=1, max=60, step=1, unit_of_measurement="min")),
         vol.Optional(
             CONF_DATA_COLLECTION,
             default=defaults.get(CONF_DATA_COLLECTION, DEFAULT_DATA_COLLECTION),
@@ -225,11 +199,7 @@ def _settings_schema(defaults: dict[str, Any]) -> dict:
         vol.Optional(
             CONF_DEFROST_ENTITY,
             default=defaults.get(CONF_DEFROST_ENTITY, vol.UNDEFINED),
-        ): selector.EntitySelector(
-            selector.EntitySelectorConfig(
-                domain=["binary_sensor", "sensor", "input_boolean"]
-            )
-        ),
+        ): selector.EntitySelector(selector.EntitySelectorConfig(domain=["binary_sensor", "sensor", "input_boolean"])),
     }
 
 
@@ -267,28 +237,16 @@ class VThermMpcFanConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-ar
                 self._abort_if_unique_id_configured()
 
                 state = self.hass.states.get(entity_id)
-                data = {
-                    key: value
-                    for key, value in user_input.items()
-                    if key != CONF_TARGET_VTHERM
-                }
+                data = {key: value for key, value in user_input.items() if key != CONF_TARGET_VTHERM}
                 data[CONF_TARGET_VTHERM] = registry_entry.unique_id
-                return self.async_create_entry(
-                    title=state.name if state is not None else entity_id, data=data
-                )
+                return self.async_create_entry(title=state.name if state is not None else entity_id, data=data)
 
         schema = {
-            vol.Required(CONF_TARGET_VTHERM): selector.EntitySelector(
-                selector.EntitySelectorConfig(
-                    domain=CLIMATE_DOMAIN, integration=VTHERM_DOMAIN
-                )
-            ),
+            vol.Required(CONF_TARGET_VTHERM): selector.EntitySelector(selector.EntitySelectorConfig(domain=CLIMATE_DOMAIN, integration=VTHERM_DOMAIN)),
             **_settings_schema(user_input or {}),
         }
 
-        return self.async_show_form(
-            step_id="user", data_schema=vol.Schema(schema), errors=errors
-        )
+        return self.async_show_form(step_id="user", data_schema=vol.Schema(schema), errors=errors)
 
     @staticmethod
     @callback
@@ -327,11 +285,7 @@ class VThermMpcFanOptionsFlow(OptionsFlow):
                 )
             )
             if not errors:
-                data = {
-                    key: value
-                    for key, value in user_input.items()
-                    if not key.startswith(f"{CONF_FAN_MODE_ORDER}_")
-                }
+                data = {key: value for key, value in user_input.items() if not key.startswith(f"{CONF_FAN_MODE_ORDER}_")}
                 if fan_order is not None:
                     data[CONF_FAN_MODE_ORDER] = fan_order
                 return self.async_create_entry(title="", data=data)
@@ -360,9 +314,7 @@ class VThermMpcFanOptionsFlow(OptionsFlow):
         """Return the state of the VTherm this entry targets, or None."""
         if not target_unique_id:
             return None
-        entity_id = er.async_get(self.hass).async_get_entity_id(
-            CLIMATE_DOMAIN, VTHERM_DOMAIN, target_unique_id
-        )
+        entity_id = er.async_get(self.hass).async_get_entity_id(CLIMATE_DOMAIN, VTHERM_DOMAIN, target_unique_id)
         if entity_id is None:
             return None
         return self.hass.states.get(entity_id)

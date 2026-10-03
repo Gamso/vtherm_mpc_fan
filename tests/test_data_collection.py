@@ -229,9 +229,7 @@ async def test_manager_skips_the_collector_when_disabled() -> None:
     manager._entry_id = MagicMock(return_value="123456789")
 
     with patch("custom_components.vtherm_mpc_fan.manager.Store", return_value=fake_store):
-        with patch(
-            "custom_components.vtherm_mpc_fan.manager.DataCollector"
-        ) as collector_cls:
+        with patch("custom_components.vtherm_mpc_fan.manager.DataCollector") as collector_cls:
             await manager.start_listening()
 
     collector_cls.assert_not_called()

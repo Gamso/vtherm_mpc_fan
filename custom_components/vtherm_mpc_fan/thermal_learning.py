@@ -109,11 +109,7 @@ class ThermalLearning:
         self._update_slope_stats(abs(slope))
 
         profile_key = (hvac_mode, fan_mode)
-        if (
-            hvac_mode != "unknown"
-            and profile_samples >= MIN_MODE_PROFILE_SAMPLES
-            and profile_key not in self._profile_ready_logged
-        ):
+        if hvac_mode != "unknown" and profile_samples >= MIN_MODE_PROFILE_SAMPLES and profile_key not in self._profile_ready_logged:
             self._profile_ready_logged.add(profile_key)
             effective_slope = self.get_mode_effective_slope(fan_mode, hvac_mode)
             _LOGGER.info(
@@ -550,7 +546,11 @@ class ThermalLearning:
 
         _LOGGER.info(
             "Learning: set_mode_effective_slope %s/%s = %.3f (removed %d, inserted %d synthetic samples)",
-            hvac_mode, fan_mode, target_slope, removed, MIN_MODE_PROFILE_SAMPLES,
+            hvac_mode,
+            fan_mode,
+            target_slope,
+            removed,
+            MIN_MODE_PROFILE_SAMPLES,
         )
 
     def get_mode_sample_count(self, fan_mode: str, hvac_mode: str) -> int:
@@ -566,11 +566,7 @@ class ThermalLearning:
         merely *seeded* -- the distinction the exploration guards in the MPC and
         the ``value_source`` attribute of the number entities rely on.
         """
-        return sum(
-            1
-            for s in self._slope_samples
-            if s[1] == fan_mode and s[3] == hvac_mode and len(s) > 4 and s[4] is not None
-        )
+        return sum(1 for s in self._slope_samples if s[1] == fan_mode and s[3] == hvac_mode and len(s) > 4 and s[4] is not None)
 
     def has_measured_profile(self, fan_mode: str, hvac_mode: str) -> bool:
         """True once a profile rests on MIN_MODE_PROFILE_SAMPLES real measurements."""
@@ -694,11 +690,7 @@ class ThermalLearning:
         # One counting pass: asking get_mode_sample_count() for every sample
         # rescanned the whole list each time, O(n^2) on the event loop at load.
         profile_counts = Counter((s[3], s[1]) for s in self._slope_samples)
-        self._profile_ready_logged = {
-            profile
-            for profile, count in profile_counts.items()
-            if profile[0] != "unknown" and count >= MIN_MODE_PROFILE_SAMPLES
-        }
+        self._profile_ready_logged = {profile for profile, count in profile_counts.items() if profile[0] != "unknown" and count >= MIN_MODE_PROFILE_SAMPLES}
 
         for sample in self._slope_samples:
             self._update_slope_stats(abs(sample[2]))
