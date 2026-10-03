@@ -1520,3 +1520,40 @@ def test_notify_fan_change_resets_the_escalation_baseline() -> None:
     fresh = mpc.evaluate(current_temp=19.6, target_temp=20.0, vtherm_slope=0.25, hvac_mode="heat", current_fan="low", minutes_since_change=8.0)
     assert "Emergency escalation" not in fresh["mpc_reason"]
     assert fresh["mpc_would_change_now"] == "no"
+
+
+def test_dead_time_trust_is_counted_per_hvac_mode() -> None:
+    """Five heating events unlock the heating interval, not the cooling one.
+
+    The trust gate counted every stored event, so a dead time that cool only
+    reaches through the pooled fallback still raised cool's change interval.
+    """
+    learning = ThermalLearning()
+    for _ in range(mpc_module.MIN_RESPONSE_EVENTS_FOR_ADAPTIVE_INTERVAL):
+        learning.add_response_event(24.0, "heat")
+    mpc = _build_mpc(learning, min_interval=10)
+
+    assert mpc._dead_time_is_trusted("heat") is True  # noqa: SLF001
+    assert mpc._dead_time_is_trusted("cool") is False  # noqa: SLF001
+    assert mpc._effective_min_interval(24.0, "heat") == 24.0  # noqa: SLF001
+    assert mpc._effective_min_interval(24.0, "cool") == 10.0  # noqa: SLF001
+
+
+def test_events_from_unregulated_modes_never_build_a_dead_time() -> None:
+    """A month of dry operation must not hand cool a learned, trusted dead time.
+
+    Response events recorded in dry or fan_only (stores written before the
+    manager stopped recording them) are ignored by the dead time, its pooled
+    fallback and the trust gate alike.
+    """
+    learning = ThermalLearning()
+    for _ in range(20):
+        learning.add_response_event(45.0, "dry")
+    mpc = _build_mpc(learning, min_interval=10)
+
+    assert learning.get_dead_time("cool") == mpc_module.DEFAULT_DEAD_TIME
+    assert learning.get_dead_time() == mpc_module.DEFAULT_DEAD_TIME
+    assert mpc._dead_time_is_trusted("cool") is False  # noqa: SLF001
+    assert mpc._dead_time_is_trusted() is False  # noqa: SLF001
+    # The diagnostic total still reports what is stored.
+    assert learning.response_event_count() == 20
