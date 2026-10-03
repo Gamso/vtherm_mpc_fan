@@ -80,8 +80,14 @@ python -m pytest tests/ -q          # run all tests
 python -m pytest tests/test_X.py -q # run one file
 ./container coverage                 # coverage via Docker container
 ./container hassfest                 # validate manifest / translations
-bash validate.sh                     # syntax/JSON/required-file checks (mirrors CI)
+bash validate.sh                     # syntax/JSON/required-file checks
+black --check custom_components tests   # formatting, enforced by CI (pyproject.toml, 180 cols)
+pylint custom_components/vtherm_mpc_fan # enforced by CI (.pylintrc)
 ```
+
+CI (`.github/workflows/`) runs on every push and PR: pytest, black, pylint, `validate.sh`, hassfest and the HACS action.
+
+Tests that need a real Home Assistant core (setup/unload, services, flows) request the `integration` fixture from `tests/conftest.py`; everything else uses the lightweight stand-ins above.
 
 ## Dev Container Workflow
 
