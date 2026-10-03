@@ -57,12 +57,12 @@
                     "defrost_entity": "Optional: binary sensor, sensor or input_boolean that indicates when the heat pump is in defrost mode.",
                     "fixed_fan_hvac_modes": "In these modes the fan is set to the fixed speed below, e.g. dry and fan_only. heat and cool are always regulated by the MPC and are not listed. The speed is applied as soon as the mode is entered; after a manual speed change it is re-applied once the minimum interval has elapsed.",
                     "fixed_fan_speed": "The speed used in the fixed-speed modes above (e.g. superhigh). Required when at least one fixed-speed mode is selected."
-                },
-                "error": {
-                    "base": "Each fan speed must be picked at exactly one rank — the same speed was selected twice.",
-                    "fixed_fan_speed_required": "Choose the fixed fan speed to use in the selected modes."
                 }
             }
+        },
+        "error": {
+            "fan_order_invalid": "Each fan speed must be picked at exactly one rank — the same speed was selected twice.",
+            "fixed_fan_speed_required": "Choose the fixed fan speed to use in the selected modes."
         }
     }
 }
