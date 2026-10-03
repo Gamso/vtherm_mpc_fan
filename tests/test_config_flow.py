@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 from custom_components.vtherm_mpc_fan.config_flow import (
     _fan_order_field_key,
     _fan_order_schema,
+    _fixed_fan_schema,
     assemble_fan_order,
     extract_all_fan_modes,
     extract_fan_modes,
@@ -18,7 +19,11 @@ from custom_components.vtherm_mpc_fan.config_flow import (
     validate_fan_order,
     validate_fixed_fan,
 )
-from custom_components.vtherm_mpc_fan.const import CONF_FAN_MODE_ORDER, CONF_FIXED_FAN_SPEED
+from custom_components.vtherm_mpc_fan.const import (
+    CONF_FAN_MODE_ORDER,
+    CONF_FIXED_FAN_HVAC_MODES,
+    CONF_FIXED_FAN_SPEED,
+)
 from custom_components.vtherm_mpc_fan.manager import apply_configured_fan_order
 from custom_components.vtherm_mpc_fan.registry import find_conflicting_plugin
 
@@ -195,6 +200,50 @@ def test_extract_fixed_fan_hvac_modes_falls_back_when_nothing_is_reported() -> N
     state = MagicMock()
     state.attributes = {}
     assert extract_fixed_fan_hvac_modes(state) == ["dry", "fan_only"]
+
+
+def test_extract_fixed_fan_hvac_modes_offers_nothing_a_climate_cannot_enter() -> None:
+    """A climate that reports only off/heat/cool gets no pinnable mode.
+
+    The fallback is for a climate that reports nothing; one that does report
+    its modes must not be offered dry/fan_only it cannot take.
+    """
+    state = MagicMock()
+    state.attributes = {"hvac_modes": ["off", "heat", "cool"]}
+    assert extract_fixed_fan_hvac_modes(state) == []
+
+
+def _schema_keys(schema: dict) -> set[str]:
+    """Return the field names of a voluptuous schema dict."""
+    return {str(key) for key in schema}
+
+
+def test_fixed_fan_fields_are_hidden_when_no_speed_is_selectable() -> None:
+    """Offering the modes without any speed would be a dead end.
+
+    Ticking a mode requires a speed; with the climate unavailable no speed is
+    known, so the form would reject every submission on a field it does not
+    show. Both fields are dropped together instead.
+    """
+    assert _fixed_fan_schema({}, ["dry", "fan_only"], []) == {}
+
+
+def test_fixed_fan_fields_are_hidden_when_no_mode_can_be_pinned() -> None:
+    """A climate with only heat/cool has nothing to pin."""
+    assert _fixed_fan_schema({}, [], ["low", "high"]) == {}
+
+
+def test_fixed_fan_fields_come_as_a_pair() -> None:
+    """With modes and speeds available, both fields are offered."""
+    keys = _schema_keys(_fixed_fan_schema({}, ["dry"], ["low", "high"]))
+    assert keys == {CONF_FIXED_FAN_HVAC_MODES, CONF_FIXED_FAN_SPEED}
+
+
+def test_stored_fixed_fan_choices_keep_the_fields_while_the_climate_is_unavailable() -> None:
+    """A saved pin stays editable, and is not silently dropped, while nothing is reported."""
+    stored = {CONF_FIXED_FAN_HVAC_MODES: ["dry"], CONF_FIXED_FAN_SPEED: "superhigh"}
+    keys = _schema_keys(_fixed_fan_schema(stored, [], []))
+    assert keys == {CONF_FIXED_FAN_HVAC_MODES, CONF_FIXED_FAN_SPEED}
 
 
 def test_extract_all_fan_modes_keeps_auto() -> None:

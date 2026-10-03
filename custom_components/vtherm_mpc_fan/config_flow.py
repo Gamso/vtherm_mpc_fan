@@ -50,16 +50,20 @@ def extract_fixed_fan_hvac_modes(state) -> list[str]:
     """Return the HVAC modes a climate state offers for a fixed fan speed.
 
     Excludes off, and heat/cool, which the MPC always regulates. Falls back to
-    the usual non-regulated modes when the entity does not (yet) report any, so
-    the option stays usable while the climate is unavailable.
+    the usual non-regulated modes only when the entity reports no
+    ``hvac_modes`` at all (unavailable, or not published yet), so the option
+    stays usable meanwhile. A climate that does report its modes and offers
+    nothing beyond off/heat/cool gets an empty list: proposing dry or fan_only
+    there would offer modes the thermostat can never enter.
     """
     raw_modes = state.attributes.get("hvac_modes") if state is not None else None
-    modes = [
+    if not raw_modes:
+        return list(FALLBACK_FIXED_FAN_HVAC_MODES)
+    return [
         mode
-        for mode in raw_modes or []
+        for mode in raw_modes
         if isinstance(mode, str) and mode.lower() != "off" and mode not in PROFILE_HVAC_MODES
     ]
-    return modes or list(FALLBACK_FIXED_FAN_HVAC_MODES)
 
 
 def extract_all_fan_modes(state) -> list[str]:
@@ -90,12 +94,20 @@ def _fixed_fan_schema(
 
     Already-stored choices stay selectable even if the climate stopped
     reporting them, so a saved value is never defaulted outside its own options.
+
+    The two fields are offered together or not at all. Selecting a mode is
+    rejected unless a speed is chosen too (``validate_fixed_fan``), so showing
+    the modes while no speed is selectable -- a climate that is unavailable and
+    has no stored speed -- would be a dead end: every submission with a mode
+    ticked errors on a field the form does not even display.
     """
     stored_modes = defaults.get(CONF_FIXED_FAN_HVAC_MODES) or []
     mode_choices = mode_choices + [m for m in stored_modes if m not in mode_choices]
     stored_speed = defaults.get(CONF_FIXED_FAN_SPEED)
     if stored_speed and stored_speed not in speed_choices:
         speed_choices = speed_choices + [stored_speed]
+    if not mode_choices or not speed_choices:
+        return {}
 
     schema: dict[Any, Any] = {
         vol.Optional(
@@ -107,15 +119,14 @@ def _fixed_fan_schema(
                 mode=selector.SelectSelectorMode.LIST,
             )
         ),
-    }
-    if speed_choices:
-        schema[
-            vol.Optional(CONF_FIXED_FAN_SPEED, default=defaults.get(CONF_FIXED_FAN_SPEED, vol.UNDEFINED))
-        ] = selector.SelectSelector(
+        vol.Optional(
+            CONF_FIXED_FAN_SPEED, default=defaults.get(CONF_FIXED_FAN_SPEED, vol.UNDEFINED)
+        ): selector.SelectSelector(
             selector.SelectSelectorConfig(
                 options=speed_choices, mode=selector.SelectSelectorMode.DROPDOWN
             )
-        )
+        ),
+    }
     return schema
 
 
