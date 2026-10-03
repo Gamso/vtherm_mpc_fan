@@ -180,3 +180,102 @@ async def test_unloading_one_of_two_entries_keeps_the_services(integration, relo
     for service in SERVICES:
         assert hass.services.has_service(DOMAIN, service)
     assert VThermAPI.get_vtherm_api(hass).get_feature_manager(FEATURE_MANAGER_MPC_FAN) is not None
+
+
+# --- _resolve_manager ---------------------------------------------------------
+
+
+async def test_resolve_manager_without_any_manager_explains_why(integration) -> None:
+    """No running manager is an actionable error, not a KeyError."""
+    with pytest.raises(HomeAssistantError, match="No VTherm MPC Fan manager is running"):
+        _resolve_manager(integration, None)
+
+
+async def test_resolve_manager_defaults_to_the_only_one(integration) -> None:
+    """With a single managed VTherm the target may be omitted."""
+    only = _fake_manager("vtherm-a", "climate.a", "A")
+    managers(integration)["vtherm-a"] = only
+    assert _resolve_manager(integration, None) is only
+
+
+@pytest.mark.parametrize("target", ["vtherm-b", "climate.b", "B"])
+async def test_resolve_manager_accepts_unique_id_entity_id_or_name(integration, target) -> None:
+    """Services take whichever identifier the user has at hand."""
+    managers(integration)["vtherm-a"] = _fake_manager("vtherm-a", "climate.a", "A")
+    wanted = managers(integration)["vtherm-b"] = _fake_manager("vtherm-b", "climate.b", "B")
+    assert _resolve_manager(integration, target) is wanted
+
+
+async def test_resolve_manager_requires_a_target_when_several_run(integration) -> None:
+    """Guessing between two thermostats would act on the wrong room."""
+    managers(integration)["vtherm-a"] = _fake_manager("vtherm-a", "climate.a", "A")
+    managers(integration)["vtherm-b"] = _fake_manager("vtherm-b", "climate.b", "B")
+    with pytest.raises(HomeAssistantError, match="Several VTherms"):
+        _resolve_manager(integration, None)
+    with pytest.raises(HomeAssistantError, match="climate.a, climate.b"):
+        _resolve_manager(integration, "climate.nowhere")
+
+
+# --- Services, nominal paths ----------------------------------------------------
+
+
+async def test_force_fan_sets_the_override_and_runs_a_cycle(integration, reload_spy) -> None:
+    """The override is stored with its deadline and applied without waiting for VTherm."""
+    import time
+
+    hass = integration
+    await _setup(hass)
+    manager = managers(hass)["vtherm-a"] = _fake_manager("vtherm-a", "climate.a", "A")
+
+    await hass.services.async_call(DOMAIN, SERVICE_FORCE_FAN, {"fan_mode": "high", "duration_minutes": 30}, blocking=True)
+
+    assert manager.force.fan_mode == "high"
+    assert manager.force.until == pytest.approx(time.time() + 1800, abs=5)
+    manager.refresh_state.assert_awaited_once()
+
+
+async def test_force_fan_zero_minutes_cancels(integration, reload_spy) -> None:
+    """Duration 0 hands control back to the MPC."""
+    hass = integration
+    await _setup(hass)
+    manager = managers(hass)["vtherm-a"] = _fake_manager("vtherm-a", "climate.a", "A")
+    manager.force = MagicMock()
+
+    await hass.services.async_call(DOMAIN, SERVICE_FORCE_FAN, {"fan_mode": "high", "duration_minutes": 0}, blocking=True)
+
+    assert manager.force is None
+
+
+async def test_force_fan_refuses_a_speed_the_unit_does_not_have(integration, reload_spy) -> None:
+    """An unknown speed fails loudly instead of being sent to the device."""
+    hass = integration
+    await _setup(hass)
+    manager = managers(hass)["vtherm-a"] = _fake_manager("vtherm-a", "climate.a", "A")
+
+    with pytest.raises(HomeAssistantError, match="turbo"):
+        await hass.services.async_call(DOMAIN, SERVICE_FORCE_FAN, {"fan_mode": "turbo", "duration_minutes": 10}, blocking=True)
+    assert manager.force is None
+
+
+async def test_reset_learning_clears_and_persists(integration, reload_spy) -> None:
+    """reset_learning empties the model and saves the empty state."""
+    hass = integration
+    await _setup(hass)
+    manager = managers(hass)["vtherm-a"] = _fake_manager("vtherm-a", "climate.a", "A")
+    manager.learning.add_slope_sample("low", 0.4, 0.5, "heat")
+
+    await hass.services.async_call(DOMAIN, SERVICE_RESET_LEARNING, {}, blocking=True)
+
+    assert manager.learning.slope_sample_count() == 0
+    manager.async_save.assert_awaited_once()
+
+
+async def test_apply_learned_settings_only_logs_before_readiness(integration, reload_spy, caplog) -> None:
+    """Nothing is changed: the service reports progress until learning is ready."""
+    hass = integration
+    await _setup(hass)
+    managers(hass)["vtherm-a"] = _fake_manager("vtherm-a", "climate.a", "A")
+
+    await hass.services.async_call(DOMAIN, SERVICE_APPLY_LEARNED_SETTINGS, {}, blocking=True)
+
+    assert "Learning not complete yet" in caplog.text
