@@ -785,8 +785,12 @@ class MpcFanFeatureManager:
                 else (now - self._first_cycle_time) / 60.0
             )
             apply_pin = hvac_mode_entered or pin_clock >= min_interval
-            effective_fan = fixed_fan if apply_pin else current_fan
             effective_reason = f"Fixed fan '{fixed_fan}' for HVAC mode '{hvac_mode}'"
+            hold_reason = self._fixed_fan_hold_reason(is_window_open, is_defrost_active)
+            if hold_reason is not None:
+                apply_pin = False
+                effective_reason += f" (held: {hold_reason})"
+            effective_fan = fixed_fan if apply_pin else current_fan
             decision = {
                 **decision,
                 "mpc_status": "Fixed",
@@ -916,6 +920,24 @@ class MpcFanFeatureManager:
             )
             return None
         return fixed_speed
+
+    def _fixed_fan_hold_reason(self, is_window_open: bool, is_defrost_active: bool) -> str | None:
+        """Return why the fixed speed must not be sent right now, or None.
+
+        The pin is a plain command, not a regulation, but it still must not
+        reach a unit that is stopped: some IR or cloud climates treat any
+        ``set_fan_mode`` as a power-on, so re-applying the speed with a window
+        open or the underlying switched off could restart it. Defrost is held
+        too, like every other fan command. The current speed is kept and the
+        pin resumes on the first cycle the disturbance has cleared.
+        """
+        if is_window_open:
+            return "window open"
+        if self._underlying_hvac_action() == HVACAction.OFF:
+            return "underlying off"
+        if is_defrost_active:
+            return "defrost active"
+        return None
 
     def _is_external_fan_change(self, current_fan: str | None) -> bool:
         """True when the fan mode moved since last cycle without this plugin asking."""
