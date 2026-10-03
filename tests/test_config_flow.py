@@ -150,9 +150,7 @@ def test_apply_configured_fan_order_without_config_is_passthrough() -> None:
 def _hass_with_entries(entries_by_domain: dict) -> MagicMock:
     """A hass whose config-entry registry returns the given entries per domain."""
     hass = MagicMock()
-    hass.config_entries.async_entries = MagicMock(
-        side_effect=lambda domain: entries_by_domain.get(domain, [])
-    )
+    hass.config_entries.async_entries = MagicMock(side_effect=lambda domain: entries_by_domain.get(domain, []))
     return hass
 
 

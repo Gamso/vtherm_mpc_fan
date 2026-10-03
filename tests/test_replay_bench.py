@@ -6,7 +6,6 @@ import sys
 
 from custom_components.vtherm_mpc_fan.thermal_learning import ThermalLearning
 
-
 _SPEC = importlib.util.spec_from_file_location(
     "replay_bench",
     Path(__file__).resolve().parent.parent / "scripts" / "replay_bench.py",
@@ -20,10 +19,7 @@ _SPEC.loader.exec_module(replay_bench)
 def _write_snapshot_csv(path: Path, rows: list[tuple[str, str, str]]) -> None:
     """Write a small effective-slope snapshot CSV for tests."""
     content = ["entity_id,state,last_changed"]
-    content.extend(
-        f"{entity_id},{state},{changed_at}"
-        for entity_id, state, changed_at in rows
-    )
+    content.extend(f"{entity_id},{state},{changed_at}" for entity_id, state, changed_at in rows)
     path.write_text("\n".join(content) + "\n", encoding="utf-8")
 
 

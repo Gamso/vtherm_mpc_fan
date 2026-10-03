@@ -24,8 +24,7 @@ def _full_store() -> ThermalLearning:
     now = time.time()
     learning = ThermalLearning()
     learning.slope_samples = [
-        (now - i * 60, rng.choice(FAN_MODES), rng.uniform(-1.0, 1.0), rng.choice(HVAC_MODES), rng.uniform(-0.5, 2.0))
-        for i in range(MAX_STORED_SLOPE_SAMPLES)
+        (now - i * 60, rng.choice(FAN_MODES), rng.uniform(-1.0, 1.0), rng.choice(HVAC_MODES), rng.uniform(-0.5, 2.0)) for i in range(MAX_STORED_SLOPE_SAMPLES)
     ]
     return learning
 

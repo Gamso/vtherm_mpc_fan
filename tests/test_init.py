@@ -117,9 +117,7 @@ async def test_set_effective_slope_accepts_a_value_in_range(integration, reload_
     manager = _fake_manager("vtherm-a", "climate.a", "A")
     managers(hass)["vtherm-a"] = manager
 
-    await hass.services.async_call(
-        DOMAIN, SERVICE_SET_EFFECTIVE_SLOPE, {"hvac_mode": "cool", "fan_mode": "low", "effective_slope": 0.4}, blocking=True
-    )
+    await hass.services.async_call(DOMAIN, SERVICE_SET_EFFECTIVE_SLOPE, {"hvac_mode": "cool", "fan_mode": "low", "effective_slope": 0.4}, blocking=True)
 
     assert manager.learning.get_mode_effective_slope("low", "cool") == pytest.approx(0.4)
     manager.async_save.assert_awaited_once()

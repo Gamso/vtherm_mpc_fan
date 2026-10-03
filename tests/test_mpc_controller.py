@@ -387,9 +387,7 @@ async def test_setting_the_number_persists_a_ready_synthetic_profile() -> None:
     # hass is deliberately left unset (None): this entity was never added to a
     # platform, and async_set_native_value must not crash trying to publish
     # state to Home Assistant that has never actually adopted it.
-    number = EffectiveSlopeNumber(
-        "entry-1", "climate.living_room", mpc, "cool", "low", on_change=on_change
-    )
+    number = EffectiveSlopeNumber("entry-1", "climate.living_room", mpc, "cool", "low", on_change=on_change)
 
     await number.async_set_native_value(0.42)
 
@@ -465,9 +463,7 @@ def test_number_surfaces_the_live_fallback_before_learning() -> None:
         minutes_since_change=20.0,
     )
 
-    number = EffectiveSlopeNumber(
-        "entry-1", "climate.living_room", mpc, "heat", "high"
-    )
+    number = EffectiveSlopeNumber("entry-1", "climate.living_room", mpc, "heat", "high")
 
     assert number.native_value is not None  # a live guess, not a blank field
     assert number.extra_state_attributes["ready"] is False
@@ -1012,6 +1008,7 @@ def test_mpc_handles_long_dead_time_without_blindness() -> None:
 def _seed_gap_profile(learning: ThermalLearning, fan_mode: str, hvac_mode: str, a: float, b: float) -> None:
     """Seed a profile whose effective slope follows a + b·error."""
     import time
+
     now = time.time()
     sign = -1.0 if hvac_mode == "cool" else 1.0
     samples = []
@@ -1032,8 +1029,7 @@ def test_gap_model_projects_faster_cooling_when_far_from_target() -> None:
     const_learning.set_mode_effective_slope("superhigh", "cool", working)
     const_mpc = MPCController(learning=const_learning, deadband=0.3, min_interval=10, fan_modes=["superhigh"])
 
-    kwargs = dict(current_temp=26.0, target_temp=24.0, vtherm_slope=-1.0,
-                  hvac_mode="cool", current_fan="superhigh", minutes_since_change=20.0)
+    kwargs = dict(current_temp=26.0, target_temp=24.0, vtherm_slope=-1.0, hvac_mode="cool", current_fan="superhigh", minutes_since_change=20.0)
     gap = gap_mpc.evaluate(**kwargs)
     const = const_mpc.evaluate(**kwargs)
 
@@ -1048,8 +1044,12 @@ def test_gap_model_does_not_plunge_past_target() -> None:
     mpc = MPCController(learning=learning, deadband=0.3, min_interval=10, fan_modes=["superhigh"])
 
     result = mpc.evaluate(
-        current_temp=24.4, target_temp=24.0, vtherm_slope=-0.5,
-        hvac_mode="cool", current_fan="superhigh", minutes_since_change=20.0,
+        current_temp=24.4,
+        target_temp=24.0,
+        vtherm_slope=-0.5,
+        hvac_mode="cool",
+        current_fan="superhigh",
+        minutes_since_change=20.0,
     )
     # Starting only 0.4°C above target, a 30-min projection must asymptote toward 24.0,
     # not dive well below it the way a constant-slope model would.
@@ -1065,8 +1065,12 @@ def test_gap_aware_disturbance_bias_stays_small_without_disturbance() -> None:
     # Room 2°C above target -> model expects ~2.5 °C/h effective cooling (raw vtherm_slope ≈ -2.5).
     for _ in range(10):
         mpc.evaluate(
-            current_temp=26.0, target_temp=24.0, vtherm_slope=-2.5,
-            hvac_mode="cool", current_fan="superhigh", minutes_since_change=40.0,
+            current_temp=26.0,
+            target_temp=24.0,
+            vtherm_slope=-2.5,
+            hvac_mode="cool",
+            current_fan="superhigh",
+            minutes_since_change=40.0,
         )
     assert abs(mpc.disturbance_bias) < 0.2
 
@@ -1074,21 +1078,22 @@ def test_gap_aware_disturbance_bias_stays_small_without_disturbance() -> None:
 def test_learning_response_sensor_with_mixed_tuple_lengths() -> None:
     """SmartFanLearningResponseSensor extra_state_attributes handles mixed lengths in response_events."""
     import time
+
     learning = ThermalLearning()
     mpc = _build_mpc(learning)
 
     # Inject mixed length response events
     learning.response_events = [
-        (time.time() - 100, 12.0),                # 2-tuple (old format)
-        (time.time() - 200, 15.0, "heat"),        # 3-tuple (new format with hvac_mode)
-        (time.time() - 300, 0.0, "cool"),         # 3-tuple to be ignored (t <= 0)
+        (time.time() - 100, 12.0),  # 2-tuple (old format)
+        (time.time() - 200, 15.0, "heat"),  # 3-tuple (new format with hvac_mode)
+        (time.time() - 300, 0.0, "cool"),  # 3-tuple to be ignored (t <= 0)
     ]
 
     sensor = SmartFanLearningResponseSensor("entry-1", "climate.living_room", mpc)
 
     assert sensor.native_value == 3
     attrs = sensor.extra_state_attributes
-    assert attrs["response_samples"] == 0         # because is_ready() is False, returns fallback 0
+    assert attrs["response_samples"] == 0  # because is_ready() is False, returns fallback 0
     assert attrs["avg_response_time_min"] == pytest.approx(13.5)
 
 
@@ -1365,6 +1370,8 @@ def test_multi_rank_stepdown_blocked_when_candidate_cannot_sustain_progress() ->
         minutes_since_change=300.0,
     )
     assert "Blocked" not in decision2["mpc_reason"]
+
+
 # --- Audit 2026-09: exploration and unmeasured speeds ----------------------
 def test_current_unmeasured_speed_is_modelled_on_the_observed_slope() -> None:
     """A speed with no profile that is losing ground must not be modelled as gaining.
@@ -1468,9 +1475,7 @@ def test_learning_hold_yields_to_comfort() -> None:
     assert drifting["mpc_would_change_now"] == "yes"
     assert "Emergency escalation" in drifting["mpc_reason"]
 
-    far_off = _build_mpc(_learning_with_measured_medium_and_high()).evaluate(
-        current_temp=18.5, minutes_since_change=20.0, **kwargs
-    )
+    far_off = _build_mpc(_learning_with_measured_medium_and_high()).evaluate(current_temp=18.5, minutes_since_change=20.0, **kwargs)
     assert far_off["mpc_would_change_now"] == "yes"
     assert "Learning hold" not in far_off["mpc_reason"]
 
