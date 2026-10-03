@@ -875,3 +875,32 @@ async def test_fixed_fan_is_held_during_defrost() -> None:
     assert await manager.refresh_state() is False
     runtime.async_set_underlying_fan_mode.assert_not_awaited()
     assert "defrost active" in manager.last_decision["mpc_reason"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hvac_mode", ["dry", "fan_only"])
+async def test_unregulated_modes_never_start_the_setpoint_drop_cooldown(hvac_mode: str) -> None:
+    """A warm room in dry is not a setpoint drop.
+
+    The error was computed with the heating convention in every non-cool
+    mode: 27 C for a 24 C setpoint read as -3 C, a "setpoint drop" on every
+    dry cycle, and slope learning stayed blocked for 30 min after switching
+    to cool although no setpoint had moved.
+    """
+    runtime = _make_runtime(vtherm_hvac_mode=hvac_mode, current_temperature=27.0, regulated_target_temperature=24.0)
+    manager = await _build_manager(runtime)
+
+    await manager.refresh_state()
+
+    assert manager._last_setpoint_drop_time == 0.0  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_a_real_setpoint_drop_in_heat_still_starts_the_cooldown() -> None:
+    """The guard only narrows the trigger to regulated modes; heat keeps it."""
+    runtime = _make_runtime(vtherm_hvac_mode="heat", current_temperature=27.0, regulated_target_temperature=24.0)
+    manager = await _build_manager(runtime)
+
+    await manager.refresh_state()
+
+    assert manager._last_setpoint_drop_time > 0.0  # noqa: SLF001

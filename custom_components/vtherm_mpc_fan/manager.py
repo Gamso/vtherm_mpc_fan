@@ -743,7 +743,11 @@ class MpcFanFeatureManager:
             if hvac_mode == "cool"
             else (target_temp - current_temp)
         )
-        if current_error < THRESHOLD_TARGET_DROP:
+        # Only a regulated mode has an error direction. Read in dry or fan_only
+        # with the heating convention, a warm summer room (27 C for a 24 C
+        # setpoint) looked like a large setpoint drop on every cycle and blocked
+        # learning for 30 min after switching to cool.
+        if hvac_mode in PROFILE_HVAC_MODES and current_error < THRESHOLD_TARGET_DROP:
             self._last_setpoint_drop_time = now
 
         decision = self._mpc.evaluate(
