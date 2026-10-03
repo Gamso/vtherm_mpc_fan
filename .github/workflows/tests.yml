@@ -1,11 +1,11 @@
 name: Tests
 
+# Every branch and every pull request: a fix pushed to a feature branch is
+# checked before it is merged, not after.
 on:
     push:
-        branches:
-            - main
-            - develop
     pull_request:
+    workflow_dispatch:
 
 jobs:
     tests:
@@ -15,10 +15,12 @@ jobs:
             - name: Check out repository
               uses: actions/checkout@v4
 
+            # Home Assistant >= 2026.3 (the minimum in hacs.json) requires Python
+            # 3.14; on 3.13 the resolver silently falls back to an older core.
             - name: Set up Python
               uses: actions/setup-python@v5
               with:
-                  python-version: "3.13"
+                  python-version: "3.14"
 
             - name: Install dependencies
               run: |
@@ -27,3 +29,28 @@ jobs:
             - name: Run tests
               run: |
                   pytest tests/ -v --tb=short
+
+    lint:
+        runs-on: ubuntu-latest
+        name: Lint (black, pylint)
+        steps:
+            - name: Check out repository
+              uses: actions/checkout@v4
+
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.14"
+
+            # pylint imports the integration, so it needs Home Assistant too.
+            - name: Install dependencies
+              run: |
+                  pip install -r requirements_test.txt black==26.5.1 pylint==4.1.2
+
+            - name: Check formatting (pyproject.toml)
+              run: |
+                  black --check --diff custom_components tests
+
+            - name: Run pylint (.pylintrc)
+              run: |
+                  pylint custom_components/vtherm_mpc_fan
