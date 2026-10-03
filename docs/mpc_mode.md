@@ -4,7 +4,7 @@
 
 The MPC controller is the sole decision engine for fan speed.
 It maintains a learned thermal model, scores every candidate fan mode over a 30-minute horizon, and selects the mode with the lowest cost.
-When MPC status is actionable (`Ready`, `Setpoint drop`, `Low confidence`), the integration applies the fan recommendation. When paused (`Disturbed`, `Idle`, `Not ready`), the current fan mode is held.
+When MPC status is actionable (`Ready`, `Setpoint drop`, `Low confidence`), the integration applies the fan recommendation. When paused (`Disturbed`, `Idle`, `Unavailable`), the current fan mode is held. The MPC only regulates `heat` and `cool`; in any other HVAC mode it reports `Idle`, unless that mode has a fixed fan speed (status `Fixed`, set by the feature manager, not by the MPC). A `force_fan` override reports `Forced`.
 
 ## Goals
 
@@ -22,34 +22,41 @@ When MPC status is actionable (`Ready`, `Setpoint drop`, `Low confidence`), the 
 
 Each control cycle follows this flow:
 
-1. Read VTherm temperature, target, slope, HVAC mode, and current fan mode.
-2. Detect disturbances (defrost, HVAC idle, window open).
-3. Compute phase (DEAD_TIME / TRANSIENT / ESTABLISHED).
-4. Run `MPCController.evaluate(...)` → `mpc_decision` dict.
-5. Push `mpc_decision` to all sensors via `sensor.update_from_mpc()`.
-6. Collect learning data (slope samples, response events) with gating.
+VTherm drives the cycle: it calls `MpcFanFeatureManager.refresh_state()` (`manager.py`) once per
+control cycle, right after recomputing its regulated setpoint.
+
+1. Read temperature, target, slope, HVAC mode, and current fan mode from the VTherm runtime.
+2. Detect disturbances (defrost and HVAC idle from the underlying climate's own `hvac_action`,
+   window open from VTherm's `hvac_off_reason`).
+3. Run `MPCController.evaluate(...)` → `mpc_decision` dict.
+4. Resolve the effective fan: `force_fan` override > fixed speed of the HVAC mode > MPC.
+5. Compute phase (DEAD_TIME / TRANSIENT / ESTABLISHED) with the dead time of the current HVAC mode.
+6. Collect learning data (slope samples, response events) with gating — `heat`/`cool` only.
 7. Append MPC information to the CSV log.
-8. Apply the MPC fan recommendation when the MPC status is actionable (`Ready`, `Setpoint drop`,
-   `Low confidence`); hold the current fan otherwise (e.g. status `Not ready`,
-   `Disturbed`, `Idle`).
+8. Push the decision to the sensors (`update_from_mpc()`) and to the VTherm's `mpc_fan` attribute.
+9. Apply the effective fan when it differs from the current one; the MPC recommendation is
+   applied only when its status is actionable (`Ready`, `Setpoint drop`, `Low confidence`), the
+   current fan is held otherwise (`Disturbed`, `Idle`, `Unavailable`).
 
 ### HA Entities
 
-| Platform | Entity ID                                                      | Purpose                                            |
-| -------- | -------------------------------------------------------------- | -------------------------------------------------- |
-| `sensor` | `sensor.smart_fan_controller_mpc_status`                       | Current MPC recommendation status                  |
-| `sensor` | `sensor.smart_fan_controller_mpc_reason`                       | Human-readable reason for the recommendation       |
-| `sensor` | `sensor.smart_fan_controller_mpc_fan_mode`                     | Recommended fan mode                               |
-| `sensor` | `sensor.smart_fan_controller_mpc_would_change_now`             | Whether MPC would change the fan this cycle        |
-| `sensor` | `sensor.smart_fan_controller_mpc_cost`                         | Best cost score for the recommended mode           |
-| `sensor` | `sensor.smart_fan_controller_mpc_confidence`                   | Confidence percentage                              |
-| `sensor` | `sensor.smart_fan_controller_mpc_predicted_temperature_10_min` | 10-minute temperature forecast                     |
-| `sensor` | `sensor.smart_fan_controller_mpc_predicted_temperature_30_min` | 30-minute temperature forecast                     |
-| `sensor` | `sensor.smart_fan_controller_mpc_dead_time`                    | Dead time used by the simulator (min)              |
-| `sensor` | `sensor.smart_fan_controller_mpc_known_profiles`               | Number of reliable learned profiles                |
-| `sensor` | `sensor.smart_fan_controller_mpc_disturbance_bias`             | Slow disturbance correction term                   |
-| `sensor` | `sensor.smart_fan_controller_mpc_heat_profiles`                | Per-mode learned profiles for heat                 |
-| `sensor` | `sensor.smart_fan_controller_mpc_cool_profiles`                | Per-mode learned profiles for cool                 |
+Entity IDs are scoped by the VTherm entity: `<platform>.vtherm_mpc_fan_<vtherm object id>_<key>`
+(below, for `climate.living_room`).
+
+| Platform | Entity ID                                                         | Purpose                                            |
+| -------- | ----------------------------------------------------------------- | -------------------------------------------------- |
+| `sensor` | `sensor.vtherm_mpc_fan_living_room_fan_mode`                         | Effective fan mode after the cycle                 |
+| `sensor` | `sensor.vtherm_mpc_fan_living_room_mpc_confidence`                   | Confidence percentage                              |
+| `sensor` | `sensor.vtherm_mpc_fan_living_room_mpc_predicted_temperature_10_min` | 10-minute temperature forecast                     |
+| `sensor` | `sensor.vtherm_mpc_fan_living_room_mpc_predicted_temperature_30_min` | 30-minute temperature forecast                     |
+| `sensor` | `sensor.vtherm_mpc_fan_living_room_mpc_disturbance_bias`             | Slow disturbance correction term                   |
+| `sensor` | `sensor.vtherm_mpc_fan_living_room_learned_dead_time`                | Learned dead time (pooled over heat/cool, min)     |
+| `number` | `number.vtherm_mpc_fan_living_room_<hvac>_<fan>_effective_slope`     | Editable effective slope of one profile            |
+
+Status, reason, recommended fan mode, would-change-now, cost, the dead time used by the simulator
+and the number of known profiles have no entity of their own: they are published in the VTherm's
+`mpc_fan` attribute section and logged at DEBUG on every cycle by `MPCController._payload()`. The
+full entity list is in the README.
 
 CSV log fields are prefixed with `mpc_*`.
 
@@ -82,7 +89,7 @@ T_hat[k+1] = T_hat[k] + delta_t_hours * raw_slope(q_hat[k+1], hvac_mode)
 
 Where:
 
-- `alpha = 0.35` in the current scaffold
+- `alpha = THERMAL_POWER_BLEND = 0.45` (`mpc_controller.py`)
 - `delta_t = 2 min`
 - `raw_slope = +q_hat` in heating and `-q_hat` in cooling
 
@@ -90,7 +97,9 @@ Where:
 
 The model reuses the current learning subsystem:
 
-- `learning.get_dead_time()` for thermal delay
+- `learning.get_dead_time(hvac_mode)` for thermal delay — per HVAC mode, from `heat`/`cool` response
+  events only; it raises the change interval only once trusted (`MIN_RESPONSE_EVENTS_FOR_ADAPTIVE_INTERVAL`
+  events in that mode)
 - `learning.get_mode_slope_model(fan_mode, hvac_mode)` for reliable per-mode profiles
 
 If a reliable profile is not yet available for a fan mode, the MPC model falls back to an estimate: for the speed currently running, the slope the room is actually showing (never floored — a speed losing ground must lose ground in the simulation); for the other candidates, the nearest learned profile stepped along the ladder by `LADDER_CAPACITY_RATIO`, or a coarse rank scaling of the current slope when nothing is learned at all. Confidence is lowered accordingly.
@@ -198,11 +207,12 @@ The CSV log also stores the MPC recommendation so we can replay and compare deci
 
 Current files involved:
 
-- `custom_components/smart_fan_controller/mpc_controller.py`: MPC thermal model and cost-based scorer
-- `custom_components/smart_fan_controller/thermal_learning.py`: slope samples, response events, profile calibration
-- `custom_components/smart_fan_controller/__init__.py`: control loop, learning collection, services
-- `custom_components/smart_fan_controller/sensor.py`: MPC and learning sensors exposed in Home Assistant
-- `custom_components/smart_fan_controller/data_collection.py`: CSV logger for offline analysis
+- `custom_components/vtherm_mpc_fan/mpc_controller.py`: MPC thermal model and cost-based scorer
+- `custom_components/vtherm_mpc_fan/thermal_learning.py`: slope samples, response events, profile calibration
+- `custom_components/vtherm_mpc_fan/manager.py`: the VTherm feature manager — control cycle, disturbance detection, learning collection, fixed-speed pin
+- `custom_components/vtherm_mpc_fan/__init__.py`: integration setup, factory registration, services
+- `custom_components/vtherm_mpc_fan/sensor.py` / `number.py`: diagnostic sensors and editable profile slopes
+- `custom_components/vtherm_mpc_fan/data_collection.py`: CSV logger for offline analysis
 
 ## Next Steps
 
