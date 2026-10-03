@@ -351,7 +351,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             SERVICE_FORCE_FAN,
         ):
             hass.services.async_remove(DOMAIN, service)
-        await _reload_target_vtherms(hass)
+        # Only the VTherm this entry drove still holds a manager to drop; every
+        # other over_climate thermostat never had one and needs no reload.
+        await _reload_target_vtherms(hass, entry)
 
     return unloaded
 

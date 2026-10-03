@@ -136,3 +136,47 @@ async def test_force_fan_rejects_out_of_range_durations(integration, reload_spy,
     with pytest.raises(vol.Invalid):
         await hass.services.async_call(DOMAIN, SERVICE_FORCE_FAN, {"fan_mode": "high", "duration_minutes": minutes}, blocking=True)
     assert manager.force is None
+
+
+# --- Unload ---------------------------------------------------------------
+
+
+async def test_unloading_the_last_entry_reloads_only_its_own_vtherm(integration, reload_spy) -> None:
+    """Removing the plugin must not reload every over_climate VTherm of the house."""
+    hass = integration
+    _vtherm_entry(hass, "vtherm-a")
+    _vtherm_entry(hass, "vtherm-b")
+    _vtherm_entry(hass, "vtherm-c", thermostat_type="thermostat_over_switch")
+    entry = await _setup(hass)
+    reload_spy.reset_mock()
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+    reload_spy.assert_awaited_once_with("vtherm-a")
+
+
+async def test_unloading_the_last_entry_tears_everything_down(integration, reload_spy) -> None:
+    """Services, the VThermAPI factory and the registry slot all go with the last entry."""
+    hass = integration
+    entry = await _setup(hass)
+    managers(hass)["vtherm-a"] = _fake_manager("vtherm-a", "climate.a", "A")
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+    for service in SERVICES:
+        assert not hass.services.has_service(DOMAIN, service)
+    assert VThermAPI.get_vtherm_api(hass).get_feature_manager(FEATURE_MANAGER_MPC_FAN) is None
+    assert "vtherm-a" not in managers(hass)
+
+
+async def test_unloading_one_of_two_entries_keeps_the_services(integration, reload_spy) -> None:
+    """The services and the factory are shared: they stay while another entry runs."""
+    hass = integration
+    first = await _setup(hass, "vtherm-a")
+    await _setup(hass, "vtherm-b")
+
+    assert await hass.config_entries.async_unload(first.entry_id)
+
+    for service in SERVICES:
+        assert hass.services.has_service(DOMAIN, service)
+    assert VThermAPI.get_vtherm_api(hass).get_feature_manager(FEATURE_MANAGER_MPC_FAN) is not None
