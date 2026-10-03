@@ -55,7 +55,7 @@
                     "min_interval": "Range: 1-60 min. Default: 10 min. Acts as both the floor and (x3) the cap on the adaptive interval derived from the learned dead time.",
                     "data_collection": "Records one CSV row per control cycle in the Home Assistant config folder, alongside configuration.yaml: vtherm_mpc_fan_data_XXXXXXXX.csv (max 10 MB, auto-rotated). Useful for reproducing algorithm behaviour and identifying improvements during the beta phase.",
                     "defrost_entity": "Optional: binary sensor, sensor or input_boolean that indicates when the heat pump is in defrost mode.",
-                    "fixed_fan_hvac_modes": "In these modes the fan is set to the fixed speed below, e.g. dry and fan_only. heat and cool are always regulated by the MPC and are not listed. The speed is applied as soon as the mode is entered; after a manual speed change it is re-applied once the minimum interval has elapsed.",
+                    "fixed_fan_hvac_modes": "In these modes the fan is set to the fixed speed below, e.g. dry and fan_only. heat and cool are always regulated by the MPC and are not listed. The speed is applied as soon as the mode is entered; after a manual speed change, or after a restart or reload, it is (re-)applied only once the minimum interval has elapsed.",
                     "fixed_fan_speed": "The speed used in the fixed-speed modes above (e.g. superhigh). Required when at least one fixed-speed mode is selected."
                 }
             }

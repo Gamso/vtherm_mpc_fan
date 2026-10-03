@@ -181,6 +181,10 @@ class MpcFanFeatureManager:
         self._last_change_time: float = 0.0
         self._previous_slope: float | None = None
         self._last_hvac_mode: str | None = None
+        # When this manager ran its first cycle. A fresh manager (restart, VTherm
+        # reload, options change) has no fan-change history, so the fixed-speed
+        # pin measures its min interval from here instead of re-applying at once.
+        self._first_cycle_time: float | None = None
         self._last_setpoint_drop_time: float = 0.0
         self._defrost_active = False
         self._defrost_start_time: float = 0.0
@@ -699,6 +703,8 @@ class MpcFanFeatureManager:
         is_hvac_idle = self._is_hvac_idle()
 
         now = time.time()
+        if self._first_cycle_time is None:
+            self._first_cycle_time = now
         if self._is_external_fan_change(current_fan):
             _LOGGER.info(
                 "%s - fan mode changed to '%s' outside this plugin; restarting the dead time",
@@ -712,9 +718,10 @@ class MpcFanFeatureManager:
         )
 
         # Reset slope memory on HVAC mode switch: a heating slope tells us
-        # nothing about the cooling response and vice versa.
-        hvac_mode_changed = self._last_hvac_mode != hvac_mode
-        if self._last_hvac_mode is not None and hvac_mode_changed:
+        # nothing about the cooling response and vice versa. The first cycle of
+        # a manager is not a switch: the previous mode is unknown, not different.
+        hvac_mode_entered = self._last_hvac_mode is not None and self._last_hvac_mode != hvac_mode
+        if hvac_mode_entered:
             _LOGGER.info(
                 "HVAC mode changed %s -> %s: resetting slope memory",
                 self._last_hvac_mode,
@@ -765,9 +772,16 @@ class MpcFanFeatureManager:
         elif fixed_fan is not None:
             # Applied at once on entering the mode; afterwards the min interval
             # applies, so a manual change (which restarts it) is not reverted on
-            # the very next cycle.
+            # the very next cycle. A fresh manager has seen no change yet, so its
+            # clock starts at its first cycle: otherwise every restart or reload
+            # would overwrite a speed the user had set by hand.
             min_interval = self._config().get(CONF_MIN_INTERVAL, DEFAULT_MIN_INTERVAL)
-            apply_pin = hvac_mode_changed or minutes_since_change >= min_interval
+            pin_clock = (
+                minutes_since_change
+                if self._last_change_time
+                else (now - self._first_cycle_time) / 60.0
+            )
+            apply_pin = hvac_mode_entered or pin_clock >= min_interval
             effective_fan = fixed_fan if apply_pin else current_fan
             effective_reason = f"Fixed fan '{fixed_fan}' for HVAC mode '{hvac_mode}'"
             decision = {
