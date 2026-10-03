@@ -28,6 +28,7 @@ from .const import (
     DATA_FACTORY_REGISTERED,
     DOMAIN,
     FEATURE_MANAGER_MPC_FAN,
+    PROFILE_HVAC_MODES,
     VTHERM_DOMAIN,
 )
 from .factory import MpcFanManagerFactory
@@ -46,6 +47,14 @@ SERVICE_SET_EFFECTIVE_SLOPE = "set_effective_slope"
 SERVICE_FORCE_FAN = "force_fan"
 
 ATTR_TARGET_VTHERM = "target_vtherm"
+
+# Service bounds. services.yaml only feeds the UI form; Home Assistant validates
+# a call against the voluptuous schema alone, so a script or automation could
+# otherwise store an absurd slope (kept until reset_learning) or a 1e12-minute
+# override. Same limits as services.yaml and the effective-slope number entity.
+EFFECTIVE_SLOPE_MIN = -2.0
+EFFECTIVE_SLOPE_MAX = 5.0
+FORCE_FAN_MAX_MINUTES = 1440
 
 
 def _register_factory(hass: HomeAssistant) -> bool:
@@ -249,9 +258,12 @@ def _register_services(hass: HomeAssistant) -> None:
         schema=vol.Schema(
             {
                 **optional_target,
-                vol.Required("hvac_mode"): cv.string,
+                vol.Required("hvac_mode"): vol.In(PROFILE_HVAC_MODES),
                 vol.Required("fan_mode"): cv.string,
-                vol.Required("effective_slope"): vol.Coerce(float),
+                vol.Required("effective_slope"): vol.All(
+                    vol.Coerce(float),
+                    vol.Range(min=EFFECTIVE_SLOPE_MIN, max=EFFECTIVE_SLOPE_MAX),
+                ),
             }
         ),
     )
@@ -263,7 +275,9 @@ def _register_services(hass: HomeAssistant) -> None:
             {
                 **optional_target,
                 vol.Required("fan_mode"): cv.string,
-                vol.Required("duration_minutes"): vol.Coerce(float),
+                vol.Required("duration_minutes"): vol.All(
+                    vol.Coerce(float), vol.Range(min=0, max=FORCE_FAN_MAX_MINUTES)
+                ),
             }
         ),
     )
