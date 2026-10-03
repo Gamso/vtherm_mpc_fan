@@ -57,12 +57,12 @@
                     "defrost_entity": "Optionnel : binary sensor, sensor ou input_boolean indiquant quand la PAC est en dégivrage.",
                     "fixed_fan_hvac_modes": "Dans ces modes, la ventilation est réglée sur la vitesse fixe ci-dessous, par exemple dry et fan_only. heat et cool sont toujours régulés par le MPC et ne sont pas listés. La vitesse est appliquée dès l'entrée dans le mode ; après un changement manuel de vitesse, elle est ré-appliquée une fois l'intervalle minimum écoulé.",
                     "fixed_fan_speed": "La vitesse utilisée dans les modes à vitesse fixe ci-dessus (ex. superhigh). Obligatoire dès qu'au moins un mode à vitesse fixe est sélectionné."
-                },
-                "error": {
-                    "base": "Chaque vitesse doit être choisie à un seul rang — la même vitesse a été sélectionnée deux fois.",
-                    "fixed_fan_speed_required": "Choisissez la vitesse de ventilation fixe à utiliser dans les modes sélectionnés."
                 }
             }
+        },
+        "error": {
+            "fan_order_invalid": "Chaque vitesse doit être choisie à un seul rang — la même vitesse a été sélectionnée deux fois.",
+            "fixed_fan_speed_required": "Choisissez la vitesse de ventilation fixe à utiliser dans les modes sélectionnés."
         }
     }
 }
