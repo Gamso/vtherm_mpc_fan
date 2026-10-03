@@ -1,3 +1,5 @@
+"""Learned thermal model: slope samples, response events, per-profile slope fits."""
+
 import logging
 import time
 import statistics

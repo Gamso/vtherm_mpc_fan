@@ -237,7 +237,6 @@ class MpcFanFeatureManager:
         """Remove every listener registered through :meth:`add_listener`."""
         while self._active_listener:
             self._active_listener.pop()()
-        return None
 
     async def refresh_state(self) -> bool:
         """Run one control cycle. Returns True when the fan mode was changed."""
@@ -957,7 +956,7 @@ class MpcFanFeatureManager:
         """True when the fan mode moved since last cycle without this plugin asking."""
         if current_fan is None or self._last_observed_fan is None:
             return False
-        return current_fan != self._last_observed_fan and current_fan != self._last_sent_fan_mode
+        return current_fan not in (self._last_observed_fan, self._last_sent_fan_mode)
 
     def _register_fan_change(self, now: float) -> None:
         """Restart everything that is measured from the last fan change."""
