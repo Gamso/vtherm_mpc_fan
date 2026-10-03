@@ -1168,7 +1168,7 @@ def test_hold_equilibrium_holds_steady_instead_of_coasting_near_setpoint(
 def _ready_learning_with_dead_time(dead_time: float) -> ThermalLearning:
     """Build a ready ThermalLearning whose learned dead time is ``dead_time``."""
     learning = ThermalLearning()
-    for _ in range(90):  # 270 samples > MIN_SAMPLES_LEARNING (240) => is_ready()
+    for _ in range(90):  # 270 samples >= MIN_SAMPLES_LEARNING => is_ready()
         learning.add_slope_sample("low", 0.3, 0.8, "heat")
         learning.add_slope_sample("medium", 0.9, 0.8, "heat")
         learning.add_slope_sample("high", 1.5, 0.8, "heat")
