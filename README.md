@@ -26,6 +26,7 @@ A Model Predictive Control (MPC) fan-speed controller for [Versatile Thermostat]
     - [Defrost Detection](#defrost-detection)
     - [HVAC Idle Detection](#hvac-idle-detection)
     - [Window-Open Detection](#window-open-detection)
+    - [HVAC Modes](#hvac-modes)
     - [Fan Speed Order](#fan-speed-order)
   - [Learning System](#learning-system)
     - [Per-Mode Fan Profiles](#per-mode-fan-profiles)
@@ -34,8 +35,9 @@ A Model Predictive Control (MPC) fan-speed controller for [Versatile Thermostat]
     - [Defrost / Idle / Window Learning Exclusion](#defrost--idle--window-learning-exclusion)
   - [Sensors \& Entities](#sensors--entities)
     - [MPC Sensors](#mpc-sensors)
+    - [The `mpc_fan` attribute of the VTherm](#the-mpc_fan-attribute-of-the-vtherm)
     - [Learning Sensors](#learning-sensors)
-    - [Learning Profile Sensors and Numbers](#learning-profile-sensors-and-numbers)
+    - [Learning Profile Numbers](#learning-profile-numbers)
   - [Services](#services)
     - [`vtherm_mpc_fan.apply_learned_settings`](#vtherm_mpc_fanapply_learned_settings)
     - [`vtherm_mpc_fan.reset_learning`](#vtherm_mpc_fanreset_learning)
@@ -138,7 +140,7 @@ All parameters can be changed at any time via **Settings → Devices & Services 
 | **HVAC modes with a fixed fan speed** | *(none)* | modes the VTherm reports except `off`, `heat`, `cool` | In these modes the fan is pinned to the **Fixed fan speed** — e.g. `dry` and `fan_only` at `superhigh` (options-flow only). See [HVAC Modes](#hvac-modes). |
 | **Fixed fan speed**    | *(none)* | fan modes the underlying reports | The speed used in the fixed-speed modes. Required as soon as one fixed-speed mode is selected (options-flow only).                                    |
 
-There is no "operating entity" or "outdoor temperature" option to set: both come from the VTherm runtime automatically (`is_device_active`, `current_outdoor_temperature`) — see [HVAC Idle Detection](#hvac-idle-detection).
+There is no "operating entity" or "outdoor temperature" option to set: whether the unit is producing is read from the underlying climate's own `hvac_action`, and the outdoor temperature from the VTherm runtime (`current_outdoor_temperature`) — see [HVAC Idle Detection](#hvac-idle-detection).
 
 ---
 
@@ -219,7 +221,7 @@ After each fan speed change, the controller classifies elapsed time into three p
 | **TRANSIENT**   | `dead_time ≤ elapsed < dead_time × 1.5` | Sensor starting to respond          |
 | **ESTABLISHED** | `elapsed ≥ dead_time × 1.5`             | Slope reflects the current fan regime |
 
-The default dead time is 10 minutes, replaced by the learned median response time as soon as response events exist. The controller and the learner share this one clock: a slope sample is never taken while the MPC still considers the room in its dead time or transient.
+The default dead time is 10 minutes, replaced by the learned median response time of the current HVAC mode as soon as response events exist (heating lag and cooling lag are learned separately; a mode with no event yet borrows the other's). The controller and the learner share this one clock: a slope sample is never taken while the MPC still considers the room in its dead time or transient.
 
 An escalation guard sits on top of this lock: if the comfort error keeps worsening since the last fan change (by more than 0.15°C), an *escalation only* (never a step-down) is allowed to bypass the phase lock, even mid dead-time — this is what protects against getting stuck above setpoint with no way out if an earlier decision turns out to be too weak.
 
@@ -233,7 +235,11 @@ When a disturbance is detected (window open, defrost, or HVAC idle), the MPC pau
 
 When a heat pump defrosts its outdoor coil, the heat output drops sharply. Without defrost awareness, the controller would misinterpret the falling slope.
 
-**External entity (required to enable this)**: configure a `binary_sensor`, `sensor`, or `input_boolean` that reports defrost state — VTherm does not expose this itself. When the entity is `on`/`true`/`1`, defrost protection activates with a 20-minute cooldown.
+**Underlying `hvac_action` (no configuration)**: when the underlying climate itself reports `hvac_action: defrosting`, defrost protection activates.
+
+**External entity (fallback)**: for units that report nothing, configure a `binary_sensor`, `sensor`, or `input_boolean` that reports defrost state — VTherm does not expose this itself. When the entity is `on`/`true`/`1`, defrost protection activates.
+
+Either way, protection is held for a 20-minute cooldown after the signal clears.
 
 **During defrost protection**: the MPC pauses (`Disturbed`), and learning samples are excluded.
 
@@ -241,7 +247,7 @@ When a heat pump defrosts its outdoor coil, the heat output drops sharply. Witho
 
 When the heat pump compressor is off (setpoint reached, system coasting), the HVAC is not actively heating or cooling — changing fan speed at that moment would be a wasted, meaningless command.
 
-This is read straight from VTherm's own runtime (`is_device_active`) — **no configuration needed**, and it cannot be disabled.
+This is read from the underlying climate's own `hvac_action` (`idle` or `off`, or the climate itself being `off`) — **no configuration needed**, and it cannot be disabled. VTherm's `is_device_active` is deliberately *not* used: when the underlying publishes no `hvac_action`, VTherm synthesises one from a target-vs-current sign check that reads idle across the whole "at or past setpoint" region — exactly the equilibrium this controller holds, while the unit is usually still running. A climate that publishes no `hvac_action` is therefore treated as unknown (not idle), and control continues.
 
 **During HVAC idle**: the MPC pauses (`Disturbed`), and learning samples are excluded.
 
@@ -253,7 +259,9 @@ Also read straight from VTherm: when VTherm itself has stopped the underlying be
 
 The MPC regulates the fan only in `heat` and `cool` (not configurable): they are the only modes with a defined comfort direction and learned profiles. In every other mode (`off`, `dry`, `fan_only`, `heat_cool`, `auto`…) it is paused (`Idle`) and the fan is left untouched — unless that mode has a fixed fan speed.
 
-**Fixed fan speed per HVAC mode.** Pick the modes (for instance `dry` and `fan_only`) and the speed (for instance `superhigh`) in the options flow. When the thermostat enters one of those modes the speed is applied on the next control cycle. While it stays in the mode the plugin re-applies the speed only once **Min Interval** has elapsed since the last fan change, so a manual speed change is respected for that long before being reverted. `mpc_status` reports `Fixed` and `mpc_reason` names the mode. A `force_fan` override takes precedence over the pin.
+**Fixed fan speed per HVAC mode.** Pick the modes (for instance `dry` and `fan_only`) and the speed (for instance `superhigh`) in the options flow; only modes the VTherm reports are offered, and the two fields only appear once a speed is selectable (or one is already stored). When the thermostat enters one of those modes the speed is applied on the next control cycle. While it stays in the mode the plugin re-applies the speed only once **Min Interval** has elapsed since the last fan change, so a manual speed change is respected for that long before being reverted. After a Home Assistant restart, a VTherm reload or an options change, the plugin has no change history: the speed is then re-applied only once **Min Interval** has elapsed since the plugin's first cycle, so a manual speed is not overwritten at startup. Nothing is sent while a window is open, the underlying is off or defrost is active (some IR/cloud units treat any fan command as power-on); the pin resumes once that clears.
+
+The pin is a plain command, not regulation: the speed's slope is not learned and no dead-time (response) event is recorded outside `heat`/`cool`. In the VTherm's [`mpc_fan` attribute](#the-mpc_fan-attribute-of-the-vtherm), `mpc_status` reports `Fixed` and `mpc_reason` names the mode (and why the speed is held, if it is). A `force_fan` override takes precedence over the pin.
 
 ### Fan Speed Order
 
@@ -280,9 +288,9 @@ The plugin includes an **automatic learning system** that collects data during n
 
 Where `volatility_factor = min(slope_stdev / slope_mean, 3.0)`.
 
-> **Note**: the `effective_timeout` diagnostic (`max(min_interval, dead_time × 1.5)` once learning is ready) is exposed as a sensor for insight into the learned thermal lag, but it does not gate control decisions — the minimum interval between fan changes does.
+> **Note**: the `effective_timeout` diagnostic (`max(min_interval, dead_time × 1.5)` once the dead time is trusted — see [Dead Time Calibration](#dead-time-calibration)) is exposed as a sensor for insight into the learned thermal lag, but it does not gate control decisions — the minimum interval between fan changes does.
 
-Once learning is ready, computed parameters are reported via the `learning_status` sensor. Use the `apply_learned_settings` service to apply them, or `reset_learning` to start over.
+Once learning is ready (`learning_progress` at 100 %), the computed deadband is shown by the `learned_deadband` sensor. Nothing is applied automatically: `apply_learned_settings` only writes the computed parameters to the log, and you change the options yourself if you want them. `reset_learning` starts over.
 
 ### Per-Mode Fan Profiles
 
@@ -299,7 +307,7 @@ Samples are filtered out when:
 
 A near-zero slope is **not** filtered out: a speed that holds the room at the setpoint produces exactly that, and it is the measurement of the profile's intercept. (An earlier 0.15 °C/h stagnation cut censored the bottom of the distribution, which both over-estimated the weak speeds and starved the intermediate ones of the few samples they get.)
 
-The effective slope is computed as the **median** (not mean) of collected samples, for robustness against occasional outlier readings caused by thermal inertia from a previous, different fan speed. While a hand-set profile has fewer than 10 measured samples, the two medians are weighted by their counts, so every measurement visibly pulls the value instead of hiding behind the seeded one.
+The effective slope is gap-dependent: each profile fits `slope(error) = a + b × error` by least squares over its measured samples (the gain `b` clamped to be non-negative), and the reported value is that line evaluated at a representative comfort error. Profiles without enough measured samples carrying an error, or whose samples all sit at the same error, fall back to the **median** slope. While a hand-set profile has fewer than 10 measured samples, the seeded and measured medians are weighted by their counts, so every measurement visibly pulls the value instead of hiding behind the seeded one.
 
 When two fan speeds' learned slopes are out of order (e.g. a rarely-used speed's small sample happens to read stronger than a well-sampled one above it), the better-sampled profile is trusted: the rejected estimate is not clamped onto its neighbour (which would make the two speeds thermally indistinguishable to the cost function) but re-synthesized one ladder step away from it, calibrated on the spacing of the profiles that *are* well sampled.
 
@@ -307,7 +315,9 @@ When two fan speeds' learned slopes are out of order (e.g. a rarely-used speed's
 
 The system measures the **thermal response time** — the delay between a fan speed change and the first observable slope change at the sensor. This median value replaces the default 10-minute dead time, letting the controller be patient during the actual thermal lag and reactive once the effect materializes.
 
-Response events are only recorded when the delay is between 2 and 60 minutes (filtering sensor noise and system-off periods), and **once per fan change**: the first significant slope move after a change is the response, later ones inside the window are not counted again (they used to be, which drifted the median toward the middle of the window).
+Response events are only recorded in `heat` and `cool`, when the delay is between 2 and 60 minutes (filtering sensor noise and system-off periods), and **once per fan change**: the first significant slope move after a change is the response, later ones inside the window are not counted again. A change made in one HVAC mode is never answered by a slope move in another, and events stored from other modes are ignored.
+
+The dead time is learned **per HVAC mode**. It raises the minimum interval between changes (up to 3× **Min Interval**) only once it is *trusted*: at least 5 response events in the current mode. Until then the configured **Min Interval** applies as is.
 
 A fan change made outside the plugin — remote control, another automation — counts as a change too: the dead time, the response event and the learning gate all restart from it. To try a speed by hand and have it learned, prefer the `force_fan` service, which also holds it for the duration you choose.
 
@@ -323,46 +333,53 @@ Slope samples and response-time events collected while defrost is active, the co
 
 ## Sensors & Entities
 
-Entity IDs are scoped by the VTherm you attached this plugin to (not the underlying climate). For example, a controller attached to `climate.living_room` (the VTherm entity) exposes `sensor.vtherm_mpc_fan_living_room_mpc_status`.
+Entity IDs are scoped by the VTherm you attached this plugin to (not the underlying climate). For example, a controller attached to `climate.living_room` (the VTherm entity) exposes `sensor.vtherm_mpc_fan_living_room_fan_mode`.
 
 ### MPC Sensors
 
 | Entity                                                                | Unit  | Description                                                        |
 | ----------------------------------------------------------------------- | ----- | --------------------------------------------------------------------- |
-| `sensor.vtherm_mpc_fan_living_room_mpc_status`                          | —     | MPC state (`Not ready`, `Ready`, `Disturbed`, `Idle`, `Fixed`, `Forced`, etc.) |
-| `sensor.vtherm_mpc_fan_living_room_mpc_reason`                          | —     | Explanation of the current MPC recommendation                        |
-| `sensor.vtherm_mpc_fan_living_room_mpc_fan_mode`                        | —     | Fan mode chosen by the MPC                                            |
-| `sensor.vtherm_mpc_fan_living_room_mpc_would_change_now`                | —     | Whether the MPC would actively change the fan right now              |
-| `sensor.vtherm_mpc_fan_living_room_mpc_cost`                            | —     | Lowest simulation cost returned by the MPC optimizer                  |
+| `sensor.vtherm_mpc_fan_living_room_fan_mode`                            | —     | Fan mode in effect after this cycle (MPC, forced or fixed)           |
+| `sensor.vtherm_mpc_fan_living_room_fan_mode_last_change`                | min   | Minutes since the last fan change (ours or external)                 |
 | `sensor.vtherm_mpc_fan_living_room_mpc_confidence`                      | %     | Confidence derived from learned profile coverage                      |
 | `sensor.vtherm_mpc_fan_living_room_mpc_predicted_temperature_10_min`    | °C    | Predicted temperature after 10 minutes with the recommended mode      |
 | `sensor.vtherm_mpc_fan_living_room_mpc_predicted_temperature_30_min`    | °C    | Predicted temperature after 30 minutes with the recommended mode      |
-| `sensor.vtherm_mpc_fan_living_room_mpc_dead_time`                       | min   | Dead time currently used by the MPC simulator                         |
-| `sensor.vtherm_mpc_fan_living_room_mpc_known_profiles`                  | count | Number of reliable learned fan-mode profiles                          |
 | `sensor.vtherm_mpc_fan_living_room_mpc_disturbance_bias`                | °C/h  | Learned disturbance correction currently applied by the MPC model     |
 
-The VTherm entity itself also gains a `mpc_fan` attribute section with the same status/reason/fan-mode fields, the fan speed order in use, and (when applicable) the domain of a conflicting fan plugin — see [Coexisting with other fan plugins](#coexisting-with-other-fan-plugins).
+### The `mpc_fan` attribute of the VTherm
+
+Point-in-time values with no history or automation use are not separate entities: they live in the `mpc_fan` attribute section of the VTherm entity itself (and in a DEBUG log line on every cycle).
+
+| Key                     | Description                                                                                       |
+| ----------------------- | --------------------------------------------------------------------------------------------------- |
+| `mpc_status`            | `Ready`, `Low confidence`, `Setpoint drop` (MPC steering); `Disturbed`, `Idle`, `Unavailable` (paused); `Fixed` (pinned speed), `Forced` (`force_fan`) |
+| `mpc_reason`            | Explanation of the current decision                                                               |
+| `mpc_fan_mode`          | Fan mode chosen (by the MPC, the pin or the override)                                             |
+| `mpc_would_change_now`  | Whether the fan is being changed right now                                                        |
+| `mpc_cost`, `mpc_confidence`, `mpc_predicted_temperature_10m`, `mpc_predicted_temperature_30m`, `mpc_dead_time`, `mpc_known_profiles`, `mpc_disturbance_bias` | Details of the last MPC evaluation |
+| `fan_mode_order`        | Fan speed ladder in use, weakest first                                                            |
+| `sent_fan_mode`         | Last fan mode this plugin sent                                                                    |
+| `learning_ready`        | Whether global learning readiness has been reached                                                |
+| `forced_until`          | Epoch time at which an active `force_fan` override ends                                           |
+| `conflicting_plugin`    | Domain of another fan plugin on this VTherm, when one is found — see [Coexisting with other fan plugins](#coexisting-with-other-fan-plugins) |
 
 ### Learning Sensors
 
 | Entity                                                          | Unit  | Description                                          |
 | -------------------------------------------------------------------- | ----- | ------------------------------------------------------- |
 | `sensor.vtherm_mpc_fan_living_room_learning_progress`                | %     | Learning completion (100% = ≥120 samples)              |
-| `sensor.vtherm_mpc_fan_living_room_learning_status`                  | —     | `"Learning (45%)"` or `"Ready"`                        |
 | `sensor.vtherm_mpc_fan_living_room_learning_samples`                 | count | Number of slope samples collected                      |
 | `sensor.vtherm_mpc_fan_living_room_learning_response_events`         | count | Number of thermal response time measurements           |
 | `sensor.vtherm_mpc_fan_living_room_learned_dead_time`                | min   | Median learned thermal response delay (`dead_time`)    |
 | `sensor.vtherm_mpc_fan_living_room_effective_timeout`                | min   | Advisory adaptive timeout (diagnostic only)             |
 | `sensor.vtherm_mpc_fan_living_room_learned_deadband`                 | °C    | Learned optimal deadband                                |
 
-### Learning Profile Sensors and Numbers
+### Learning Profile Numbers
 
-Once fan modes are detected, the plugin creates per-HVAC-mode profile summary sensors, and one **editable** effective-slope `number` per fan mode:
+Once fan modes are detected, the plugin creates one **editable** effective-slope `number` per fan mode and HVAC mode (`heat`, `cool`):
 
 | Entity (example with `low`/`medium`/`high` fan modes)             | Unit | Description                                        |
 | ------------------------------------------------------------------ | ---- | ---------------------------------------------------- |
-| `sensor.vtherm_mpc_fan_living_room_mpc_heat_profiles`               | —    | JSON summary of learned heat profiles per fan mode  |
-| `sensor.vtherm_mpc_fan_living_room_mpc_cool_profiles`               | —    | JSON summary of learned cool profiles per fan mode  |
 | `number.vtherm_mpc_fan_living_room_heat_low_effective_slope`        | °C/h | Effective slope for `low` in heat mode              |
 | `number.vtherm_mpc_fan_living_room_heat_medium_effective_slope`     | °C/h | Effective slope for `medium` in heat mode           |
 | `number.vtherm_mpc_fan_living_room_heat_high_effective_slope`       | °C/h | Effective slope for `high` in heat mode             |
@@ -379,11 +396,11 @@ Click the value to edit it directly — this replaces the profile's samples with
 
 ### `vtherm_mpc_fan.apply_learned_settings`
 
-Report the parameters computed by the learning system to the log. Useful to inspect what would be applied, or to re-check after a manual change.
+Write the parameters computed by the learning system to the log. Nothing is applied: it is a way to inspect what learning suggests (the deadband is also shown by `sensor.vtherm_mpc_fan_living_room_learned_deadband`), to then change the options yourself.
 
 `target_vtherm` is required only when several VTherm MPC Fan controllers are running.
 
-**Requirement**: `sensor.vtherm_mpc_fan_living_room_learning_status` must be `"Ready"`.
+**Requirement**: learning must be ready (`sensor.vtherm_mpc_fan_living_room_learning_progress` at 100 %); before that the service only logs the current progress.
 
 ### `vtherm_mpc_fan.reset_learning`
 
@@ -402,7 +419,7 @@ Manually set the effective slope for a specific fan mode / HVAC mode profile wit
 | `target_vtherm`   | No*      | `climate.living_room` | Required when several VTherm MPC Fan controllers are running   |
 | `hvac_mode`       | Yes      | `heat`                 | The HVAC mode (`heat` or `cool`)                                |
 | `fan_mode`        | Yes      | `silent`               | The fan mode name                                                |
-| `effective_slope` | Yes      | `0.15`                 | Target effective slope in °C/h (positive = towards target)     |
+| `effective_slope` | Yes      | `0.15`                 | Target effective slope in °C/h (positive = towards target), from `-2` to `5` |
 
 `target_vtherm` is the **VTherm's** entity_id (the thermostat you attached this plugin to), not the underlying climate.
 
@@ -426,7 +443,7 @@ Force a specific fan mode for a fixed duration, overriding the MPC. The override
 | ------------------- | -------- | ---------------------- | -------------------------------------------------------------- |
 | `target_vtherm`     | No*      | `climate.living_room` | Required when several VTherm MPC Fan controllers are running |
 | `fan_mode`          | Yes      | `high`                 | The fan mode to force                                          |
-| `duration_minutes`  | Yes      | `30`                   | How long to hold the forced mode; `0` cancels an active override |
+| `duration_minutes`  | Yes      | `30`                   | How long to hold the forced mode, from `0` to `1440`; `0` cancels an active override |
 
 **Example** (Developer Tools → Services):
 ```yaml
@@ -437,7 +454,7 @@ data:
   duration_minutes: 30
 ```
 
-While a force is active, `mpc_status` reports `Forced` and `mpc_reason` shows the remaining time.
+While a force is active, `mpc_status` (in the VTherm's [`mpc_fan` attribute](#the-mpc_fan-attribute-of-the-vtherm)) reports `Forced` and `mpc_reason` shows the remaining time.
 
 ---
 
@@ -457,8 +474,8 @@ Make sure VTherm's own **auto-fan** option is set to `none` on the VTherm you at
 
 | Symptom                        | What to check / do                                                                                                                         |
 | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Fan not changing**            | Check `sensor.vtherm_mpc_fan_living_room_mpc_status` and `mpc_reason`. The MPC may be paused (disturbed) or the min interval hasn't elapsed. |
-| **MPC status: Not ready**       | Learning hasn't collected enough profiles. Check `sensor.vtherm_mpc_fan_living_room_mpc_known_profiles` and `learning_progress`.             |
+| **Fan not changing**            | Check `mpc_status` and `mpc_reason` in the VTherm's `mpc_fan` attribute. The MPC may be paused (disturbed), the min interval hasn't elapsed, or the mode is pinned (`Fixed`). |
+| **MPC status: Low confidence**  | Few fan speeds have learned profiles yet. Check `mpc_known_profiles` in the `mpc_fan` attribute and `sensor.vtherm_mpc_fan_living_room_learning_progress`. |
 | **MPC status: Disturbed**       | Defrost, HVAC idle, or a window open is detected. Normal — the MPC holds the current fan until the disturbance clears.                        |
 | **Fan not changing at all, no error** | Another plugin may already be driving this fan — check the VTherm's `mpc_fan.conflicting_plugin` attribute. See [Coexisting with other fan plugins](#coexisting-with-other-fan-plugins). |
 | **Too many fan changes**        | Increase `deadband` or `min_interval`. Enable learning to auto-optimize.                                                                        |
