@@ -301,15 +301,19 @@ class MPCController:
         """
         self._error_at_lock_start = None
 
-    def _dead_time_is_trusted(self) -> bool:
-        """True when the learned dead time rests on enough real response events.
+    def _dead_time_is_trusted(self, hvac_mode: str = "unknown") -> bool:
+        """True when *hvac_mode*'s learned dead time rests on enough real response events.
 
         See MIN_RESPONSE_EVENTS_FOR_ADAPTIVE_INTERVAL for why this is not
         ``ThermalLearning.is_ready()``: that flag counts slope samples, which
         answers a different question and lags so far behind that the adaptive
         interval could never engage on a coarse room sensor.
+
+        Counted per mode, like the dead time itself: five heating events say
+        nothing about the cooling lag, and a dead time that only exists through
+        the pooled fallback must not unlock the adaptive interval.
         """
-        return self._learning.response_event_count() >= MIN_RESPONSE_EVENTS_FOR_ADAPTIVE_INTERVAL
+        return self._learning.response_event_count(hvac_mode) >= MIN_RESPONSE_EVENTS_FOR_ADAPTIVE_INTERVAL
 
     def get_effective_timeout(self, hvac_mode: str = "unknown") -> float:
         """Return the adaptive advisory timeout (diagnostic only).
@@ -320,12 +324,12 @@ class MPCController:
         dead time is trusted it falls back to the default dead time scaled by the
         safety factor.
         """
-        if self._dead_time_is_trusted():
+        if self._dead_time_is_trusted(hvac_mode):
             learned_dead_time = self._learning.get_dead_time(hvac_mode)
             return max(self._min_interval, learned_dead_time * DEAD_TIME_SAFETY_FACTOR)
         return DEFAULT_DEAD_TIME * DEAD_TIME_SAFETY_FACTOR
 
-    def _effective_min_interval(self, dead_time: float) -> float:
+    def _effective_min_interval(self, dead_time: float, hvac_mode: str = "unknown") -> float:
         """Return the minimum dwell (minutes) before a fan change is allowed.
 
         The configured ``min_interval`` is a floor. Once the dead time is trusted
@@ -337,7 +341,7 @@ class MPCController:
         overrides (setpoint drop, window/defrost/idle) are handled before this
         gate, so they are never blocked by a long adaptive interval.
         """
-        if not self._dead_time_is_trusted():
+        if not self._dead_time_is_trusted(hvac_mode):
             return float(self._min_interval)
         capped = min(dead_time, self._min_interval * MAX_ADAPTIVE_INTERVAL_FACTOR)
         return max(float(self._min_interval), capped)
@@ -407,7 +411,7 @@ class MPCController:
         if minutes_since_change < self._cycle_minutes or self._error_at_lock_start is None:
             self._error_at_lock_start = current_error
         error_growth_since_change = current_error - self._error_at_lock_start
-        effective_min_interval = self._effective_min_interval(dead_time)
+        effective_min_interval = self._effective_min_interval(dead_time, hvac_mode)
         learning_hold_minutes = dead_time * MIN_ESTABLISHED_RATIO + LEARNING_HOLD_EXTRA_MINUTES
         learning_hold = self._learning_hold_active(
             active_fan=active_fan,

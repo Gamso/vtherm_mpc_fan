@@ -6,6 +6,7 @@ from .const import (
     MIN_SAMPLES_LEARNING,
     MIN_MODE_PROFILE_SAMPLES,
     DEFAULT_DEAD_TIME,
+    PROFILE_HVAC_MODES,
     PROFILE_RETENTION_SAMPLES,
     REFERENCE_SLOPE_ERROR,
 )
@@ -209,9 +210,39 @@ class ThermalLearning:
         """Return number of collected slope samples."""
         return len(self._slope_samples)
 
-    def response_event_count(self) -> int:
-        """Return number of recorded response events."""
-        return len(self._response_events)
+    def response_event_count(self, hvac_mode: str | None = None) -> int:
+        """Return the number of recorded response events.
+
+        Without *hvac_mode* every stored event is counted (diagnostics). With
+        one, only the events that :meth:`get_dead_time` would use for that mode
+        are counted -- so "is the dead time of cool trusted?" is answered by
+        cool's own events, never by heating's or by a non-regulated mode's.
+        """
+        if hvac_mode is None:
+            return len(self._response_events)
+        return len(self._mode_response_times(hvac_mode))
+
+    @staticmethod
+    def _event_mode(item) -> str:
+        """Return the HVAC mode a response event was recorded in (legacy: unknown)."""
+        return item[2] if len(item) == 3 else "unknown"
+
+    def _mode_response_times(self, hvac_mode: str) -> list[float]:
+        """Return the response times that describe *hvac_mode*'s dead time.
+
+        Events recorded in a non-regulated mode (dry, fan_only...) are never
+        used: the slope there is not driven by heating or cooling, so its
+        "response" says nothing about the lag the MPC works with. ``unknown``
+        pools the regulated modes; legacy events without a mode count for any.
+        """
+        times = []
+        for item in self._response_events:
+            event_mode = self._event_mode(item)
+            if item[1] <= 0 or (event_mode != "unknown" and event_mode not in PROFILE_HVAC_MODES):
+                continue
+            if hvac_mode == "unknown" or event_mode in (hvac_mode, "unknown"):
+                times.append(item[1])
+        return times
 
     def get_progress(self) -> float:
         """Return learning progress as percentage (0-100).
@@ -285,19 +316,16 @@ class ThermalLearning:
     def get_dead_time(self, hvac_mode: str = "unknown") -> float:
         """Return the learned dead time (median response time) in minutes for specified HVAC mode.
 
-        Falls back to DEFAULT_DEAD_TIME when no response events have been recorded yet.
+        Falls back to the regulated modes pooled together when the requested
+        mode has no event yet, then to DEFAULT_DEAD_TIME when there is none at
+        all. Events from non-regulated modes are ignored (see
+        :meth:`_mode_response_times`).
         """
-        response_times = []
-        for item in self._response_events:
-            t = item[1]
-            hm = item[2] if len(item) == 3 else "unknown"
-            if t > 0:
-                if hvac_mode == "unknown" or hm == hvac_mode or hm == "unknown":
-                    response_times.append(t)
+        response_times = self._mode_response_times(hvac_mode)
 
         if not response_times:
-            # Try any if specific not found
-            response_times = [item[1] for item in self._response_events if item[1] > 0]
+            # Try any regulated mode if the specific one has none yet
+            response_times = self._mode_response_times("unknown")
 
         if not response_times:
             return DEFAULT_DEAD_TIME

@@ -769,3 +769,51 @@ async def test_fixed_fan_after_a_restart_waits_the_min_interval_from_the_first_c
     manager._first_cycle_time -= 2 * 60  # noqa: SLF001  (11 min since the first cycle)
     await manager.refresh_state()
     runtime.async_set_underlying_fan_mode.assert_awaited_once_with("superhigh")
+
+
+@pytest.mark.asyncio
+async def test_pinned_speed_commands_generate_no_response_events() -> None:
+    """The pin's own commands must not teach the model a dead time.
+
+    Every command arms the response detector; in dry the slope still moves (a
+    dehumidifier changes the room), so each pinned command used to record a
+    "dry" response event. Five of them made the adaptive interval trust a dead
+    time learned outside heat/cool.
+    """
+    import time
+
+    runtime = _make_runtime(last_temperature_slope=-0.2)
+    hass = _make_hass()
+    manager = await _build_manager(runtime, hass=hass, min_interval=10, **FIXED_FAN_CONFIG)
+    await _enter_fixed_mode(runtime, manager)
+    runtime.async_set_underlying_fan_mode.assert_awaited_once_with("superhigh")
+    # The climate now reports the pinned speed, so the pin holds rather than resends.
+    hass.states.get(runtime.entity_id).attributes["fan_mode"] = "superhigh"
+    await manager.refresh_state()
+
+    for slope in (-0.6, -0.1, -0.7, 0.0, -0.8):
+        manager._last_change_time = time.time() - 10 * 60  # noqa: SLF001
+        manager._response_armed = True  # noqa: SLF001  (as after any command)
+        runtime.last_temperature_slope = slope
+        await manager.refresh_state()
+
+    assert manager.learning.response_event_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_a_pending_response_does_not_cross_an_hvac_mode_change() -> None:
+    """A fan change made in dry is not the cause of a slope move seen in cool."""
+    import time
+
+    runtime = _make_runtime(vtherm_hvac_mode="dry", last_temperature_slope=-0.2)
+    manager = await _build_manager(runtime, hass=_hass_with_auto_fan("vtherm-uid"))
+    await manager.refresh_state()
+    manager._last_change_time = time.time() - 10 * 60  # noqa: SLF001
+    manager._response_armed = True  # noqa: SLF001
+
+    runtime.vtherm_hvac_mode = "cool"
+    await manager.refresh_state()
+    runtime.last_temperature_slope = -0.9
+    await manager.refresh_state()
+
+    assert manager.learning.response_event_count() == 0

@@ -40,6 +40,7 @@ from .const import (
     HVAC_OFF_REASON_WINDOW,
     MIN_ESTABLISHED_RATIO,
     PHASE_ESTABLISHED,
+    PROFILE_HVAC_MODES,
     SETPOINT_DROP_LEARNING_COOLDOWN,
     SLOPE_SAMPLE_MIN_DELTA,
     STORAGE_KEY,
@@ -728,6 +729,8 @@ class MpcFanFeatureManager:
                 hvac_mode,
             )
             self._previous_slope = None
+            # A pending response belongs to the mode its fan change was made in.
+            self._response_armed = False
         self._last_hvac_mode = hvac_mode
 
         if self._previous_slope is None:
@@ -824,7 +827,12 @@ class MpcFanFeatureManager:
                 current_fan, vtherm_slope, current_error, hvac_mode, is_window_open  # type: ignore[arg-type]
             )
 
-        if slope_change and self._response_armed:
+        if hvac_mode not in PROFILE_HVAC_MODES:
+            # Dead time is the heating/cooling lag. In dry or fan_only the slope
+            # moves for other reasons, and the pinned-speed commands would
+            # otherwise feed it events of their own.
+            self._response_armed = False
+        elif slope_change and self._response_armed:
             response_time = minutes_since_change
             if response_time > 60.0:
                 # Too late to be a response to the change: stop waiting for one.
