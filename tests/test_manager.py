@@ -634,13 +634,29 @@ async def test_slope_samples_wait_for_the_learned_dead_time() -> None:
 FIXED_FAN_CONFIG = {"fixed_fan_hvac_modes": ["dry", "fan_only"], "fixed_fan_speed": "superhigh"}
 
 
+async def _enter_fixed_mode(runtime, manager, hvac_mode: str = "dry") -> bool:
+    """Run one regulated cycle, switch the VTherm to *hvac_mode*, run one more.
+
+    Entering a mode is a transition between two observed cycles: a manager's
+    very first cycle has no previous mode to have left. The command the cool
+    cycle may have sent is cleared so assertions only see the mode entry.
+    Returns what the entry cycle returned.
+    """
+    runtime.vtherm_hvac_mode = "cool"
+    await manager.refresh_state()
+    runtime.async_set_underlying_fan_mode.reset_mock()
+    manager._last_change_time = 0.0  # noqa: SLF001  (forget the cool cycle's change)
+    runtime.vtherm_hvac_mode = hvac_mode
+    return await manager.refresh_state()
+
+
 @pytest.mark.asyncio
 async def test_fixed_fan_is_applied_on_entering_a_fixed_mode() -> None:
     """In a fixed-speed mode the pinned speed is sent without waiting for the MPC."""
-    runtime = _make_runtime(vtherm_hvac_mode="dry")
-    manager = await _build_manager(runtime, **FIXED_FAN_CONFIG)
+    runtime = _make_runtime()
+    manager = await _build_manager(runtime, min_interval=10, **FIXED_FAN_CONFIG)
 
-    changed = await manager.refresh_state()
+    changed = await _enter_fixed_mode(runtime, manager)
 
     assert changed is True
     runtime.async_set_underlying_fan_mode.assert_awaited_once_with("superhigh")
@@ -677,9 +693,9 @@ async def test_fixed_fan_respects_the_min_interval_after_a_change() -> None:
     """A manual change inside the mode is not reverted on the next cycle."""
     import time
 
-    runtime = _make_runtime(vtherm_hvac_mode="dry")
+    runtime = _make_runtime()
     manager = await _build_manager(runtime, min_interval=10, **FIXED_FAN_CONFIG)
-    await manager.refresh_state()
+    await _enter_fixed_mode(runtime, manager)
     runtime.async_set_underlying_fan_mode.reset_mock()
 
     await manager.refresh_state()  # same mode, change was just made
@@ -717,3 +733,39 @@ async def test_fixed_fan_ignored_when_the_underlying_no_longer_offers_it() -> No
 
     assert changed is False
     assert manager.last_decision["mpc_status"] == "Idle"
+
+
+@pytest.mark.asyncio
+async def test_fixed_fan_is_not_forced_on_the_first_cycle_after_a_restart() -> None:
+    """A restart or reload must not overwrite a speed the user set by hand.
+
+    A fresh manager's first cycle used to count as "entering" the mode (its
+    previous mode was None), so every restart, VTherm reload or options change
+    sent the pin at once -- reverting a manual speed the contract says is kept
+    until the min interval has elapsed.
+    """
+    runtime = _make_runtime(vtherm_hvac_mode="dry")
+    manager = await _build_manager(runtime, min_interval=10, **FIXED_FAN_CONFIG)
+
+    changed = await manager.refresh_state()
+
+    assert changed is False
+    runtime.async_set_underlying_fan_mode.assert_not_awaited()
+    assert manager.last_decision["mpc_status"] == "Fixed"
+    assert manager.last_decision["mpc_would_change_now"] == "no"
+
+
+@pytest.mark.asyncio
+async def test_fixed_fan_after_a_restart_waits_the_min_interval_from_the_first_cycle() -> None:
+    """Without a change history the pin's clock starts at the manager's first cycle."""
+    runtime = _make_runtime(vtherm_hvac_mode="dry")
+    manager = await _build_manager(runtime, min_interval=10, **FIXED_FAN_CONFIG)
+    await manager.refresh_state()
+
+    manager._first_cycle_time -= 9 * 60  # noqa: SLF001
+    await manager.refresh_state()
+    runtime.async_set_underlying_fan_mode.assert_not_awaited()
+
+    manager._first_cycle_time -= 2 * 60  # noqa: SLF001  (11 min since the first cycle)
+    await manager.refresh_state()
+    runtime.async_set_underlying_fan_mode.assert_awaited_once_with("superhigh")
