@@ -290,7 +290,12 @@ Current files involved:
 - `custom_components/vtherm_mpc_fan/sensor.py` / `number.py`: diagnostic sensors and editable profile slopes
 - `custom_components/vtherm_mpc_fan/data_collection.py`: CSV logger for offline analysis
 
-## Next Steps
+## Validation
 
-1. Improve the thermal model with residual correction and better disturbance handling.
-2. Add offline replay tooling against recorded CSV traces.
+- `tests/closed_loop.py` is a closed-loop plant (inverter capacity following the error, actuator delay,
+  power lag, 0.2 °C sensor publishing on change, VTherm EMA slope); `tests/test_closed_loop.py` asserts
+  fewer than 0.5 fan changes per hour and a comfort MAE under 0.25 °C over 48 h on several plant
+  variants, reports the T+30 forecast error next to persistence, and drives the real feature manager
+  from a cold-ish start to check that every speed gets measured.
+- `scripts/replay_bench.py` replays recorded CSV traces in open loop: decisions are compared, the
+  temperature does not react to them. It reports the forecast MAE next to the persistence baseline.

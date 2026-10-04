@@ -65,7 +65,8 @@ Every `evaluate()` return path funnels through `_payload()`, which also logs the
 ## Test Conventions
 
 - Framework: **pytest** in `tests/`; run with `python -m pytest tests/ -q`
-- Never use `time.sleep`; mock `time.time` via `unittest.mock.patch`
+- Never use `time.sleep`; mock `time.time` via `unittest.mock.patch`, or give `ThermalLearning(clock=...)` / `from_dict(data, clock=...)` a settable clock
+- Closed-loop behaviour (changes/h, comfort MAE, exploration) is tested on the plant of `tests/closed_loop.py` (`tests/test_closed_loop.py`, which also drives the real manager); calibrate cost weights there, the replay bench is open loop
 - Protected-member access (`manager._is_hvac_idle()`) is normal in tests — add `# noqa: SLF001` on that line, not a module-level pylint disable
 - Every test function and helper needs a docstring
 - Test helpers: `_build_learning()` / `_build_mpc(learning)` in `test_mpc_controller.py`; `_make_runtime()` / `_make_hass()` / `_build_manager()` in `test_manager.py` build stand-ins for VTherm's `InterfaceThermostatRuntime` and a `hass` stub respectively
