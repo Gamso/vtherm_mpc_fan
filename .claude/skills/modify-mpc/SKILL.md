@@ -18,7 +18,7 @@ This project uses a **discrete MPC-lite** adapted for residential heat-pump HVAC
 - **State**: room temperature (scalar)
 - **Control input**: fan speed mode (discrete: silent → low → med → high → superhigh)
 - **Model**: linear `T(t+Δ) = T(t) + slope × Δt + disturbance_bias × Δt`
-- **Horizon**: 30 min (configurable), step size = control loop cadence (~2 min)
+- **Horizon**: dead time + 60 min (`DEFAULT_HORIZON_MINUTES`), simulation step 2 min (independent of the control cadence)
 - **Optimizer**: exhaustive enumeration over discrete fan modes (small action space)
 - **Cost**: comfort error + overshoot penalty + mode-change cost (see table below)
 
@@ -40,7 +40,7 @@ When MPC status is actionable (`Ready`, `Setpoint drop`, `Overshoot`, `Low confi
 5. Pause conditions: window-open, defrost, HVAC idle → return "Disturbed"
 6. Setpoint drop (genuine user setpoint move, `_track_setpoint`) → return lowest mode immediately; a comfort error < −1 °C without one is `Overshoot` (lowest mode the guards allow, after the simulation)
 7. Build monotone slope map (over the learned profiles, partial ladders included)
-8. Simulate ALL fan modes over the horizon (30 min default)
+8. Simulate ALL fan modes over the horizon (dead time + 60 min); all of them follow the observed slope during the dead time
 9. Select best by lowest cost
 10. Apply guards: min-interval hold, hysteresis, step-down hold
 11. Build and return payload
@@ -53,14 +53,13 @@ Each candidate fan mode is simulated step-by-step over the horizon:
 | Cost Component | Weight | Purpose |
 |---|---|---|
 | `comfort_error × urgency` | 1.0 × (1 + excess error × 2) | Penalizes being outside deadband |
-| `overshoot²` | 3.0 | Strongly penalizes going past target |
-| `floor_violation` (linear) | 12.0 × urgency | Penalizes being below target (heat) |
+| `overshoot²` | 3.0 | Penalizes going past target |
+| `floor_violation` (linear) | 12.0 × urgency | Penalizes a shortfall beyond the deadband (below target in heat, above in cool) |
 | `floor_violation²` | 30.0 | Strongly penalizes large shortfalls |
 | `mode_change_cost` | 0.15 × distance | Penalizes switching fan modes |
-| `mode_rank_cost` | 0.05 × `1.82^rank`, scaled to 0.15× near equilibrium (`HOLD_RANK_SCALE`) | Geometric preference for lower fan speeds — reproduces the old 1.0/1.8/3.3/6.0 power ramp regardless of how many speeds the climate exposes; shrunk to a tie-breaker when already holding near target |
-| `min_interval_penalty` | 25.0 | Blocks changes before min_interval |
+| `mode_rank_cost` | 1.0 × `1.82^rank`, scaled to 0.15× near equilibrium (`HOLD_RANK_SCALE`) | Energy: one more rank costs what ~0.05–0.13 °C of sustained shortfall costs |
 
-Cost weights are module-level constants (e.g. `FLOOR_VIOLATION_LINEAR_WEIGHT = 12.0`).
+The four thermal terms are averaged over the simulation steps (per-step units); all are zero inside the deadband. Cost weights are module-level constants (e.g. `FLOOR_VIOLATION_LINEAR_WEIGHT = 12.0`); calibrate them on the closed-loop plant (`tests/closed_loop.py`, `tests/test_closed_loop.py`), not on the open-loop replay alone.
 
 ### Hysteresis (`_required_switch_gain`)
 
@@ -68,11 +67,11 @@ The MPC requires a minimum cost improvement before switching:
 
 | Situation | Base Margin |
 |---|---|
-| Over-target or far under | 0.10 |
-| Approaching target | 0.15 |
-| Near target (within deadband) | 0.30 |
+| Over-target or far under | 0.2 |
+| Approaching target | 0.3 |
+| Near target (within deadband) | 0.5 |
 
-Plus bonuses for non-established phase (+0.10) and step distance (+0.05/step).
+Plus bonuses for non-established phase (+0.2), step distance (+0.1/step) and a step down while under target (+0.4 + 1.0/°C).
 
 ### Step-Down Hold (`_step_down_hold_note`)
 

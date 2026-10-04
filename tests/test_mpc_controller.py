@@ -161,7 +161,9 @@ def test_mpc_holds_superhigh_while_still_below_target() -> None:
 
     assert result["mpc_fan_mode"] == "superhigh"
     assert result["mpc_would_change_now"] == "no"
-    assert "Below target: holding superhigh" in result["mpc_reason"]
+    # Inside the deadband the weaker speeds are cheaper, but not by the margin a
+    # step down while under target requires.
+    assert "Hysteresis holds superhigh" in result["mpc_reason"] or "Below target: holding superhigh" in result["mpc_reason"]
 
 
 def test_mpc_pauses_when_window_is_open() -> None:
@@ -1261,11 +1263,16 @@ def test_hold_equilibrium_dormant_beyond_deadband(monkeypatch: pytest.MonkeyPatc
     assert on["mpc_cost"] == pytest.approx(off["mpc_cost"])
 
 
-def test_hold_equilibrium_holds_steady_instead_of_coasting_near_setpoint(
+def test_hold_equilibrium_is_never_weaker_and_never_costlier(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Inside the hold zone the controller never coasts to a weaker mode and never
-    costs more; here it holds harder (medium -> high) rather than let the room drift."""
+    costs more than without it.
+
+    With the deadband on both comfort terms, a speed that keeps the room inside
+    the band is charged nothing thermal, so the cheapest one -- low, which still
+    conditions slowly -- wins either way.
+    """
     monkeypatch.setattr(mpc_module, "HOLD_EQUILIBRIUM", False)
     off = _evaluate_hold(24.2)
     monkeypatch.setattr(mpc_module, "HOLD_EQUILIBRIUM", True)
@@ -1277,8 +1284,7 @@ def test_hold_equilibrium_holds_steady_instead_of_coasting_near_setpoint(
     # Never weaker than baseline, and the relaxed penalties never raise the cost.
     assert on_rank >= off_rank
     assert on["mpc_cost"] <= off["mpc_cost"] + 1e-9
-    # On this trace the tolerance lets it commit to a firmer steady hold.
-    assert (off["mpc_fan_mode"], on["mpc_fan_mode"]) == ("medium", "high")
+    assert (off["mpc_fan_mode"], on["mpc_fan_mode"]) == ("low", "low")
 
 
 # --- Adaptive min interval (coupled to learned dead time) -----------------
@@ -1336,7 +1342,7 @@ def test_adaptive_interval_holds_change_until_dead_time_elapses() -> None:
     # First call establishes the comfort-error baseline for this hold (small
     # growth budget below).
     mpc.evaluate(
-        current_temp=19.7,
+        current_temp=19.25,
         target_temp=20.0,
         vtherm_slope=0.25,
         hvac_mode="heat",
@@ -1345,10 +1351,10 @@ def test_adaptive_interval_holds_change_until_dead_time_elapses() -> None:
     )
     # 15 min since last change: allowed under the old fixed 10-min rule, but the
     # learned 20-min dead time means the previous change is not observable yet.
-    # Error only grew 0.05C since the baseline, well under the 0.15C escalation
-    # budget, so the hold is not bypassed.
+    # Error only grew 0.05C since the baseline, well under the escalation
+    # threshold, so the hold is not bypassed.
     held = mpc.evaluate(
-        current_temp=19.65,
+        current_temp=19.2,
         target_temp=20.0,
         vtherm_slope=0.25,
         hvac_mode="heat",
@@ -1359,7 +1365,7 @@ def test_adaptive_interval_holds_change_until_dead_time_elapses() -> None:
     assert "Min interval active" in held["mpc_reason"]
 
     allowed = mpc.evaluate(
-        current_temp=19.65,
+        current_temp=19.2,
         target_temp=20.0,
         vtherm_slope=0.25,
         hvac_mode="heat",
@@ -1382,22 +1388,32 @@ def test_dead_time_lock_escalates_on_growing_error() -> None:
     mpc = _build_mpc(learning, min_interval=10)
     # First call establishes the baseline right after the change (small error).
     mpc.evaluate(
-        current_temp=19.8,
+        current_temp=19.6,
         target_temp=20.0,
         vtherm_slope=0.25,
         hvac_mode="heat",
         current_fan="low",
         minutes_since_change=1.0,
     )
-    # 8 min later the room has drifted 0.2C further from target (> the 0.15C
-    # growth budget) while still inside the 20-min learned dead time.
-    escalated = mpc.evaluate(
-        current_temp=19.6,
+    # 6 min later the room has drifted 0.4C further from target (past the
+    # 0.30C threshold of a 0.2C sensor) while still inside the 20-min learned
+    # dead time. One cycle is not enough: the growth must be confirmed.
+    first = mpc.evaluate(
+        current_temp=19.2,
         target_temp=20.0,
         vtherm_slope=0.25,
         hvac_mode="heat",
         current_fan="low",
-        minutes_since_change=8.0,
+        minutes_since_change=6.0,
+    )
+    assert first["mpc_would_change_now"] == "no"
+    escalated = mpc.evaluate(
+        current_temp=19.2,
+        target_temp=20.0,
+        vtherm_slope=0.25,
+        hvac_mode="heat",
+        current_fan="low",
+        minutes_since_change=11.0,
     )
     assert escalated["mpc_would_change_now"] == "yes"
     assert escalated["mpc_fan_mode"] != "low"
@@ -1583,7 +1599,8 @@ def test_learning_hold_yields_to_comfort() -> None:
     kwargs = dict(target_temp=20.0, vtherm_slope=0.0, hvac_mode="heat", current_fan="low")
 
     mpc.evaluate(current_temp=19.6, minutes_since_change=6.0, **kwargs)  # baseline: error 0.4
-    drifting = mpc.evaluate(current_temp=19.4, minutes_since_change=12.0, **kwargs)  # grew 0.2
+    mpc.evaluate(current_temp=19.2, minutes_since_change=12.0, **kwargs)  # grew 0.4: first breach
+    drifting = mpc.evaluate(current_temp=19.2, minutes_since_change=17.0, **kwargs)  # confirmed
     assert drifting["mpc_would_change_now"] == "yes"
     assert "Emergency escalation" in drifting["mpc_reason"]
 
@@ -1626,15 +1643,17 @@ def test_notify_fan_change_resets_the_escalation_baseline() -> None:
     """
     learning = _ready_learning_with_dead_time(20.0)
     mpc = _build_mpc(learning, min_interval=10)
-    mpc.evaluate(current_temp=19.8, target_temp=20.0, vtherm_slope=0.25, hvac_mode="heat", current_fan="low", minutes_since_change=1.0)
+    mpc.evaluate(current_temp=19.6, target_temp=20.0, vtherm_slope=0.25, hvac_mode="heat", current_fan="low", minutes_since_change=1.0)
 
-    # Without notification the old 0.2 baseline is kept: 0.4 reads as +0.2 growth.
-    stale = mpc.evaluate(current_temp=19.6, target_temp=20.0, vtherm_slope=0.25, hvac_mode="heat", current_fan="low", minutes_since_change=8.0)
+    # Without notification the old 0.4 baseline is kept: 0.8 reads as +0.4 growth.
+    mpc.evaluate(current_temp=19.2, target_temp=20.0, vtherm_slope=0.25, hvac_mode="heat", current_fan="low", minutes_since_change=6.0)
+    stale = mpc.evaluate(current_temp=19.2, target_temp=20.0, vtherm_slope=0.25, hvac_mode="heat", current_fan="low", minutes_since_change=11.0)
     assert "Emergency escalation" in stale["mpc_reason"]
 
     # The same room state right after a (reported) change is a fresh baseline.
     mpc.notify_fan_change()
-    fresh = mpc.evaluate(current_temp=19.6, target_temp=20.0, vtherm_slope=0.25, hvac_mode="heat", current_fan="low", minutes_since_change=8.0)
+    mpc.evaluate(current_temp=19.2, target_temp=20.0, vtherm_slope=0.25, hvac_mode="heat", current_fan="low", minutes_since_change=6.0)
+    fresh = mpc.evaluate(current_temp=19.2, target_temp=20.0, vtherm_slope=0.25, hvac_mode="heat", current_fan="low", minutes_since_change=11.0)
     assert "Emergency escalation" not in fresh["mpc_reason"]
     assert fresh["mpc_would_change_now"] == "no"
 
@@ -1674,3 +1693,129 @@ def test_events_from_unregulated_modes_never_build_a_dead_time() -> None:
     assert mpc._dead_time_is_trusted() is False  # noqa: SLF001
     # The diagnostic total still reports what is stored.
     assert learning.response_event_count() == 20
+
+
+# --- Step 4 guards: sensor resolution, confirmed escalation, cost scale ---------
+def test_sensor_resolution_is_detected_from_the_smallest_reading_step() -> None:
+    """The smallest non-zero change between readings, bounded, with a 0.2 fallback."""
+    mpc = _build_mpc(ThermalLearning())
+    assert mpc.sensor_resolution == pytest.approx(0.2)
+    assert mpc.escalation_threshold == pytest.approx(0.3)
+
+    for temp in (20.0, 20.1, 20.1, 20.3, 20.2, 20.4):
+        mpc.evaluate(current_temp=temp, target_temp=20.0, vtherm_slope=0.0, hvac_mode="heat", current_fan="low", minutes_since_change=60.0)
+
+    assert mpc.sensor_resolution == pytest.approx(0.1)
+    assert mpc.escalation_threshold == pytest.approx(0.15)
+
+    fine = _build_mpc(ThermalLearning())
+    for temp in (20.0, 20.01, 20.02, 20.03, 20.04):
+        fine.evaluate(current_temp=temp, target_temp=20.0, vtherm_slope=0.0, hvac_mode="heat", current_fan="low", minutes_since_change=60.0)
+    assert fine.sensor_resolution == pytest.approx(0.05)
+
+
+def test_one_sensor_step_does_not_escalate() -> None:
+    """A single 0.2 degC reading change during a hold is not an emergency.
+
+    With the old 0.15 threshold one step of a 0.2 degC sensor bypassed the min
+    interval, the hysteresis, the climb guard and the learning hold.
+    """
+    learning = _ready_learning_with_dead_time(20.0)
+    mpc = _build_mpc(learning, min_interval=10)
+    mpc.evaluate(current_temp=19.6, target_temp=20.0, vtherm_slope=0.25, hvac_mode="heat", current_fan="low", minutes_since_change=1.0)
+
+    for minutes in (6.0, 11.0, 16.0):
+        result = mpc.evaluate(current_temp=19.4, target_temp=20.0, vtherm_slope=0.25, hvac_mode="heat", current_fan="low", minutes_since_change=minutes)
+        assert "Emergency escalation" not in result["mpc_reason"]
+        assert result["mpc_would_change_now"] == "no"
+
+
+def test_a_large_error_escalates_without_waiting_for_confirmation() -> None:
+    """Past MULTI_RANK_JUMP_ERROR the growth escalates on its first cycle."""
+    learning = _ready_learning_with_dead_time(20.0)
+    mpc = _build_mpc(learning, min_interval=10)
+    mpc.evaluate(current_temp=19.3, target_temp=20.0, vtherm_slope=0.25, hvac_mode="heat", current_fan="low", minutes_since_change=1.0)
+
+    result = mpc.evaluate(current_temp=18.9, target_temp=20.0, vtherm_slope=0.25, hvac_mode="heat", current_fan="low", minutes_since_change=6.0)
+
+    assert result["mpc_would_change_now"] == "yes"
+    assert "Emergency escalation" in result["mpc_reason"]
+
+
+def test_no_change_inside_the_deadband_on_the_short_side() -> None:
+    """A predicted shortfall inside the deadband costs nothing: no climb for 0.1 degC.
+
+    Without a deadband on the floor term, +0.1 degC of error (half the 0.2
+    deadband) made the controller climb med -> high.
+    """
+    learning = ThermalLearning()
+    learning.set_mode_effective_slope("low", "heat", 0.1)
+    learning.set_mode_effective_slope("medium", "heat", 0.4)
+    learning.set_mode_effective_slope("high", "heat", 0.9)
+    mpc = MPCController(learning=learning, deadband=0.2, min_interval=10, fan_modes=FAN_MODES)
+
+    result = mpc.evaluate(current_temp=19.9, target_temp=20.0, vtherm_slope=0.05, hvac_mode="heat", current_fan="medium", minutes_since_change=60.0)
+
+    assert result["mpc_fan_mode"] == "medium"
+    assert result["mpc_would_change_now"] == "no"
+
+
+def test_cost_terms_are_ordered_comfort_over_energy() -> None:
+    """One rank of energy weighs what 0.05-0.1 degC of sustained shortfall does, not less.
+
+    A sustained shortfall of x beyond the deadband costs 13x + 56x^2 per step;
+    the energy step between the two lowest ranks must sit between x = 0.03 and
+    x = 0.1, and every thermal term must be zero inside the deadband.
+    """
+
+    def sustained(excess: float) -> float:
+        return 13 * excess + 56 * excess**2
+
+    lowest_step = mpc_module.MODE_RANK_COST * (mpc_module.MODE_POWER_RATIO - 1)
+    assert sustained(0.03) < lowest_step < sustained(0.1)
+
+    learning = ThermalLearning()
+    learning.set_mode_effective_slope("low", "heat", 0.0)
+    mpc = MPCController(learning=learning, deadband=0.3, min_interval=10, fan_modes=["low"])
+    held = mpc.evaluate(current_temp=19.8, target_temp=20.0, vtherm_slope=0.0, hvac_mode="heat", current_fan="low", minutes_since_change=60.0)
+    # Only the (tie-breaker scaled) energy of rank 0 remains: no thermal cost at all.
+    assert held["mpc_cost"] == pytest.approx(mpc_module.MODE_RANK_COST * mpc_module.HOLD_RANK_SCALE)
+
+
+def test_every_candidate_starts_on_the_observed_slope() -> None:
+    """Staying and switching are simulated on the same basis during the dead time.
+
+    The current speed used to switch to its model at once while every other
+    candidate kept the observed slope for the dead time: with a learned model
+    far from what the room shows, the comparison favoured or penalised staying
+    for a reason unrelated to the candidates.
+    """
+    learning = ThermalLearning()
+    learning.set_mode_effective_slope("low", "heat", 2.0)
+    learning.set_mode_effective_slope("medium", "heat", 2.5)
+    learning.set_mode_effective_slope("high", "heat", 3.0)
+    for _ in range(5):
+        learning.add_response_event(20.0, "heat")
+    mpc = MPCController(learning=learning, deadband=0.2, min_interval=10, fan_modes=FAN_MODES)
+
+    result = mpc.evaluate(current_temp=19.0, target_temp=20.0, vtherm_slope=-0.6, hvac_mode="heat", current_fan="medium", minutes_since_change=60.0)
+
+    # The room is observed losing 0.6 degC/h: during the 20-minute dead time the
+    # forecast for staying follows that, not medium's learned +2.5 degC/h.
+    assert result["mpc_predicted_temperature_10m"] < 19.0
+
+
+def test_an_unlearned_weaker_speed_is_never_rated_above_the_current_one() -> None:
+    """An observed losing speed bounds every weaker unlearned estimate from above."""
+    fan_modes = ["silent", "low", "med", "high", "superhigh"]
+    learning = ThermalLearning()
+    _seed_gap_profile(learning, "superhigh", "cool", a=0.4, b=0.6)
+    mpc = MPCController(learning=learning, deadband=0.2, min_interval=10, fan_modes=fan_modes)
+
+    mpc.evaluate(current_temp=24.6, target_temp=24.0, vtherm_slope=0.3, hvac_mode="cool", current_fan="high", minutes_since_change=60.0)
+
+    current, _ = mpc.get_live_mode_slope("high", "cool")
+    for weaker in ("silent", "low", "med"):
+        slope, learned = mpc.get_live_mode_slope(weaker, "cool")
+        assert learned is False
+        assert slope < current

@@ -134,7 +134,7 @@ All parameters can be changed at any time via **Settings → Devices & Services 
 
 | Parameter             | Default  | Range           | Description                                                                                                                                                             |
 | ---------------------- | -------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Deadband**           | `0.2°C`  | `0.0` – `5.0°C` | Comfort zone around target — no action taken within this range. Increase to reduce fan changes.                                                                         |
+| **Deadband**           | `0.2°C`  | `0.0` – `5.0°C` | Comfort zone around the user's setpoint: a predicted error inside it costs nothing, on either side, so only energy decides there. Increase to reduce fan changes.                                                                         |
 | **Min Interval**       | `10 min` | `1` – `60 min`  | Minimum time between non-emergency fan changes. Prevents rapid oscillations.                                                                                             |
 | **Data Collection**    | `true`   | —                | Records one CSV row per control cycle in the HA config folder (`vtherm_mpc_fan_data_XXXXXXXX.csv`, max 10 MB, auto-rotated). Useful for offline analysis.               |
 | **Defrost Entity**     | *(none)* | —                | Optional entity (`binary_sensor`, `sensor`, or `input_boolean`) that reports when the heat pump is in a defrost cycle. VTherm does not report this itself. See [Defrost Detection](#defrost-detection). |
@@ -185,10 +185,10 @@ The MPC (Model Predictive Control) engine is the sole decision-maker for fan spe
 To eliminate "dead-time blindness" during startup or large setpoint changes when the physical system has lag, the simulation horizon resolves adaptively to:
 
 ```
-horizon = max(30, dead_time + 30) minutes
+horizon = dead_time + 60 minutes
 ```
 
-This ensures that every candidate fan speed is simulated for a full 30-minute window of active response after its transition delay.
+This ensures that every candidate fan speed is simulated for a full hour of active response after its transition delay. During the first `dead_time` minutes every candidate — the current speed included — follows the slope the room is showing, so staying and switching are compared on the same basis. Sixty minutes rather than thirty: on a 30-minute window the cheap speed that drifts out of the band only after half an hour always beat the one that holds the band, and the controller alternated a weak and a strong speed around the one that would have held.
 
 See [docs/mpc_mode.md](docs/mpc_mode.md) for the full technical design.
 
@@ -207,16 +207,17 @@ Each candidate fan mode is scored with:
 
 | Component                   | Purpose                                                                      |
 | --------------------------- | ----------------------------------------------------------------------------- |
-| **Comfort error × urgency** | Penalizes being outside the deadband, with dynamic step-by-step urgency       |
-| **Overshoot²**               | Strongly penalizes going past the target temperature                          |
-| **Floor violation**         | Penalizes predicted temperature dropping below setpoint (linear + quadratic) |
+| **Comfort error × urgency** | Penalizes being outside the deadband (either side), with dynamic step-by-step urgency |
+| **Overshoot²**               | Penalizes going past the target temperature                                   |
+| **Floor violation**         | Penalizes a predicted *shortfall* beyond the deadband — below the setpoint in heat, above it in cool (linear + quadratic) |
 | **Mode-change cost**        | Penalizes unnecessary fan jumps (proportional to step distance)              |
-| **Mode-rank cost**          | Slight preference for lower fan speeds using a physical non-linear power curve |
-| **Min-interval penalty**    | Blocks changes before the minimum interval has elapsed                        |
+| **Mode-rank cost**          | Energy: `1.0 × 1.82^rank`, so one more rank costs what ~0.05–0.13 °C of sustained shortfall costs |
+
+The thermal terms are averaged over the simulation steps, so costs read "per step" whatever the horizon, and inside the deadband they are zero: there the cheapest speed that keeps the predicted room inside the band wins. A sustained shortfall of `x` °C beyond the deadband costs `13x + 56x²` per step. The minimum interval is a gate, not a cost.
 
 ### Hysteresis and Guards
 
-- **Hysteresis**: a recommendation that changes the fan must beat the current mode by a minimum cost margin. The margin is larger when near the target (0.30) and smaller when far away (0.10).
+- **Hysteresis**: a recommendation that changes the fan must beat the current mode by a minimum cost margin. The margin is larger when near the target (0.5) and smaller when far away (0.2), plus 0.2 outside the established phase, 0.1 per rank, and 0.4 + 1.0 per °C of error for a step down while under target.
 - **Step-down hold**: blocks a jump of more than one rank down to a fan mode whose own learned profile cannot sustain progress at the current comfort error — this is what stops the controller diving straight to a speed with no track record of actually holding the room.
 - **Min interval**: non-emergency changes respect the configured minimum interval between fan changes.
 - **Learning hold**: while the *current* speed has no measured profile (seeded values do not count), the dwell is raised to the learning gate (1.5× dead time) plus 10 minutes so the speed can actually be sampled before it is left. A speed that is never measured is never credible on cost and never chosen again, which is how intermediate speeds stayed unknown. The hold yields to comfort: it is released by the escalation guard, by an overshoot that keeps worsening, and it never applies more than 1 °C from target.
@@ -234,7 +235,7 @@ After each fan speed change, the controller classifies elapsed time into three p
 
 The default dead time is 10 minutes, replaced by the learned median response time of the current HVAC mode as soon as response events exist (heating lag and cooling lag are learned separately; a mode with no event yet borrows the other's). The controller and the learner share this one clock: a slope sample is never taken while the MPC still considers the room in its dead time or transient.
 
-An escalation guard sits on top of this lock: if the comfort error keeps worsening since the last fan change (by more than 0.15°C), an *escalation only* (never a step-down) is allowed to bypass the phase lock, even mid dead-time — this is what protects against getting stuck above setpoint with no way out if an earlier decision turns out to be too weak.
+An escalation guard sits on top of this lock: if the comfort error keeps worsening since the last fan change, an *escalation only* (never a step-down) is allowed to bypass the phase lock, even mid dead-time — this is what protects against getting stuck above setpoint with no way out if an earlier decision turns out to be too weak. The growth must exceed `max(0.15, 1.5 × sensor resolution)` — 0.30 °C for a 0.2 °C sensor — on **two consecutive cycles**; only past 1 °C of comfort error does it escalate at once. The sensor resolution is detected automatically (smallest non-zero change between two readings over the last day, bounded to 0.05–0.5 °C, 0.2 until known) and published as `mpc_sensor_resolution`. With a fixed 0.15 °C threshold a single 0.2 °C sensor step escalated, bypassing the min interval, the hysteresis, the climb guard and the learning hold.
 
 ### Disturbance Handling
 
@@ -370,6 +371,7 @@ Point-in-time values with no history or automation use are not separate entities
 | `mpc_would_change_now`  | Whether the fan is being changed right now                                                        |
 | `mpc_cost`, `mpc_confidence`, `mpc_predicted_temperature_10m`, `mpc_predicted_temperature_30m`, `mpc_dead_time`, `mpc_known_profiles`, `mpc_disturbance_bias` | Details of the last MPC evaluation |
 | `mpc_comfort_error`, `mpc_regulation_offset` | Error against the user's setpoint (positive = needs more heating/cooling), and VTherm's regulated setpoint minus the user's |
+| `mpc_sensor_resolution` | Room sensor resolution detected from the readings (°C) |
 | `fan_mode_order`        | Fan speed ladder in use, weakest first                                                            |
 | `sent_fan_mode`         | Last fan mode this plugin sent                                                                    |
 | `learning_ready`        | Whether global learning readiness has been reached                                                |

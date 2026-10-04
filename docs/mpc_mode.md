@@ -3,7 +3,7 @@
 ## Purpose
 
 The MPC controller is the sole decision engine for fan speed.
-It maintains a learned thermal model, scores every candidate fan mode over a 30-minute horizon, and selects the mode with the lowest cost.
+It maintains a learned thermal model, scores every candidate fan mode over a horizon of the dead time plus 60 minutes, and selects the mode with the lowest cost.
 When MPC status is actionable (`Ready`, `Setpoint drop`, `Overshoot`, `Low confidence`), the integration applies the fan recommendation. When paused (`Disturbed`, `Idle`, `Unavailable`), the current fan mode is held. The MPC only regulates `heat` and `cool`; in any other HVAC mode it reports `Idle`, unless that mode has a fixed fan speed (status `Fixed`, set by the feature manager, not by the MPC). A `force_fan` override reports `Forced`.
 
 ## Goals
@@ -165,36 +165,59 @@ When a window is detected as open, the MPC model does not trust its own predicti
 
 ## MPC-lite Decision Rule
 
-The controller simulates every available fan mode on a short fixed horizon of 30 minutes.
-The candidate fan action is held constant over the horizon, but its effective slope is recomputed at
-each step from the simulated comfort error (see the gap-dependent slope model above).
-The simulator supports both `heat` and `cool`; cooling uses the same learned effective-power model with the sign inverted back to room-temperature evolution.
+The controller simulates every available fan mode over `dead_time + DEFAULT_HORIZON_MINUTES` (60)
+minutes, in 2-minute steps. The candidate fan action is held constant over the horizon, but its
+effective slope is recomputed at each step from the simulated comfort error (see the gap-dependent
+slope model above). During the first `dead_time` minutes **every** candidate — the current speed
+included — follows the observed slope, then its own model: staying and switching start from the same
+trajectory. The simulator supports both `heat` and `cool`; cooling uses the same learned
+effective-power model with the sign inverted back to room-temperature evolution.
 
 Each candidate mode gets a scalar cost:
 
 ```text
 J(mode) =
-    sum(comfort_error × urgency)
-  + 3.0 * sum(overshoot²)
-  + 12.0 * urgency * sum(floor_violation) + 30.0 * sum(floor_violation²)
-  + 0.15 * fan_step_distance
-  + 0.05 * fan_energy_rank
-  + min_interval_penalty
+    mean over steps of [ comfort_error × urgency
+                         + 3.0 × overshoot²
+                         + 12.0 × urgency × floor_violation + 30.0 × floor_violation² ]
+  + 0.15 × fan_step_distance
+  + 1.0 × 1.82^rank × (0.15 inside the hold zone)
 ```
 
-Where:
+Where, with `e` the simulated comfort error against the user's setpoint (positive = short):
 
-- `comfort_error = max(abs(error) - deadband, 0)`, amplified by urgency (`1 + excess × 2`)
-- `overshoot = max(-error, 0)` — going past target
-- `floor_violation = max(target - predicted, 0)` — dropping below setpoint
+- `comfort_error = max(|e| - deadband, 0)`, urgency `1 + 2 × comfort_error`
+- `overshoot = max(-e - tolerance, 0)` — going past target (`tolerance` = 0.3 inside the hold zone, else 0)
+- `floor_violation = max(e - deadband, 0)` — a shortfall beyond the deadband: below the setpoint in
+  heat, **above** it in cool
 - `fan_step_distance` penalizes unnecessary fan jumps
-- `fan_energy_rank` lightly discourages staying on the highest modes all the time
-- `min_interval_penalty` prevents changes before the effective timeout has elapsed
+- the energy term grows geometrically with the rank; one more rank costs what ~0.05–0.13 °C of
+  sustained shortfall costs (a shortfall `x` beyond the deadband costs `13x + 56x²` per step)
 
-In addition, the current implementation applies a mode-independent floor penalty when the predicted room temperature drops below the setpoint. This reflects a conservative comfort rule: if the target is `20°C`, predictions below `20°C` are considered increasingly unacceptable in both `heat` and `cool`.
+Every thermal term is zero inside the deadband: the deadband is a real "no action" zone on both sides,
+where energy alone decides. Averaging over the steps keeps the costs, the energy term and the
+hysteresis margins on one scale whatever the dead time. The minimum interval is a gate (see below),
+not a cost. The weights were calibrated on the closed-loop plant of `tests/closed_loop.py`.
 
 The selected mode is the one with the lowest total cost.
-To avoid fan yo-yo near the setpoint, a recommendation that changes the fan must also beat the current mode by a minimum gain. If the gain is only marginal, the MPC controller keeps the current fan and reports that hysteresis blocked the switch.
+To avoid fan yo-yo near the setpoint, a recommendation that changes the fan must also beat the current
+mode by a minimum gain (`_required_switch_gain`: 0.2 far from target, 0.3 approaching, 0.5 inside the
+deadband, +0.2 outside the established phase, +0.1 per rank, +0.4 + 1.0/°C for a step down while under
+target). If the gain is only marginal, the MPC controller keeps the current fan and reports that
+hysteresis blocked the switch.
+
+An unlearned candidate is estimated from the nearest learned profile along the ladder, then bounded by
+the current speed (`_bound_by_current`): a weaker speed is never rated above the speed running now, a
+stronger one never below.
+
+### Escalation
+
+The min interval can be bypassed upward when the comfort error has grown since the last change by more
+than `escalation_threshold = max(DEAD_TIME_ESCALATION_GROWTH, 1.5 × sensor_resolution)` on
+`ESCALATION_CONFIRM_CYCLES` (2) consecutive cycles, or on the first cycle once the comfort error exceeds
+`MULTI_RANK_JUMP_ERROR`. `sensor_resolution` is the smallest non-zero change between two consecutive
+readings over the last `SENSOR_RESOLUTION_WINDOW` cycles, bounded to [0.05, 0.5], 0.2 until three
+changes have been seen.
 
 ### Exploration guards
 

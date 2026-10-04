@@ -48,9 +48,10 @@ VTherm drives the cycle, not a private timer: `manager.py → MpcFanFeatureManag
 
 ## MPC Decision Engine
 
-The MPC controller (`mpc_controller.py`) evaluates all candidate fan modes over a 30-min horizon:
+The MPC controller (`mpc_controller.py`) evaluates all candidate fan modes over `dead_time + DEFAULT_HORIZON_MINUTES` (60 min); every candidate, the current one included, follows the observed slope during the dead time:
 
-- **Cost function**: comfort error + overshoot penalty + floor violation + mode-change distance cost + geometric mode-rank cost (`MODE_POWER_RATIO ** candidate_index`, tie-breaker-scaled near equilibrium via `HOLD_RANK_SCALE`) + min-interval-change penalty
+- **Cost function**: thermal terms averaged per step — comfort error + overshoot penalty + floor violation (shortfall *beyond the deadband*) — + mode-change distance cost + geometric mode-rank cost (`MODE_RANK_COST × MODE_POWER_RATIO ** candidate_index`, one rank ≈ 0.05–0.13 °C of sustained shortfall, scaled down near equilibrium via `HOLD_RANK_SCALE`). No term charges a predicted error inside the deadband; the min interval is a gate, not a cost
+- **Escalation**: growth of the comfort error since the change past `max(0.15, 1.5 × sensor_resolution)` on 2 consecutive cycles (immediate past `MULTI_RANK_JUMP_ERROR`); `sensor_resolution` is auto-detected from the readings
 - **Hysteresis**: requires minimum cost improvement before switching (margin scales with proximity to target)
 - **Step-down guards**: blocks downward moves when under target and not established or predicted shortfall
 - **Disturbance bias**: EMA tracker for unmodeled effects (solar, occupancy); decays during paused periods

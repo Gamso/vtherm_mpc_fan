@@ -70,8 +70,7 @@ python scripts/replay_bench.py data.csv \
 | `FLOOR_VIOLATION_LINEAR_WEIGHT`    | `12.0`  | Linear penalty for floor violation                |
 | `FLOOR_VIOLATION_QUADRATIC_WEIGHT` | `30.0`  | Quadratic penalty for floor violation             |
 | `MODE_CHANGE_DISTANCE_COST`        | `0.15`  | Distance cost when switching fan mode             |
-| `MODE_RANK_COST`                   | `0.05`  | Rank cost (nudges towards lower fan modes)        |
-| `MIN_INTERVAL_CHANGE_PENALTY`      | `25.0`  | Penalty for switching before the minimum interval |
+| `MODE_RANK_COST`                   | `1.0`   | Rank cost (energy, × `MODE_POWER_RATIO`^rank)     |
 | `URGENCY_SENSITIVITY`              | `2.0`   | Urgency scaling when error exceeds deadband       |
 
 ### Report output
