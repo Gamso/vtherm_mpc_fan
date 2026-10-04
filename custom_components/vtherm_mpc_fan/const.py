@@ -94,7 +94,24 @@ PHASE_ESTABLISHED = "ESTABLISHED"
 # 20-30 accepted samples per day, so a 7-day window tops out near 180 samples.
 # The previous 240 was unreachable on real hardware and is_ready() never flipped.
 MIN_SAMPLES_LEARNING = 120  # Minimum slope samples required for initial readiness
-MIN_MODE_PROFILE_SAMPLES = 10  # Minimum *measured* samples per fan mode to trust its profile
+MIN_MODE_PROFILE_SAMPLES = 10  # Synthetic samples written by a seed; min samples for the spread statistic
+
+# Time-based sampling. VTherm's slope only moves when the room sensor publishes,
+# and a coarse sensor (0.2 degC steps, one distinct reading every ~18 min in
+# median on the production trace) publishes least precisely when a speed *holds*
+# the room. Requiring a distinct reading per sample therefore starved exactly the
+# speeds that work: after the established gate only superhigh ever reached ten
+# distinct readings (20 holds out of 64; low 0/85, high 0/35, med 1/33, silent
+# 1/78). One sample is now taken per SAMPLE_INTERVAL_MINUTES of established
+# regime even when the slope has not moved; within that interval an unchanged
+# reading is still a duplicate. Samples so taken are strongly autocorrelated,
+# which the fits account for (effective sample size, see thermal_learning).
+SAMPLE_INTERVAL_MINUTES = 10.0
+# A profile is *measured* once its samples cover this much established regime
+# (each sample carries the minutes it stands for) and number at least
+# MIN_MEASURED_PROFILE_SAMPLES -- rather than ten distinct readings.
+MEASURED_PROFILE_MINUTES = 90.0
+MIN_MEASURED_PROFILE_SAMPLES = 6
 # Newest samples always kept per (fan_mode, hvac_mode) profile, however old they
 # are. The reliability gate above counts measured samples, and a rarely-used
 # speed collects a handful per week: expiring them by date alone (the 7-day

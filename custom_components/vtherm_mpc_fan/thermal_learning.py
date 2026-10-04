@@ -7,12 +7,15 @@ from collections import Counter
 from dataclasses import dataclass
 
 from .const import (
+    MEASURED_PROFILE_MINUTES,
+    MIN_MEASURED_PROFILE_SAMPLES,
     MIN_SAMPLES_LEARNING,
     MIN_MODE_PROFILE_SAMPLES,
     DEFAULT_DEAD_TIME,
     PROFILE_HVAC_MODES,
     PROFILE_RETENTION_SAMPLES,
     REFERENCE_SLOPE_ERROR,
+    SAMPLE_INTERVAL_MINUTES,
 )
 
 #: Cap on persisted slope samples (see to_dict). ~7 days at 2-min intervals.
@@ -20,7 +23,9 @@ MAX_STORED_SLOPE_SAMPLES = 5000
 
 # --- Persisted sample format ------------------------------------------------
 # A slope sample is a tuple, persisted as a JSON list:
-#   (timestamp, fan_mode, raw_slope, hvac_mode, comfort_error, regulation_offset)
+#   (timestamp, fan_mode, raw_slope, hvac_mode, comfort_error, regulation_offset, dwell_minutes)
+# ``dwell_minutes`` is how much established regime the sample stands for (see
+# SAMPLE_INTERVAL_MINUTES); a 6-item sample stands for SAMPLE_INTERVAL_MINUTES.
 # Older stores hold shorter tuples, all still accepted by from_dict():
 #   3 items: no hvac_mode, no error          -> hvac "unknown", error None
 #   4 items: no error                        -> error None (a constant, like a seed)
@@ -39,6 +44,25 @@ LEARNING_DATA_FORMAT = 2
 # this much of a current sample in the fits, and they age out of the 7-day
 # window / per-profile retention like any other sample.
 LEGACY_SAMPLE_WEIGHT = 0.25
+# Legacy samples were only taken on a distinct sensor reading and carry no
+# dwell. Ten of them used to make a profile "measured"; crediting each with 9
+# minutes keeps exactly that (10 x 9 = MEASURED_PROFILE_MINUTES), so an upgrade
+# changes no profile's status.
+LEGACY_SAMPLE_DWELL_MINUTES = 9.0
+
+# Consecutive samples of one regime are strongly autocorrelated (VTherm's slope
+# is an EMA and the sensor moves rarely), so n samples carry the information of
+# n_eff = n / (1 + 2 * rho), rho the lag-1 autocorrelation of the fit residuals
+# within a run of samples. DEFAULT_SAMPLE_AUTOCORRELATION is used while too few
+# consecutive pairs exist to estimate it.
+DEFAULT_SAMPLE_AUTOCORRELATION = 0.5
+MAX_SAMPLE_AUTOCORRELATION = 0.9
+MIN_AUTOCORRELATION_PAIRS = 5
+# A profile's gain b is shrunk toward the gain pooled over every speed of the
+# HVAC mode, as if GAIN_PRIOR_SAMPLES independent samples had shown the pooled
+# value: b = (n_eff * b_profile + k * b_pool) / (n_eff + k). A thin profile
+# cannot then invent a steep gain from a few autocorrelated points.
+GAIN_PRIOR_SAMPLES = 10.0
 
 # The regulation offset (sign-aligned, positive = VTherm asks the unit for more)
 # is a proxy for how hard the inverter compressor is driven, which the fan speed
@@ -68,6 +92,7 @@ class ProfileFit:
     intercept: float
     gain: float
     r_squared: float | None
+    effective_samples: float | None = None
     offset_gain: float = 0.0
     offset_base: float = 0.0
     offset_trend: float = 0.0
@@ -93,6 +118,18 @@ def demand_offset(regulation_offset: float | None, hvac_mode: str) -> float | No
 def sample_weight(sample) -> float:
     """Return a measurement's weight in the fits (see LEGACY_SAMPLE_WEIGHT)."""
     return 1.0 if len(sample) > 5 else LEGACY_SAMPLE_WEIGHT
+
+
+def sample_dwell(sample) -> float:
+    """Return the minutes of established regime a measurement stands for."""
+    if len(sample) > 6 and sample[6] is not None:
+        return float(sample[6])
+    return SAMPLE_INTERVAL_MINUTES if len(sample) > 5 else LEGACY_SAMPLE_DWELL_MINUTES
+
+
+def is_measurement(sample) -> bool:
+    """True for a measured sample (it carries a comfort error), False for a seed."""
+    return len(sample) > 4 and sample[4] is not None
 
 
 def sample_offset(sample) -> float | None:
@@ -161,6 +198,12 @@ class ThermalLearning:
         # entity and every MPC candidate reads the same few fits several times
         # per cycle; they only change when the sample list does.
         self._fit_cache: dict[tuple[str, str], ProfileFit | None] = {}
+        self._pooled_gain_cache: dict[str, float] = {}
+
+    def _invalidate_fits(self) -> None:
+        """Drop every cached fit (per profile and pooled); the samples changed."""
+        self._fit_cache.clear()
+        self._pooled_gain_cache.clear()
 
     def reset(self) -> None:
         """Reset all learning data and statistics."""
@@ -172,7 +215,7 @@ class ThermalLearning:
         self._slope_max = 0.0
         self._ready_once = False
         self._optimal_cache = None
-        self._fit_cache.clear()
+        self._invalidate_fits()
         self._profile_ready_logged.clear()
         _LOGGER.info("Learning: reset requested; data cleared")
 
@@ -184,12 +227,16 @@ class ThermalLearning:
         hvac_mode: str = "unknown",
         is_window_open: bool = False,
         regulation_offset: float | None = None,
+        dwell_minutes: float | None = None,
     ):
         """Record slope only if in normal operating range.
 
         ``temperature_error`` is the comfort error against the *user's* setpoint
         and ``regulation_offset`` VTherm's regulated setpoint minus the user's
         (raw degC, None when unknown): see ``ProfileFit`` for how it is used.
+        ``dwell_minutes`` is the established regime the sample stands for
+        (SAMPLE_INTERVAL_MINUTES when not given); the profile counts as measured
+        once these add up to MEASURED_PROFILE_MINUTES.
 
         Samples are filtered out when:
         - Setpoint drop / night mode (error < -1°C)
@@ -219,8 +266,9 @@ class ThermalLearning:
             _LOGGER.debug("Learning: Skipped sample (window open)")
             return
 
-        self._slope_samples.append((time.time(), fan_mode, slope, hvac_mode, temperature_error, regulation_offset))
-        self._fit_cache.clear()
+        dwell = SAMPLE_INTERVAL_MINUTES if dwell_minutes is None else max(0.0, float(dwell_minutes))
+        self._slope_samples.append((time.time(), fan_mode, slope, hvac_mode, temperature_error, regulation_offset, dwell))
+        self._invalidate_fits()
         profile_samples = self.get_mode_sample_count(fan_mode, hvac_mode)
         _LOGGER.debug(
             "Learning: Collected slope sample #%d (fan=%s, slope=%.2f, err=%.2f, hvac=%s, profile=%d/%d)",
@@ -238,7 +286,7 @@ class ThermalLearning:
         self._update_slope_stats(abs(slope))
 
         profile_key = (hvac_mode, fan_mode)
-        if hvac_mode != "unknown" and profile_samples >= MIN_MODE_PROFILE_SAMPLES and profile_key not in self._profile_ready_logged:
+        if hvac_mode != "unknown" and profile_key not in self._profile_ready_logged and self.has_measured_profile(fan_mode, hvac_mode):
             self._profile_ready_logged.add(profile_key)
             effective_slope = self.get_mode_effective_slope(fan_mode, hvac_mode)
             _LOGGER.info(
@@ -257,7 +305,7 @@ class ThermalLearning:
         self._slope_samples = self.trim_with_min_retention(self._slope_samples, cutoff_time, PROFILE_RETENTION_SAMPLES)
         # The trim may reorder samples even when it drops none, and the
         # regression sums in list order: never serve a fit from the old order.
-        self._fit_cache.clear()
+        self._invalidate_fits()
 
         if len(self._slope_samples) < before:
             self.recompute_slope_stats()
@@ -427,7 +475,7 @@ class ThermalLearning:
     def slope_samples(self, value: list) -> None:
         self._slope_samples = value
         self._optimal_cache = None
-        self._fit_cache.clear()
+        self._invalidate_fits()
 
     @property
     def response_events(self) -> list:
@@ -497,66 +545,130 @@ class ThermalLearning:
         target (raw VTherm slope is inverted in cooling). When the regulation
         offset varied enough, a shrunk second term models it (see ProfileFit).
 
+        The samples are autocorrelated: the fit reports its effective sample
+        size, and the gain is shrunk toward the gain pooled over the HVAC mode's
+        speeds in proportion to it (GAIN_PRIOR_SAMPLES).
+
         ``r_squared`` is the coefficient of determination of the fit (0..1); it is
         ``None`` for the constant fallback (no real regression was performed).
 
         Falls back to a constant model ``(median_effective_slope, 0.0, None)`` when
-        there are too few error-bearing samples or the error has no spread — which
-        keeps behaviour identical to the previous median estimator for legacy data
-        and for synthetic profiles seeded via ``set_mode_effective_slope``.
+        the error has no spread. A profile that is not measured yet (see
+        :meth:`has_measured_profile`) but was seeded blends the seeded and
+        measured medians.
 
         The gain ``b`` is clamped to be non-negative: a larger gap can only cool/heat
         at least as fast, never slower.
 
-        Returns None if fewer than MIN_MODE_PROFILE_SAMPLES are available.
+        Returns None for a profile neither measured nor seeded.
         """
         sign = -1.0 if hvac_mode == "cool" else 1.0
         matching = [s for s in self._slope_samples if s[1] == fan_mode and s[3] == hvac_mode]
-        if len(matching) < MIN_MODE_PROFILE_SAMPLES:
-            return None
-
         # Only samples that carry a stored error are measurements; the others are
         # synthetic (set_mode_effective_slope) or predate the error column.
-        measured = [s for s in matching if len(s) > 4 and s[4] is not None]
+        measured = sorted((s for s in matching if is_measurement(s)), key=lambda s: s[0])
         points = [(s[4], sign * s[2], sample_weight(s)) for s in measured]
-        constants = [sign * s[2] for s in matching if len(s) <= 4 or s[4] is None]
-        if len(points) < MIN_MODE_PROFILE_SAMPLES:
+        constants = [sign * s[2] for s in matching if not is_measurement(s)]
+        if not self._covers_measured_profile(measured):
+            if not constants:
+                return None
             # Not enough measurements for a regression. A plain median over the
             # mixed set would return the seeded value unchanged until the real
             # samples outnumber the synthetic ones (ten identical values are the
             # median of any set of fewer than twenty), hiding every bit of
             # progress. Weight the two medians by their counts instead, so each
             # measurement visibly pulls the profile toward what was observed.
-            median_constant = statistics.median(constants) if constants else None
-            median_measured = weighted_median([y for _, y, _ in points], [w for _, _, w in points]) if points else None
-            if median_constant is None:
-                return ProfileFit(median_measured, 0.0, None)
-            if median_measured is None:
+            median_constant = statistics.median(constants)
+            if not points:
                 return ProfileFit(median_constant, 0.0, None)
+            median_measured = weighted_median([y for _, y, _ in points], [w for _, _, w in points])
             weight = len(points) / (len(points) + len(constants))
             return ProfileFit(median_constant + weight * (median_measured - median_constant), 0.0, None)
 
+        total = sum(w for _, _, w in points)
+        mean_y = sum(w * y for _, y, w in points) / total
         line = weighted_line(points)
         if line is None:
             # All samples taken at (nearly) the same error: no slope can be fitted.
-            constant = ProfileFit(weighted_median([y for _, y, _ in points], [w for _, _, w in points]), 0.0, None)
+            median_y = weighted_median([y for _, y, _ in points], [w for _, _, w in points])
+            n_eff = self._effective_sample_count(measured, [y - median_y for _, y, _ in points], total)
+            constant = ProfileFit(median_y, 0.0, None, effective_samples=n_eff)
             return self._fit_offset_term(constant, measured, sign, hvac_mode)
 
-        intercept_a, gain_b, _, _ = line
-        if gain_b < 0.0:
-            gain_b = 0.0
-            total = sum(w for _, _, w in points)
-            intercept_a = sum(w * y for _, y, w in points) / total
-        mean_y = sum(w * y for _, y, w in points) / sum(w for _, _, w in points)
+        intercept_a, gain_b, _, mean_x = line
+        n_eff = self._effective_sample_count(measured, [y - (intercept_a + gain_b * x) for x, y, _ in points], total)
+        gain_b = max(0.0, gain_b)
+        pooled = self._pooled_gain(hvac_mode)
+        gain_b = (n_eff * gain_b + GAIN_PRIOR_SAMPLES * pooled) / (n_eff + GAIN_PRIOR_SAMPLES)
+        intercept_a = mean_y - gain_b * mean_x
 
-        # Coefficient of determination against the (clamped) fitted line.
+        # Coefficient of determination against the (clamped, shrunk) fitted line.
         ss_tot = sum(w * (y - mean_y) ** 2 for _, y, w in points)
         if ss_tot < 1e-9:
             r_squared = None
         else:
             ss_res = sum(w * (y - (intercept_a + gain_b * x)) ** 2 for x, y, w in points)
             r_squared = max(0.0, 1.0 - ss_res / ss_tot)
-        return self._fit_offset_term(ProfileFit(intercept_a, gain_b, r_squared), measured, sign, hvac_mode)
+        return self._fit_offset_term(ProfileFit(intercept_a, gain_b, r_squared, effective_samples=n_eff), measured, sign, hvac_mode)
+
+    @staticmethod
+    def _covers_measured_profile(measured: list) -> bool:
+        """True when *measured* samples cover MEASURED_PROFILE_MINUTES of regime, in enough samples."""
+        if len(measured) < MIN_MEASURED_PROFILE_SAMPLES:
+            return False
+        return sum(sample_dwell(s) for s in measured) >= MEASURED_PROFILE_MINUTES - 1e-6
+
+    @staticmethod
+    def _effective_sample_count(measured: list, residuals: list[float], total_weight: float) -> float:
+        """Return n_eff = weight / (1 + 2 rho) for time-sorted *measured* samples.
+
+        rho is the lag-1 autocorrelation of the fit residuals over consecutive
+        samples of one run (gap <= 2.5 x SAMPLE_INTERVAL_MINUTES), clamped to
+        [0, MAX_SAMPLE_AUTOCORRELATION]; DEFAULT_SAMPLE_AUTOCORRELATION when
+        fewer than MIN_AUTOCORRELATION_PAIRS pairs exist or the residuals are flat.
+        """
+        max_gap = 2.5 * SAMPLE_INTERVAL_MINUTES * 60.0
+        products = 0.0
+        squares = 0.0
+        pairs = 0
+        for index in range(1, len(measured)):
+            if measured[index][0] - measured[index - 1][0] > max_gap:
+                continue
+            first, second = residuals[index - 1], residuals[index]
+            products += first * second
+            squares += (first * first + second * second) / 2.0
+            pairs += 1
+        if pairs < MIN_AUTOCORRELATION_PAIRS or squares < 1e-12:
+            rho = DEFAULT_SAMPLE_AUTOCORRELATION
+        else:
+            rho = min(MAX_SAMPLE_AUTOCORRELATION, max(0.0, products / squares))
+        return total_weight / (1.0 + 2.0 * rho)
+
+    def _pooled_gain(self, hvac_mode: str) -> float:
+        """Return the gain pooled over every speed of *hvac_mode* (within-speed slope).
+
+        Each speed keeps its own intercept; only the dependence on the error is
+        shared, which is what the profiles have in common (the compressor's
+        response to the gap). Clamped non-negative, 0 when nothing varies.
+        """
+        if hvac_mode in self._pooled_gain_cache:
+            return self._pooled_gain_cache[hvac_mode]
+        sign = -1.0 if hvac_mode == "cool" else 1.0
+        by_fan: dict[str, list[tuple[float, float, float]]] = {}
+        for s in self._slope_samples:
+            if s[3] == hvac_mode and is_measurement(s):
+                by_fan.setdefault(s[1], []).append((s[4], sign * s[2], sample_weight(s)))
+        sxy = 0.0
+        sxx = 0.0
+        for points in by_fan.values():
+            total = sum(w for _, _, w in points)
+            mean_x = sum(w * x for x, _, w in points) / total
+            mean_y = sum(w * y for _, y, w in points) / total
+            sxx += sum(w * (x - mean_x) ** 2 for x, _, w in points)
+            sxy += sum(w * (x - mean_x) * (y - mean_y) for x, y, w in points)
+        pooled = max(0.0, sxy / sxx) if sxx >= 1e-6 else 0.0
+        self._pooled_gain_cache[hvac_mode] = pooled
+        return pooled
 
     @staticmethod
     def _fit_offset_term(fit: ProfileFit, measured: list, sign: float, hvac_mode: str) -> ProfileFit:
@@ -589,13 +701,13 @@ class ThermalLearning:
         offset_gain = sum(rd * ry for rd, ry in residuals) / (spread_sq + OFFSET_PRIOR_SAMPLES * OFFSET_PRIOR_SPREAD**2)
         if offset_gain <= 0.0:
             return fit
-        return ProfileFit(fit.intercept, fit.gain, fit.r_squared, offset_gain, base, slope_d)
+        return ProfileFit(fit.intercept, fit.gain, fit.r_squared, fit.effective_samples, offset_gain, base, slope_d)
 
     def get_mode_slope_model(self, fan_mode: str, hvac_mode: str) -> tuple[float, float] | None:
         """Return the gap-dependent slope model ``(intercept_a, gain_b)`` for a profile.
 
-        See :meth:`_fit_mode_slope` for the model definition. Returns None if the
-        profile has fewer than MIN_MODE_PROFILE_SAMPLES samples.
+        See :meth:`_compute_mode_fit` for the model definition. Returns None for
+        a profile neither measured nor seeded.
         """
         fit = self._fit_mode_slope(fan_mode, hvac_mode)
         return None if fit is None else (fit.intercept, fit.gain)
@@ -709,7 +821,7 @@ class ThermalLearning:
         # Remove existing samples for this profile
         before = len(self._slope_samples)
         self._slope_samples = [s for s in self._slope_samples if not (s[1] == fan_mode and s[3] == hvac_mode)]
-        self._fit_cache.clear()
+        self._invalidate_fits()
         removed = before - len(self._slope_samples)
 
         # Insert MIN_MODE_PROFILE_SAMPLES synthetic samples at current time.
@@ -742,11 +854,23 @@ class ThermalLearning:
         merely *seeded* -- the distinction the exploration guards in the MPC and
         the ``value_source`` attribute of the number entities rely on.
         """
-        return sum(1 for s in self._slope_samples if s[1] == fan_mode and s[3] == hvac_mode and len(s) > 4 and s[4] is not None)
+        return sum(1 for s in self._slope_samples if s[1] == fan_mode and s[3] == hvac_mode and is_measurement(s))
+
+    def get_mode_measured_minutes(self, fan_mode: str, hvac_mode: str) -> float:
+        """Return the established regime (minutes) a profile's measurements cover."""
+        return sum(sample_dwell(s) for s in self._slope_samples if s[1] == fan_mode and s[3] == hvac_mode and is_measurement(s))
 
     def has_measured_profile(self, fan_mode: str, hvac_mode: str) -> bool:
-        """True once a profile rests on MIN_MODE_PROFILE_SAMPLES real measurements."""
-        return self.get_mode_real_sample_count(fan_mode, hvac_mode) >= MIN_MODE_PROFILE_SAMPLES
+        """True once a profile's measurements cover MEASURED_PROFILE_MINUTES of regime.
+
+        At least MIN_MEASURED_PROFILE_SAMPLES of them are required too. Seeded
+        values never count: they are what the user guessed, not what the room did.
+        """
+        return self._covers_measured_profile([s for s in self._slope_samples if s[1] == fan_mode and s[3] == hvac_mode and is_measurement(s)])
+
+    def is_profile_ready(self, fan_mode: str, hvac_mode: str) -> bool:
+        """True when a profile has a value to serve: measured, or seeded by the user."""
+        return self._fit_mode_slope(fan_mode, hvac_mode) is not None
 
     def get_known_fan_modes(self) -> list[str]:
         """Return unique fan modes seen in slope samples, preserving first-seen order."""
@@ -780,6 +904,9 @@ class ThermalLearning:
                 "r_squared": round(r_squared, 3) if r_squared is not None else None,
                 "thermal_time_constant_h": round(time_constant, 2) if time_constant is not None else None,
                 "offset_gain": round(offset_gain, 3) if offset_gain is not None else None,
+                "effective_samples": round(fit.effective_samples, 1) if fit is not None and fit.effective_samples is not None else None,
+                "measured_minutes": round(self.get_mode_measured_minutes(fan_mode, hvac_mode), 1),
+                "measured": self.has_measured_profile(fan_mode, hvac_mode),
                 "legacy_samples": sum(1 for s in self._slope_samples if s[1] == fan_mode and s[3] == hvac_mode and len(s) == 5 and s[4] is not None),
                 "samples": sample_count,
                 "real_samples": self.get_mode_real_sample_count(fan_mode, hvac_mode),
@@ -867,7 +994,7 @@ class ThermalLearning:
         self._slope_m2 = 0.0
         self._slope_max = 0.0
         self._optimal_cache = None  # Invalidate cache when stats are rebuilt
-        self._fit_cache.clear()
+        self._invalidate_fits()
         # One counting pass: asking get_mode_sample_count() for every sample
         # rescanned the whole list each time, O(n^2) on the event loop at load.
         profile_counts = Counter((s[3], s[1]) for s in self._slope_samples)
@@ -893,7 +1020,8 @@ class ThermalLearning:
         - 5-tuple (timestamp, fan_mode, slope, hvac_mode, temperature_error) → kept
           as a 5-tuple: a *legacy* measurement, whose error was taken against the
           regulated setpoint (see LEGACY_SAMPLE_WEIGHT)
-        - 6-tuple (…, temperature_error, regulation_offset) → current format
+        - 6-tuple (…, temperature_error, regulation_offset) → dwell SAMPLE_INTERVAL_MINUTES
+        - 7-tuple (…, regulation_offset, dwell_minutes) → current format
         Samples without a stored error simply don't contribute to the gap-slope
         regression (they fall back to the constant median model). Nothing is
         dropped or rewritten: an existing installation restarts with every

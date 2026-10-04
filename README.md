@@ -307,7 +307,7 @@ Once learning is ready (`learning_progress` at 100 %), the computed deadband is 
 
 The learning system tracks the **effective slope per fan mode and HVAC mode** (e.g. "medium in heat" vs "high in cool"). This provides visibility into which fan speeds are actually effective in each mode.
 
-Profiles require at least 10 samples per mode to be considered reliable, and at least 10 **measured** samples (as opposed to the synthetic ones written when you set a value by hand) before the MPC treats the speed as known rather than guessed — see the `real_samples` and `value_source` attributes below. Each profile keeps its 40 newest samples however old they are, so a speed measured a few times a week accumulates across weeks instead of losing to the 7-day window what it gathered the week before.
+A profile is **measured** once its measured samples (as opposed to the synthetic ones written when you set a value by hand) cover **90 minutes of established regime**, in at least 6 samples; only then does the MPC treat the speed as known rather than guessed — see the `measured_minutes`, `real_samples` and `value_source` attributes below. A sample is taken at most once per **10 minutes** of established regime, and at least that often even when the slope has not moved: a speed that holds the room still keeps the sensor silent, and requiring a new sensor reading per sample starved precisely the speeds that work (on the production trace, after the established gate only the strongest speed ever reached ten distinct readings in one hold). Each sample records the minutes it stands for. A hand-set profile is usable straight away, but stays *seeded* until measured. Each profile keeps its 40 newest samples however old they are, so a speed measured a few times a week accumulates across weeks instead of losing to the 7-day window what it gathered the week before.
 
 Samples are filtered out when:
 - A window is open, or the compressor is idle, or defrost is active (see the detection sections above)
@@ -335,7 +335,7 @@ A fan change made outside the plugin — remote control, another automation — 
 
 ### Duplicate-Reading Filtering
 
-VTherm recomputes its temperature slope only when the room sensor reports a new value, so consecutive control cycles frequently observe the exact same number — especially at a short `cycle_min`. Feeding the same reading to the learning model repeatedly would record one measurement as several: since `MIN_MODE_PROFILE_SAMPLES` counts rows, a rarely-used speed could clear the reliability gate on a handful of genuine observations padded out by duplicates. A reading whose slope has not moved since the last one accepted for that fan mode is therefore dropped before it reaches the model.
+VTherm recomputes its temperature slope only when the room sensor reports a new value, so consecutive control cycles frequently observe the exact same number — especially at a short `cycle_min`. Within 10 minutes of the last sample accepted for a fan mode, a reading whose slope has not moved is dropped before it reaches the model. Past those 10 minutes the same reading is a new sample — the regime held for another interval — and the profile is credited with that much regime. Successive samples of one regime are strongly correlated, so the fit does not count them as independent: it estimates the lag-1 autocorrelation of its residuals (ρ) and works with an effective sample size `n_eff = n / (1 + 2ρ)`, exposed as `effective_samples`. The gain `b` of a profile is shrunk toward the gain pooled over all the speeds of the HVAC mode, as if 10 independent samples had shown the pooled value: `b = (n_eff·b_profile + 10·b_pooled) / (n_eff + 10)`.
 
 ### Defrost / Idle / Window Learning Exclusion
 
@@ -399,7 +399,7 @@ Once fan modes are detected, the plugin creates one **editable** effective-slope
 | `number.vtherm_mpc_fan_living_room_cool_low_effective_slope`        | °C/h | Effective slope for `low` in cool mode              |
 | … (one per fan mode × HVAC mode combination)                       | …    | …                                                    |
 
-These entities appear once the underlying's fan modes become known. Each shows a real learned value once the profile has at least 10 samples; below that, there is no fixed default — the field instead shows the live rank-scaled estimate the MPC is substituting for that speed right now (what it actually bases decisions on), so it is never blank. The `value_source` attribute says which one you're looking at: `learned` (10+ measured samples), `seeded` (a value you set, no measurement yet), `seeded_blended` (a value you set, already pulled by a few measurements) or `live_fallback_estimate`. `ready` mirrors the 10-sample threshold and `real_samples` counts the measured ones.
+These entities appear once the underlying's fan modes become known. Each shows a real learned value once the profile is measured (or seeded); before that, there is no fixed default — the field instead shows the live estimate the MPC is substituting for that speed right now (what it actually bases decisions on), so it is never blank. The `value_source` attribute says which one you're looking at: `learned` (measured: 90 min of regime in 6+ samples), `seeded` (a value you set, no measurement yet), `seeded_blended` (a value you set, already pulled by a few measurements) or `live_fallback_estimate`. `ready` says whether the profile has a value of its own, `real_samples` counts the measured samples and `measured_minutes` the regime they cover.
 
 Click the value to edit it directly — this replaces the profile's samples with synthetic ones producing exactly the value you enter (the same effect as the `set_effective_slope` service, which remains available for automations/scripts). Real samples collected afterwards blend in and gradually refine the value; they don't reset it.
 
@@ -495,7 +495,7 @@ Versatile Thermostat's configuration form proposes an auto-fan mode by default, 
 | **Too many fan changes**        | Increase `deadband` or `min_interval`. Enable learning to auto-optimize.                                                                        |
 | **Temperature overshoots**      | Decrease `deadband`. Verify Versatile Thermostat is providing an accurate slope.                                                                |
 | **Learning not progressing**    | Verify the HVAC is running and no window is open. Check whether `cycle_min` on the VTherm is unusually long.                                   |
-| **A weak fan speed's learned slope looks wrong** | Check its sample count before trusting the value — under 10 samples it isn't shown as a reliable profile. See [Per-Mode Fan Profiles](#per-mode-fan-profiles). |
+| **A weak fan speed's learned slope looks wrong** | Check its `measured_minutes` and `effective_samples` before trusting the value — under 90 minutes of measured regime it isn't a measured profile. See [Per-Mode Fan Profiles](#per-mode-fan-profiles). |
 
 ---
 

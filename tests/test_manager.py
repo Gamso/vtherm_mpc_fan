@@ -274,23 +274,42 @@ async def test_prediction_grid_is_independent_of_the_control_cadence() -> None:
 
 @pytest.mark.asyncio
 async def test_repeated_slope_readings_are_not_learned_twice() -> None:
-    """A slope that has not moved is one measurement, not several.
+    """A slope that has not moved is one measurement -- within one sampling interval.
 
     VTherm recomputes its slope on sensor events, so consecutive cycles often
-    read the same number. Counting each as evidence would let a rarely-used
-    speed clear the reliability gate without the observations to back it.
+    read the same number. Past SAMPLE_INTERVAL_MINUTES the same reading is a
+    new sample: the regime held for another interval.
     """
     manager = await _build_manager()
+    t0 = 1_000_000.0
 
-    assert manager._is_duplicate_slope("low", "cool", -0.80) is False  # noqa: SLF001
-    assert manager._is_duplicate_slope("low", "cool", -0.80) is True  # noqa: SLF001
-    assert manager._is_duplicate_slope("low", "cool", -0.801) is True  # noqa: SLF001
+    assert manager._is_duplicate_slope("low", "cool", -0.80, t0) is False  # noqa: SLF001
+    manager._last_sample[("cool", "low")] = (-0.80, t0)  # noqa: SLF001
+    assert manager._is_duplicate_slope("low", "cool", -0.80, t0 + 60) is True  # noqa: SLF001
+    assert manager._is_duplicate_slope("low", "cool", -0.801, t0 + 300) is True  # noqa: SLF001
     # A real move is accepted...
-    assert manager._is_duplicate_slope("low", "cool", -0.95) is False  # noqa: SLF001
-    # ...and the ladder is tracked per fan mode, so switching speed re-arms it.
-    assert manager._is_duplicate_slope("high", "cool", -0.95) is False  # noqa: SLF001
-    # ...as does switching hvac mode with the same reading.
-    assert manager._is_duplicate_slope("high", "heat", -0.95) is False  # noqa: SLF001
+    assert manager._is_duplicate_slope("low", "cool", -0.95, t0 + 300) is False  # noqa: SLF001
+    # ...and the ladder is tracked per fan mode and per hvac mode.
+    assert manager._is_duplicate_slope("high", "cool", -0.80, t0 + 60) is False  # noqa: SLF001
+    assert manager._is_duplicate_slope("low", "heat", -0.80, t0 + 60) is False  # noqa: SLF001
+    # One sampling interval later the unchanged reading is a new sample.
+    assert manager._is_duplicate_slope("low", "cool", -0.80, t0 + 600) is False  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_a_held_regime_yields_one_sample_per_interval_with_its_dwell() -> None:
+    """An unchanged reading over 20 minutes of established regime gives samples at 0, 10, 20 min."""
+    runtime = _make_runtime(last_temperature_slope=-0.3)
+    manager = await _build_manager(runtime, hass=_hass_with_auto_fan("vtherm-uid"))
+    t0 = 2_000_000.0
+
+    for minute in range(0, 25, 5):
+        with patch("time.time", return_value=t0 + minute * 60):
+            await manager.refresh_state()
+
+    samples = manager.learning.slope_samples
+    assert len(samples) == 3
+    assert [s[6] for s in samples] == [0.0, 10.0, 10.0]
 
 
 @pytest.mark.asyncio

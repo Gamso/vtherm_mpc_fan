@@ -42,6 +42,7 @@ from .const import (
     NATIVE_AUTO_FAN_CONFLICT,
     PHASE_ESTABLISHED,
     PROFILE_HVAC_MODES,
+    SAMPLE_INTERVAL_MINUTES,
     SETPOINT_DROP_LEARNING_COOLDOWN,
     SLOPE_SAMPLE_MIN_DELTA,
     STORAGE_KEY,
@@ -225,10 +226,11 @@ class MpcFanFeatureManager:
         # inside the 60-minute window counted as another response to the same
         # change, and the median dead time drifted toward the middle of the window.
         self._response_armed = False
-        # Last slope actually handed to the model per (hvac_mode, fan_mode).
-        # Not persisted: after a restart the first sample of each mode is
-        # accepted, which costs at most one duplicate and avoids stale state.
-        self._last_sampled_slope: dict[tuple[str, str], float] = {}
+        # Last sample actually handed to the model per (hvac_mode, fan_mode):
+        # (slope, epoch seconds). Not persisted: after a restart the first sample
+        # of each mode is accepted, which costs at most one duplicate and avoids
+        # stale state.
+        self._last_sample: dict[tuple[str, str], tuple[float, float]] = {}
 
         #: Manual override set by the force_fan service: {"fan_mode": str, "until": float}
         self.force: FanOverride | None = None
@@ -674,23 +676,39 @@ class MpcFanFeatureManager:
         self._conflict = conflict
         return conflict
 
-    def _is_duplicate_slope(self, fan_mode: str, hvac_mode: str, slope: float) -> bool:
+    def _is_duplicate_slope(self, fan_mode: str, hvac_mode: str, slope: float, now: float) -> bool:
         """True when this reading merely repeats the last one taken for that mode.
 
         VTherm recomputes its slope only when the room sensor publishes a new
         value, so several control cycles in a row can read the exact same
-        number. Feeding it to the model each time records one measurement as
-        many: MIN_MODE_PROFILE_SAMPLES counts rows, so duplicates let a
-        rarely-used speed clear the reliability gate on a handful of genuine
-        observations and then be trusted as if it had ten. Measured on a 15-day
-        production trace, 89% of consecutive 2-minute readings were repeats.
+        number. Measured on a 15-day production trace, 89% of consecutive
+        2-minute readings were repeats. Within SAMPLE_INTERVAL_MINUTES of the
+        last accepted sample such a repeat is dropped. Past it, the same reading
+        is a new sample: the regime held for another interval, and a speed that
+        holds the room still -- the sensor publishing nothing -- is precisely
+        the one whose measurement was missing (see SAMPLE_INTERVAL_MINUTES).
         """
         key = (hvac_mode, fan_mode)
-        last = self._last_sampled_slope.get(key)
-        if last is not None and abs(slope - last) < SLOPE_SAMPLE_MIN_DELTA:
+        last = self._last_sample.get(key)
+        if last is not None and abs(slope - last[0]) < SLOPE_SAMPLE_MIN_DELTA and (now - last[1]) / 60.0 < SAMPLE_INTERVAL_MINUTES:
             return True
-        self._last_sampled_slope[key] = slope
         return False
+
+    def _sample_dwell_minutes(self, fan_mode: str, hvac_mode: str, now: float, gate_minutes: float) -> float:
+        """Return the minutes of established regime a sample taken now stands for.
+
+        The time since the previous sample of that profile, counted from when
+        the established gate opened at the earliest, and capped at one sampling
+        period (an idle or disturbed gap inside a regime is not regime).
+        """
+        if self._last_change_time:
+            established_since = self._last_change_time + gate_minutes * 60.0
+        else:
+            established_since = self._first_cycle_time or now
+        last = self._last_sample.get((hvac_mode, fan_mode))
+        start = max(last[1], established_since) if last is not None else established_since
+        period = max(SAMPLE_INTERVAL_MINUTES, float(self._vtherm.cycle_min or 0))
+        return max(0.0, min(period, (now - start) / 60.0))
 
     # ------------------------------------------------------------------
     # Control cycle
@@ -893,8 +911,8 @@ class MpcFanFeatureManager:
             learned_dead_time=learned_dead_time,
             now=now,
         ) and not self._is_duplicate_slope(
-            current_fan, hvac_mode, vtherm_slope
-        ):  # type: ignore[arg-type]
+            current_fan, hvac_mode, vtherm_slope, now  # type: ignore[arg-type]
+        ):
             self._learning.add_slope_sample(
                 current_fan,  # type: ignore[arg-type]
                 vtherm_slope,
@@ -902,7 +920,9 @@ class MpcFanFeatureManager:
                 hvac_mode,
                 is_window_open,
                 regulation_offset=inputs.regulation_offset,
+                dwell_minutes=self._sample_dwell_minutes(current_fan, hvac_mode, now, learned_dead_time * MIN_ESTABLISHED_RATIO),  # type: ignore[arg-type]
             )
+            self._last_sample[(hvac_mode, current_fan)] = (vtherm_slope, now)  # type: ignore[index]
 
         if hvac_mode not in PROFILE_HVAC_MODES:
             # Dead time is the heating/cooling lag. In dry or fan_only the slope

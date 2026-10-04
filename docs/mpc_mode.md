@@ -120,7 +120,7 @@ The model reuses the current learning subsystem:
 
 If a reliable profile is not yet available for a fan mode, the MPC model falls back to an estimate: for the speed currently running, the slope the room is actually showing (never floored — a speed losing ground must lose ground in the simulation); for the other candidates, the nearest learned profile stepped along the ladder by `LADDER_CAPACITY_RATIO`, or a coarse rank scaling of the current slope when nothing is learned at all. Confidence is lowered accordingly.
 
-A profile seeded by hand (`set_effective_slope`, or the number entities) counts as *known* for the slope but not as *measured*: the exploration guards below only trust `ThermalLearning.has_measured_profile()`, i.e. `MIN_MODE_PROFILE_SAMPLES` samples that carry a comfort error.
+A profile seeded by hand (`set_effective_slope`, or the number entities) counts as *known* for the slope but not as *measured*: the exploration guards below only trust `ThermalLearning.has_measured_profile()`, i.e. samples that carry a comfort error and cover `MEASURED_PROFILE_MINUTES` (90) of established regime in at least `MIN_MEASURED_PROFILE_SAMPLES` (6). The manager takes one sample per `SAMPLE_INTERVAL_MINUTES` (10) of established regime even when the slope has not moved, and records with it the minutes it stands for (`dwell_minutes`); within that interval an unchanged reading is a duplicate.
 
 ### Gap-Dependent Slope Model
 

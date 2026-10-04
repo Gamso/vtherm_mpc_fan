@@ -367,7 +367,7 @@ def test_store_round_trip_keeps_the_format_and_legacy_marking() -> None:
     restored = ThermalLearning.from_dict(data)
 
     assert data["format"] == 2
-    assert [len(s) for s in restored.slope_samples] == [5, 6]
+    assert [len(s) for s in restored.slope_samples] == [5, 7]
     assert restored.slope_samples[1][5] == pytest.approx(-0.4)
 
 
@@ -399,3 +399,70 @@ def test_a_steady_regulation_offset_is_ignored() -> None:
 
     assert learning.get_mode_profiles("cool", ["high"])["high"]["offset_gain"] == 0.0
     assert learning.get_mode_offset_correction("high", "cool", 0.4, -1.5) == 0.0
+
+
+# --- Time-based sampling: a profile is measured by regime duration --------
+def test_a_profile_is_measured_by_regime_duration_not_distinct_readings() -> None:
+    """Nine 10-minute samples of one unchanged reading make 90 min: measured."""
+    learning = ThermalLearning()
+    for _ in range(8):
+        learning.add_slope_sample("med", -0.1, 0.1, hvac_mode="cool", dwell_minutes=10.0)
+    assert learning.get_mode_measured_minutes("med", "cool") == pytest.approx(80.0)
+    assert learning.has_measured_profile("med", "cool") is False
+    assert learning.is_profile_ready("med", "cool") is False
+
+    learning.add_slope_sample("med", -0.1, 0.1, hvac_mode="cool", dwell_minutes=10.0)
+
+    assert learning.has_measured_profile("med", "cool") is True
+    assert learning.get_mode_effective_slope("med", "cool") == pytest.approx(0.1)
+
+
+def test_a_measured_profile_also_needs_enough_samples() -> None:
+    """Long dwells cannot make a profile out of a handful of samples."""
+    learning = ThermalLearning()
+    for _ in range(5):
+        learning.add_slope_sample("med", -0.1, 0.1, hvac_mode="cool", dwell_minutes=30.0)
+
+    assert learning.get_mode_measured_minutes("med", "cool") == pytest.approx(150.0)
+    assert learning.has_measured_profile("med", "cool") is False
+
+
+def test_ten_legacy_samples_keep_a_profile_measured() -> None:
+    """An upgrade changes no profile's status: ten legacy samples still make it measured."""
+    import time
+
+    now = time.time()
+    legacy = [(now - i, "high", -0.6, "cool", 0.3) for i in range(10)]
+
+    restored = ThermalLearning.from_dict({"slope_samples": legacy, "response_events": []})
+
+    assert restored.has_measured_profile("high", "cool") is True
+    assert restored.get_mode_effective_slope("high", "cool") == pytest.approx(0.6)
+
+
+def test_autocorrelated_samples_count_for_less() -> None:
+    """Consecutive samples of a slowly drifting residual carry less than one sample each."""
+    import time
+    from unittest.mock import patch
+
+    learning = ThermalLearning()
+    start = time.time()
+    for i in range(30):
+        with patch("time.time", return_value=start + i * 600):
+            # Residual drifts slowly: strongly autocorrelated.
+            learning.add_slope_sample("high", -(0.5 + 0.3 * (i % 6) * 0.1 + 0.05 * (i // 10)), (i % 6) * 0.1, hvac_mode="cool")
+
+    profile = learning.get_mode_profiles("cool", ["high"])["high"]
+    assert profile["effective_samples"] < 30 / 1.5
+
+
+def test_a_thin_profile_gain_is_shrunk_toward_the_pooled_gain() -> None:
+    """A steep gain read from a few points of one speed is pulled toward what every speed shows."""
+    learning = ThermalLearning()
+    for err in [0.2, 0.4, 0.6, 0.8, 1.0, 1.2] * 10:
+        learning.add_slope_sample("superhigh", 0.5 + 0.3 * err, err, hvac_mode="heat")
+    for err in [0.1, 0.15, 0.2, 0.25, 0.3, 0.1, 0.15, 0.2, 0.25]:
+        learning.add_slope_sample("low", 0.1 + 2.0 * err, err, hvac_mode="heat")
+
+    _, gain = learning.get_mode_slope_model("low", "heat")
+    assert 0.3 < gain < 2.0

@@ -43,7 +43,7 @@ Keep this in sync with `_HEADER` in `custom_components/vtherm_mpc_fan/data_colle
 | `mpc_cost` | MPC optimization cost of the chosen mode |
 | `mpc_confidence` | Profile coverage % |
 | `mpc_temp_10m` / `mpc_temp_30m` | MPC 10/30-minute temperature predictions |
-| `mpc_known_profiles` | Count of fan modes with a reliable learned profile (≥`MIN_MODE_PROFILE_SAMPLES`) |
+| `mpc_known_profiles` | Count of fan modes with a profile of their own (measured — 90 min of regime in ≥ 6 samples — or seeded) |
 | `mpc_disturbance` | Current disturbance-bias EMA (°C/h) |
 | `defrost_active` | `True` when defrost protection is active — from the underlying's own `hvac_action == "defrosting"`, or the optional defrost entity |
 | `hvac_idle` | `True` when the underlying reports it is not producing (its own `hvac_action`, not VTherm's simulated one — see `CLAUDE.md`) |
@@ -74,7 +74,7 @@ Keep this in sync with `_HEADER` in `custom_components/vtherm_mpc_fan/data_colle
 **MPC disturbed periods (`mpc_status == "Disturbed"`)**
 - Identify what triggered the disturbance: defrost, window open, HVAC idle
 - Check `mpc_confidence` — low confidence = not enough learning data
-- Check `mpc_known_profiles` — MPC needs ≥10 samples per mode
+- Check `mpc_known_profiles` — a speed is measured once its samples cover 90 min of established regime
 
 **Slow temperature recovery**
 - Plot `current_temp` vs `target_temp` over time
