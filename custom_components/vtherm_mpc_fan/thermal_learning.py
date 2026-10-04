@@ -4,6 +4,7 @@ import logging
 import time
 import statistics
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .const import (
@@ -177,7 +178,11 @@ _LOGGER = logging.getLogger(__name__)
 class ThermalLearning:
     """Auto-calibration of thermal parameters based on observed system behavior."""
 
-    def __init__(self):
+    def __init__(self, clock: Callable[[], float] | None = None):
+        # Wall clock (epoch seconds). Injected by tests and by offline benches
+        # that replay a trace at their own pace; time.time otherwise, looked up
+        # at call time so that patching time.time still works.
+        self._clock = clock
         # Data collection with sliding window
         self._slope_samples = []  # (timestamp, fan_mode, slope, hvac_mode, temperature_error, regulation_offset)
         self._response_events = []  # (timestamp, response_time_minutes) - thermal response from fan change to slope change
@@ -199,6 +204,34 @@ class ThermalLearning:
         # per cycle; they only change when the sample list does.
         self._fit_cache: dict[tuple[str, str], ProfileFit | None] = {}
         self._pooled_gain_cache: dict[str, float] = {}
+        # Exploration probes (see MPCController): when each (hvac_mode, fan_mode)
+        # was last probed, and how many probes were started overall. Persisted so
+        # a restart neither re-probes at once nor loses the count.
+        self._probe_times: dict[str, float] = {}
+        self._probe_count = 0
+
+    def now(self) -> float:
+        """Return the current time (epoch seconds) from the injected clock."""
+        return self._clock() if self._clock is not None else time.time()
+
+    @staticmethod
+    def _probe_key(fan_mode: str, hvac_mode: str) -> str:
+        """Return the persisted key of one profile's probe timestamp."""
+        return f"{hvac_mode}|{fan_mode}"
+
+    def record_probe(self, fan_mode: str, hvac_mode: str) -> None:
+        """Remember that an exploration probe of this profile starts now."""
+        self._probe_times[self._probe_key(fan_mode, hvac_mode)] = self.now()
+        self._probe_count += 1
+
+    def last_probe_time(self, fan_mode: str, hvac_mode: str) -> float | None:
+        """Return when this profile was last probed (epoch seconds), None if never."""
+        return self._probe_times.get(self._probe_key(fan_mode, hvac_mode))
+
+    @property
+    def probe_count(self) -> int:
+        """Return how many exploration probes were started (persisted)."""
+        return self._probe_count
 
     def _invalidate_fits(self) -> None:
         """Drop every cached fit (per profile and pooled); the samples changed."""
@@ -217,6 +250,8 @@ class ThermalLearning:
         self._optimal_cache = None
         self._invalidate_fits()
         self._profile_ready_logged.clear()
+        self._probe_times.clear()
+        self._probe_count = 0
         _LOGGER.info("Learning: reset requested; data cleared")
 
     def add_slope_sample(
@@ -267,7 +302,7 @@ class ThermalLearning:
             return
 
         dwell = SAMPLE_INTERVAL_MINUTES if dwell_minutes is None else max(0.0, float(dwell_minutes))
-        self._slope_samples.append((time.time(), fan_mode, slope, hvac_mode, temperature_error, regulation_offset, dwell))
+        self._slope_samples.append((self.now(), fan_mode, slope, hvac_mode, temperature_error, regulation_offset, dwell))
         self._invalidate_fits()
         profile_samples = self.get_mode_sample_count(fan_mode, hvac_mode)
         _LOGGER.debug(
@@ -300,7 +335,7 @@ class ThermalLearning:
         # Cleanup: keep only data within sliding window (7 days), but retain the
         # PROFILE_RETENTION_SAMPLES newest per profile so a rarely-used mode keeps
         # accumulating measurements across weeks instead of losing them.
-        cutoff_time = time.time() - (self._learning_window_hours * 3600)
+        cutoff_time = self.now() - (self._learning_window_hours * 3600)
         before = len(self._slope_samples)
         self._slope_samples = self.trim_with_min_retention(self._slope_samples, cutoff_time, PROFILE_RETENTION_SAMPLES)
         # The trim may reorder samples even when it drops none, and the
@@ -366,7 +401,7 @@ class ThermalLearning:
 
     def add_response_event(self, minutes_to_response: float, hvac_mode: str = "unknown"):
         """Record time until slope changed significantly after fan change."""
-        self._response_events.append((time.time(), minutes_to_response, hvac_mode))
+        self._response_events.append((self.now(), minutes_to_response, hvac_mode))
         _LOGGER.debug(
             "Learning: Recorded response time #%d: %.1f min (hvac=%s)",
             len(self._response_events),
@@ -378,7 +413,7 @@ class ThermalLearning:
         self._optimal_cache = None
 
         # Cleanup: keep only data within sliding window (7 days)
-        cutoff_time = time.time() - (self._learning_window_hours * 3600)
+        cutoff_time = self.now() - (self._learning_window_hours * 3600)
         before = len(self._response_events)
         self._response_events = [
             (ts, t, hm) if len(item) == 3 else (ts, t, "unknown")
@@ -826,7 +861,7 @@ class ThermalLearning:
 
         # Insert MIN_MODE_PROFILE_SAMPLES synthetic samples at current time.
         # error is None so they produce a constant model (gain 0) at exactly target_slope.
-        now = time.time()
+        now = self.now()
         for i in range(MIN_MODE_PROFILE_SAMPLES):
             self._slope_samples.append((now + i, fan_mode, raw_slope, hvac_mode, None))
 
@@ -985,6 +1020,8 @@ class ThermalLearning:
             "slope_mean": self._slope_mean,
             "slope_m2": self._slope_m2,
             "slope_max": self._slope_max,
+            "probe_times": dict(self._probe_times),
+            "probe_count": self._probe_count,
         }
 
     def recompute_slope_stats(self) -> None:
@@ -1011,7 +1048,7 @@ class ThermalLearning:
         )
 
     @classmethod
-    def from_dict(cls, data: dict):
+    def from_dict(cls, data: dict, clock: Callable[[], float] | None = None):
         """Restore from storage.
 
         Handles backward compatibility for slope_samples across schema versions:
@@ -1028,7 +1065,7 @@ class ThermalLearning:
         profile it had.
         Old 2-tuple response_events are migrated to 3-tuples by appending hvac_mode="unknown".
         """
-        instance = cls()
+        instance = cls(clock=clock)
 
         # Migrate slope_samples to the canonical 5-tuple shape.
         raw_samples = data.get("slope_samples", [])
@@ -1053,7 +1090,11 @@ class ThermalLearning:
         # Apply sliding window cleanup on restore, keeping the newest
         # PROFILE_RETENTION_SAMPLES per profile so rarely-used modes keep what
         # they gathered across weeks.
-        cutoff_time = time.time() - (instance._learning_window_hours * 3600)
+        cutoff_time = instance.now() - (instance._learning_window_hours * 3600)
+        probe_times = data.get("probe_times")
+        if isinstance(probe_times, dict):
+            instance._probe_times = {str(key): float(value) for key, value in probe_times.items() if isinstance(value, (int, float))}
+        instance._probe_count = int(data.get("probe_count", 0) or 0)
         instance._slope_samples = ThermalLearning.trim_with_min_retention(instance._slope_samples, cutoff_time, PROFILE_RETENTION_SAMPLES)
         instance._response_events = [item for item in instance._response_events if item[0] > cutoff_time]
 

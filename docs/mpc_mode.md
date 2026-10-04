@@ -221,10 +221,22 @@ changes have been seen.
 
 ### Exploration guards
 
-A purely cost-driven controller never visits a speed it has no profile for, and a speed that is never visited never gets a profile. Two guards break that loop; both are diagnosed in `mpc_reason`.
+A purely cost-driven controller never visits a speed it has no profile for, and a speed that is never visited never gets a profile. The guards and strategies below break that loop; all are diagnosed in `mpc_reason`.
 
-- **Learning hold** — while the current speed has no measured profile, the change interval is raised to `dead_time × MIN_ESTABLISHED_RATIO + LEARNING_HOLD_EXTRA_MINUTES`, so the learning gate has time to record samples before the speed is left. Released by the emergency escalation (error growing past `DEAD_TIME_ESCALATION_GROWTH`), by an overshoot that keeps worsening, and not applied at all past `MULTI_RANK_JUMP_ERROR`.
+- **Learning hold** — while the current speed has no measured profile, the change interval is raised to `gate_dead_time × MIN_ESTABLISHED_RATIO + LEARNING_HOLD_EXTRA_MINUTES` (`gate_dead_time` = the learned dead time capped at `DEAD_TIME_MAX_FOR_GATE`, 15 min), so the learning gate has time to record samples before the speed is left. Released by the confirmed escalation, by an overshoot that keeps worsening past the escalation threshold, by an abandoned probe, and not applied at all past `MULTI_RANK_JUMP_ERROR` or below `THRESHOLD_TARGET_DROP`.
 - **Climb guard** — a move of more than one rank *up* may not skip an intermediate speed that has no measured profile and a positive estimated slope: that rung is selected instead, because it can only be measured under load. Exceptions: comfort error above `MULTI_RANK_JUMP_ERROR` (a setpoint step is a recovery and belongs on the strongest speed at once) and the emergency escalation. The pre-existing step-down guard (no multi-rank drop to a profile that cannot sustain progress) is unchanged.
+- **S1, exploration probe** (`exploration_probe`, on by default) — when the final decision is to stay, the comfort error is within the deadband, the phase is `ESTABLISHED`, `|bias| < PROBE_MAX_BIAS` (0.1 °C/h), the speed one rank below has no measured profile and was not probed for `PROBE_INTERVAL_HOURS` (6 h; `ThermalLearning.record_probe` / `last_probe_time`, persisted as `probe_times`/`probe_count`), the controller switches to it. The learning hold keeps it; the probe is abandoned (hold released, change allowed at once) when the comfort error exceeds `deadband + sensor_resolution`.
+- **S2, information bonus** (`exploration_ucb`, off) — inside the deadband, `INFO_BONUS / sqrt(1 + measured_minutes / SAMPLE_INTERVAL_MINUTES)` (1.0) is subtracted from each candidate's cost.
+- **S3, measurement under load** (`exploration_under_load`, off) — when a climb survives the guards outside a recovery (no escalation, comfort error ≤ `MULTI_RANK_JUMP_ERROR`), the lowest unmeasured rung on the way whose slope at the current error plus the bias is positive is selected instead.
+
+## Dead time
+
+A response event is the time from a fan change to the first move of the room temperature of at least
+one `sensor_resolution` in the expected direction (`MpcFanFeatureManager._detect_response`): the
+direction is +1 for a stronger speed, −1 for a weaker one, from the ladder; an event is recorded
+between 2 and 60 minutes, in `heat`/`cool`, undisturbed. The median per HVAC mode sets the horizon and
+the adaptive change interval; `MPCController.gate_dead_time()` caps it at `DEAD_TIME_MAX_FOR_GATE` for
+the learning gate, the phase split and the learning hold.
 
 ## Diagnostics
 

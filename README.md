@@ -141,6 +141,9 @@ All parameters can be changed at any time via **Settings → Devices & Services 
 | **Fan Speed Order**    | detected | —                | One dropdown per fan speed rank, only shown once the underlying's fan modes are known (options-flow only). See [Fan Speed Order](#fan-speed-order).                     |
 | **HVAC modes with a fixed fan speed** | *(none)* | modes the VTherm reports except `off`, `heat`, `cool` | In these modes the fan is pinned to the **Fixed fan speed** — e.g. `dry` and `fan_only` at `superhigh` (options-flow only). See [HVAC Modes](#hvac-modes). |
 | **Fixed fan speed**    | *(none)* | fan modes the underlying reports | The speed used in the fixed-speed modes. Required as soon as one fixed-speed mode is selected (options-flow only).                                    |
+| **Exploration probe**  | `true`   | —                | Lets the controller try, now and then, a weaker speed that has never been measured while the room holds — see [Hysteresis and Guards](#hysteresis-and-guards). |
+| **Exploration bonus**  | `false`  | —                | Advanced. Near the setpoint, favours poorly measured speeds in the cost. |
+| **Measure intermediate speeds under load** | `false` | — | Advanced. On a climb outside a recovery, stops first on the lowest unmeasured speed predicted to make progress. |
 
 There is no "operating entity" or "outdoor temperature" option to set: whether the unit is producing is read from the underlying climate's own `hvac_action`, and the outdoor temperature from the VTherm runtime (`current_outdoor_temperature`) — see [HVAC Idle Detection](#hvac-idle-detection).
 
@@ -222,6 +225,9 @@ The thermal terms are averaged over the simulation steps, so costs read "per ste
 - **Min interval**: non-emergency changes respect the configured minimum interval between fan changes.
 - **Learning hold**: while the *current* speed has no measured profile (seeded values do not count), the dwell is raised to the learning gate (1.5× dead time) plus 10 minutes so the speed can actually be sampled before it is left. A speed that is never measured is never credible on cost and never chosen again, which is how intermediate speeds stayed unknown. The hold yields to comfort: it is released by the escalation guard, by an overshoot that keeps worsening, and it never applies more than 1 °C from target.
 - **Climb guard**: rising more than one rank may not skip over an intermediate speed that has no measured profile and looks viable — that rung is tried first, because a speed can only be measured under load and load is exactly what a rising error means. Recoveries stay direct: past 1 °C of error (a setpoint step) or when the escalation guard fires, the jump goes straight to the strongest speed.
+- **Exploration probe** (option, on by default): a cost driven by estimates seldom chooses a speed nobody measured. While the room holds inside the deadband in an established regime, with a disturbance bias under 0.1 °C/h, the controller steps **one rank down** to a weaker speed that has no measured profile and was not probed in the last 6 hours (`mpc_reason` reads `Exploration probe`). The learning hold then keeps it long enough to be measured — near equilibrium, where it would serve. The probe is abandoned, and the climb back allowed at once, as soon as the comfort error exceeds the deadband plus one sensor step. Probe times are stored with the learning data; `mpc_exploration_probes` counts them.
+- **Exploration bonus** (option, off): inside the deadband each candidate's cost is lowered by `1.0 / √(1 + n)`, `n` its measured regime in 10-minute intervals, so a poorly measured speed wins when the predicted trajectories are close.
+- **Measurement under load** (option, off): when a climb is decided outside a recovery, the controller stops first on the lowest unmeasured speed predicted to make progress (its slope at the current error plus the disturbance bias is positive). It lengthens the climb by about a dead time; it is the only way to measure how a speed's output grows with the error.
 
 ### Phase Detection
 
@@ -233,7 +239,7 @@ After each fan speed change, the controller classifies elapsed time into three p
 | **TRANSIENT**   | `dead_time ≤ elapsed < dead_time × 1.5` | Sensor starting to respond          |
 | **ESTABLISHED** | `elapsed ≥ dead_time × 1.5`             | Slope reflects the current fan regime |
 
-The default dead time is 10 minutes, replaced by the learned median response time of the current HVAC mode as soon as response events exist (heating lag and cooling lag are learned separately; a mode with no event yet borrows the other's). The controller and the learner share this one clock: a slope sample is never taken while the MPC still considers the room in its dead time or transient.
+The default dead time is 10 minutes, replaced by the learned median response time of the current HVAC mode as soon as response events exist (heating lag and cooling lag are learned separately; a mode with no event yet borrows the other's), capped at 15 minutes for these phases. The controller and the learner share this one clock: a slope sample is never taken while the MPC still considers the room in its dead time or transient.
 
 An escalation guard sits on top of this lock: if the comfort error keeps worsening since the last fan change, an *escalation only* (never a step-down) is allowed to bypass the phase lock, even mid dead-time — this is what protects against getting stuck above setpoint with no way out if an earlier decision turns out to be too weak. The growth must exceed `max(0.15, 1.5 × sensor resolution)` — 0.30 °C for a 0.2 °C sensor — on **two consecutive cycles**; only past 1 °C of comfort error does it escalate at once. The sensor resolution is detected automatically (smallest non-zero change between two readings over the last day, bounded to 0.05–0.5 °C, 0.2 until known) and published as `mpc_sensor_resolution`. With a fixed 0.15 °C threshold a single 0.2 °C sensor step escalated, bypassing the min interval, the hysteresis, the climb guard and the learning hold.
 
@@ -326,9 +332,11 @@ When two fan speeds' learned slopes are out of order (e.g. a rarely-used speed's
 
 ### Dead Time Calibration
 
-The system measures the **thermal response time** — the delay between a fan speed change and the first observable slope change at the sensor. This median value replaces the default 10-minute dead time, letting the controller be patient during the actual thermal lag and reactive once the effect materializes.
+The system measures the **thermal response time** — the delay between a fan speed change and the first move of the room temperature, of at least one sensor step, **in the direction the change should produce** (cooler after a climb in cool, warmer after a climb in heat, the reverse after a step down). This median value replaces the default 10-minute dead time. It used to be detected on VTherm's slope, which fired on the very next sensor reading whatever its direction, so on a 0.2 °C sensor the "dead time" was mostly the wait for that reading (17.5–28.5 min).
 
-Response events are only recorded in `heat` and `cool`, when the delay is between 2 and 60 minutes (filtering sensor noise and system-off periods), and **once per fan change**: the first significant slope move after a change is the response, later ones inside the window are not counted again. A change made in one HVAC mode is never answered by a slope move in another, and events stored from other modes are ignored.
+Response events are only recorded in `heat` and `cool`, when the delay is between 2 and 60 minutes (filtering sensor noise and system-off periods), and **once per fan change**. A change made in one HVAC mode is never answered by a temperature move in another, and events stored from other modes are ignored.
+
+The learned dead time sets the prediction horizon and the adaptive change interval. The learning gate, the phase split (`DEAD_TIME` / `TRANSIENT` / `ESTABLISHED`) and the learning hold use it **capped at 15 minutes**: with a coarse sensor a long learned value is mostly the sensor's wait, and gating on it held every unmeasured speed for ~50 minutes before its first sample.
 
 The dead time is learned **per HVAC mode**. It raises the minimum interval between changes (up to 3× **Min Interval**) only once it is *trusted*: at least 5 response events in the current mode. Until then the configured **Min Interval** applies as is.
 
@@ -372,6 +380,7 @@ Point-in-time values with no history or automation use are not separate entities
 | `mpc_cost`, `mpc_confidence`, `mpc_predicted_temperature_10m`, `mpc_predicted_temperature_30m`, `mpc_dead_time`, `mpc_known_profiles`, `mpc_disturbance_bias` | Details of the last MPC evaluation |
 | `mpc_comfort_error`, `mpc_regulation_offset` | Error against the user's setpoint (positive = needs more heating/cooling), and VTherm's regulated setpoint minus the user's |
 | `mpc_sensor_resolution` | Room sensor resolution detected from the readings (°C) |
+| `mpc_exploration_probes` | Exploration probes started so far (persisted) |
 | `fan_mode_order`        | Fan speed ladder in use, weakest first                                                            |
 | `sent_fan_mode`         | Last fan mode this plugin sent                                                                    |
 | `learning_ready`        | Whether global learning readiness has been reached                                                |

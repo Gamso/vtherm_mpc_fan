@@ -15,6 +15,9 @@ from .const import (
     CONF_DATA_COLLECTION,
     CONF_DEADBAND,
     CONF_DEFROST_ENTITY,
+    CONF_EXPLORATION_PROBE,
+    CONF_EXPLORATION_UCB,
+    CONF_EXPLORATION_UNDER_LOAD,
     CONF_FAN_MODE_ORDER,
     CONF_FIXED_FAN_HVAC_MODES,
     CONF_FIXED_FAN_SPEED,
@@ -22,6 +25,9 @@ from .const import (
     CONF_TARGET_VTHERM,
     DEFAULT_DATA_COLLECTION,
     DEFAULT_DEADBAND,
+    DEFAULT_EXPLORATION_PROBE,
+    DEFAULT_EXPLORATION_UCB,
+    DEFAULT_EXPLORATION_UNDER_LOAD,
     DEFAULT_MIN_INTERVAL,
     DOMAIN,
     PROFILE_HVAC_MODES,
@@ -200,6 +206,18 @@ def _settings_schema(defaults: dict[str, Any]) -> dict:
             CONF_DEFROST_ENTITY,
             default=defaults.get(CONF_DEFROST_ENTITY, vol.UNDEFINED),
         ): selector.EntitySelector(selector.EntitySelectorConfig(domain=["binary_sensor", "sensor", "input_boolean"])),
+        vol.Optional(
+            CONF_EXPLORATION_PROBE,
+            default=defaults.get(CONF_EXPLORATION_PROBE, DEFAULT_EXPLORATION_PROBE),
+        ): selector.BooleanSelector(),
+        vol.Optional(
+            CONF_EXPLORATION_UCB,
+            default=defaults.get(CONF_EXPLORATION_UCB, DEFAULT_EXPLORATION_UCB),
+        ): selector.BooleanSelector(),
+        vol.Optional(
+            CONF_EXPLORATION_UNDER_LOAD,
+            default=defaults.get(CONF_EXPLORATION_UNDER_LOAD, DEFAULT_EXPLORATION_UNDER_LOAD),
+        ): selector.BooleanSelector(),
     }
 
 

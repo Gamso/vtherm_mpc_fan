@@ -5,9 +5,11 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import logging
+import math
 from typing import Any
 
 from .const import (
+    DEAD_TIME_MAX_FOR_GATE,
     DEAD_TIME_SAFETY_FACTOR,
     DEFAULT_DEAD_TIME,
     DEFAULT_CYCLE_MINUTES,
@@ -17,6 +19,7 @@ from .const import (
     PHASE_TRANSIENT,
     PROFILE_HVAC_MODES,
     REFERENCE_SLOPE_ERROR,
+    SAMPLE_INTERVAL_MINUTES,
     THRESHOLD_TARGET_DROP,
 )
 from .thermal_learning import ThermalLearning
@@ -135,6 +138,36 @@ LEARNING_HOLD_EXTRA_MINUTES = 10.0
 # speed came straight from the two weakest ones.
 MULTI_RANK_JUMP_ERROR = 1.0  # degC
 
+# --- Exploration strategies ---------------------------------------------------
+# The guards above keep an unmeasured speed long enough to be measured, but only
+# once the cost has chosen it -- and a cost driven by estimates seldom chooses a
+# speed nobody measured. Three strategies create the visits:
+#
+# S1, opportunistic downward probe (on by default, option exploration_probe):
+# while the room holds inside the deadband in an established regime, with a
+# small disturbance bias, step one rank down to a weaker speed that has no
+# measured profile and has not been probed for PROBE_INTERVAL_HOURS. The learning
+# hold then keeps it for its measurement; the probe is abandoned as soon as the
+# comfort error exceeds deadband + sensor resolution. Worst case: deadband + one
+# sensor step of drift for the length of a hold, a few times a day -- and the
+# speed gets measured near equilibrium, where it would serve.
+PROBE_INTERVAL_HOURS = 6.0
+PROBE_MAX_BIAS = 0.1  # degC/h
+#
+# S2, information bonus (off by default, option exploration_ucb): inside the
+# deadband each candidate's cost is lowered by INFO_BONUS / sqrt(1 + n), n its
+# measured regime in sampling intervals, so a poorly measured speed wins when
+# the predicted trajectories are close. Diffuse and implicit. Sized to beat the
+# in-band hysteresis for one rank (0.6) between an unmeasured speed and one with
+# two hours of measurements, not more.
+INFO_BONUS = 1.0
+#
+# S3, measurement under load (off by default, option exploration_under_load):
+# when a climb is decided outside a recovery, stop at the lowest unmeasured rung
+# on the way that is predicted to make progress (its slope at the current error
+# plus the bias is positive). Lengthens the recovery by about a dead time; the
+# only way to measure a speed's gain is under load.
+
 # --- Hold-equilibrium (economic) mode -------------------------------------
 # When enabled, near the setpoint the controller matches fan output to the
 # system's steady thermal production instead of collapsing to the lowest speed.
@@ -251,8 +284,16 @@ class MPCController:
         fan_modes: list[str] | None = None,
         horizon_minutes: int = DEFAULT_HORIZON_MINUTES,
         cycle_minutes: int = DEFAULT_CYCLE_MINUTES,
+        exploration_probe: bool = True,
+        exploration_ucb: bool = False,
+        exploration_under_load: bool = False,
     ) -> None:
         self._learning = learning
+        self._exploration_probe = exploration_probe
+        self._exploration_ucb = exploration_ucb
+        self._exploration_under_load = exploration_under_load
+        # (fan_mode, hvac_mode) of the downward probe in progress, if any.
+        self._active_probe: tuple[str, str] | None = None
         self._deadband = deadband
         self._min_interval = min_interval
         self._fan_modes = fan_modes
@@ -534,6 +575,15 @@ class MPCController:
         # pooling here either -- get_dead_time() already falls back to the pooled
         # set on its own when the requested mode has no events yet.
         dead_time = self._learning.get_dead_time(hvac_mode)
+        # The learning gate, the phase split and the learning hold use the dead
+        # time capped at DEAD_TIME_MAX_FOR_GATE; the horizon and the adaptive
+        # change interval keep the learned value.
+        gate_dead_time = self.gate_dead_time(dead_time)
+        if self._active_probe is not None and self._active_probe != (active_fan, hvac_mode):
+            # The probed speed is no longer running (it was never applied, or
+            # the probe already ended in a change): nothing left to abandon.
+            if minutes_since_change >= self._cycle_minutes:
+                self._active_probe = None
         # Snapshot the comfort error at the start of each hold so growth since
         # the fan last changed can be measured (see DEAD_TIME_ESCALATION_GROWTH).
         # notify_fan_change() clears the snapshot explicitly; the time-based
@@ -545,8 +595,11 @@ class MPCController:
         error_growth_since_change = current_error - self._error_at_lock_start
         escalation = self._escalation_confirmed(error_growth_since_change, current_error, minutes_since_change)
         effective_min_interval = self._effective_min_interval(dead_time, hvac_mode)
-        learning_hold_minutes = dead_time * MIN_ESTABLISHED_RATIO + LEARNING_HOLD_EXTRA_MINUTES
-        learning_hold = self._learning_hold_active(
+        learning_hold_minutes = gate_dead_time * MIN_ESTABLISHED_RATIO + LEARNING_HOLD_EXTRA_MINUTES
+        probe_abandoned = self._active_probe == (active_fan, hvac_mode) and current_error > self._deadband + self.sensor_resolution
+        if probe_abandoned:
+            self._active_probe = None
+        learning_hold = not probe_abandoned and self._learning_hold_active(
             active_fan=active_fan,
             hvac_mode=hvac_mode,
             minutes_since_change=minutes_since_change,
@@ -556,8 +609,10 @@ class MPCController:
         )
         if learning_hold:
             effective_min_interval = max(effective_min_interval, learning_hold_minutes)
-        change_allowed = minutes_since_change >= effective_min_interval
-        phase = self.detect_phase(minutes_since_change, dead_time)
+        # An abandoned probe may climb back at once: the room left the band
+        # because of a speed chosen for its information, not for comfort.
+        change_allowed = probe_abandoned or minutes_since_change >= effective_min_interval
+        phase = self.detect_phase(minutes_since_change, gate_dead_time)
         monotone_slopes = self.build_monotone_slopes(fan_modes, hvac_mode, error=current_error, regulation_offset=regulation_offset)
         current_mode_slope, current_known_profile = self._get_mode_slope(
             active_fan,
@@ -675,6 +730,9 @@ class MPCController:
                 known_profile=known_profile,
                 horizon_minutes=sim_horizon,
             )
+            if self._exploration_ucb and abs(current_error) <= self._deadband:
+                measured_intervals = self._learning.get_mode_measured_minutes(fan_mode, hvac_mode) / SAMPLE_INTERVAL_MINUTES
+                sim.total_cost -= INFO_BONUS / math.sqrt(1.0 + measured_intervals)
             simulations.append(sim)
             known_profiles += int(known_profile)
             if known_profile:
@@ -767,6 +825,33 @@ class MPCController:
                     selection_note = hold_note
                     best = current_simulation
 
+        exploration_note = ""
+        best_index = fan_modes.index(best.fan_mode)
+        # A climb that is not a recovery (escalation, > MULTI_RANK_JUMP_ERROR, overshoot).
+        ordinary_climb = change_allowed and best_index > current_index and not (escalation or overshoot or current_error > MULTI_RANK_JUMP_ERROR)
+        if self._exploration_under_load and ordinary_climb:
+            for rung in fan_modes[current_index + 1 : best_index]:
+                rung_slope, _ = mode_slopes_snapshot[rung]
+                rung_gain = self._learning.get_mode_slope_gain(rung, hvac_mode)
+                if self._learning.has_measured_profile(rung, hvac_mode) or self._gap_slope(rung_slope, rung_gain, current_error) + self._disturbance_bias <= 0:
+                    continue
+                best = next(sim for sim in simulations if sim.fan_mode == rung)
+                exploration_note = f"Measuring {rung} under load on the way to {fan_modes[best_index]}"
+                break
+        if (
+            self._exploration_probe
+            and change_allowed
+            and best.fan_mode == active_fan
+            and not overshoot
+            and (probe := self._probe_candidate(fan_modes, current_index, hvac_mode, current_error, phase)) is not None
+        ):
+            best = next(sim for sim in simulations if sim.fan_mode == probe)
+            self._learning.record_probe(probe, hvac_mode)
+            self._active_probe = (probe, hvac_mode)
+            exploration_note = f"Exploration probe: trying {probe}, which has no measured profile, while the room holds"
+        if probe_abandoned:
+            exploration_note = f"Exploration probe abandoned: {current_error:.2f}C short of the setpoint"
+
         confidence = self._compute_confidence(known_profiles, len(fan_modes), phase, worst_spread)
         would_change_now = "yes" if change_allowed and best.fan_mode != active_fan else "no"
         status = "Ready" if confidence >= 0.5 else "Low confidence"
@@ -792,6 +877,8 @@ class MPCController:
             reason += f" | {blocked_note}"
         if selection_note:
             reason += f" | {selection_note}"
+        if exploration_note:
+            reason += f" | {exploration_note}"
         # Surface capacity saturation: strongest fan selected yet still well short
         # of target means the HVAC system is capacity-bound, not a control issue.
         if best.fan_mode == fan_modes[-1] and current_error > self._deadband:
@@ -816,6 +903,36 @@ class MPCController:
             known_profiles=known_profiles,
             disturbance_bias=self._disturbance_bias,
         )
+
+    @staticmethod
+    def gate_dead_time(dead_time: float) -> float:
+        """Return the dead time used by the learning gate, the phase split and the hold.
+
+        The learned value capped at DEAD_TIME_MAX_FOR_GATE (see const.py): with a
+        coarse sensor the learned dead time is mostly the wait for the sensor's
+        next step, and gating on it held every unmeasured speed for ~50 minutes.
+        """
+        return min(dead_time, DEAD_TIME_MAX_FOR_GATE) if dead_time > 0 else dead_time
+
+    def _probe_candidate(self, fan_modes: list[str], current_index: int, hvac_mode: str, current_error: float, phase: str) -> str | None:
+        """Return the speed an opportunistic downward probe should try now, or None.
+
+        One rank below the current speed, when the room holds inside the
+        deadband in an established regime with a small disturbance bias, that
+        speed has no measured profile, and it was not probed in the last
+        PROBE_INTERVAL_HOURS.
+        """
+        if current_index == 0 or abs(current_error) > self._deadband or phase != PHASE_ESTABLISHED:
+            return None
+        if abs(self._disturbance_bias) >= PROBE_MAX_BIAS:
+            return None
+        lower = fan_modes[current_index - 1]
+        if self._learning.has_measured_profile(lower, hvac_mode):
+            return None
+        last = self._learning.last_probe_time(lower, hvac_mode)
+        if last is not None and self._learning.now() - last < PROBE_INTERVAL_HOURS * 3600.0:
+            return None
+        return lower
 
     def _learning_hold_active(
         self,
@@ -1390,6 +1507,7 @@ class MPCController:
             "mpc_known_profiles": known_profiles,
             "mpc_disturbance_bias": round(disturbance_bias, 3) if disturbance_bias is not None else None,
         }
+        payload["mpc_exploration_probes"] = self._learning.probe_count
         for key, value in self._cycle_extras.items():
             payload[f"mpc_{key}"] = round(value, 3) if isinstance(value, float) else value
         _LOGGER.debug(

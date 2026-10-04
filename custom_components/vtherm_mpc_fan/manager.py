@@ -26,6 +26,9 @@ from .const import (
     CONF_DATA_COLLECTION,
     CONF_DEADBAND,
     CONF_DEFROST_ENTITY,
+    CONF_EXPLORATION_PROBE,
+    CONF_EXPLORATION_UCB,
+    CONF_EXPLORATION_UNDER_LOAD,
     CONF_FAN_MODE_ORDER,
     CONF_FIXED_FAN_HVAC_MODES,
     CONF_FIXED_FAN_SPEED,
@@ -34,6 +37,9 @@ from .const import (
     DEFAULT_CYCLE_MINUTES,
     DEFAULT_DATA_COLLECTION,
     DEFAULT_DEADBAND,
+    DEFAULT_EXPLORATION_PROBE,
+    DEFAULT_EXPLORATION_UCB,
+    DEFAULT_EXPLORATION_UNDER_LOAD,
     DEFAULT_MIN_INTERVAL,
     DOMAIN,
     FEATURE_MANAGER_MPC_FAN,
@@ -47,7 +53,6 @@ from .const import (
     SLOPE_SAMPLE_MIN_DELTA,
     STORAGE_KEY,
     STORAGE_VERSION,
-    THRESHOLD_SLOPE,
 )
 from .data_collection import DataCollector
 from .mpc_controller import MPCController
@@ -206,7 +211,6 @@ class MpcFanFeatureManager:
 
         # Control-cycle memory (previously the module-level ctrl_state dict).
         self._last_change_time: float = 0.0
-        self._previous_slope: float | None = None
         self._last_hvac_mode: str | None = None
         # When this manager ran its first cycle. A fresh manager (restart, VTherm
         # reload, options change) has no fan-change history, so the fixed-speed
@@ -222,10 +226,14 @@ class MpcFanFeatureManager:
         # event and the learning gate all restart from it.
         self._last_observed_fan: str | None = None
         # One response event per fan change: armed by a change, consumed by the
-        # first significant slope move after it. Without this every slope jump
-        # inside the 60-minute window counted as another response to the same
-        # change, and the median dead time drifted toward the middle of the window.
+        # first sensor step in the direction the change should move the room.
+        # Without this every move inside the 60-minute window counted as another
+        # response to the same change, and the median dead time drifted toward
+        # the middle of the window. The reference is the temperature at the
+        # change and the expected direction (+1 a stronger speed, -1 a weaker).
         self._response_armed = False
+        self._response_start_temp: float | None = None
+        self._response_direction = 0
         # Last sample actually handed to the model per (hvac_mode, fan_mode):
         # (slope, epoch seconds). Not persisted: after a restart the first sample
         # of each mode is accepted, which costs at most one duplicate and avoids
@@ -442,6 +450,9 @@ class MpcFanFeatureManager:
             # The MPC simulates in control-cycle steps, so it must use the cadence
             # it is actually driven at -- which VTherm owns, not this plugin.
             cycle_minutes=self._vtherm.cycle_min or DEFAULT_CYCLE_MINUTES,
+            exploration_probe=conf.get(CONF_EXPLORATION_PROBE, DEFAULT_EXPLORATION_PROBE),
+            exploration_ucb=conf.get(CONF_EXPLORATION_UCB, DEFAULT_EXPLORATION_UCB),
+            exploration_under_load=conf.get(CONF_EXPLORATION_UNDER_LOAD, DEFAULT_EXPLORATION_UNDER_LOAD),
         )
 
         if conf.get(CONF_DATA_COLLECTION, DEFAULT_DATA_COLLECTION):
@@ -801,7 +812,7 @@ class MpcFanFeatureManager:
                 self._name,
                 current_fan,
             )
-            self._register_fan_change(now)
+            self._register_fan_change(now, current_temp, self._change_direction(self._last_observed_fan, current_fan))
         self._last_observed_fan = current_fan
         minutes_since_change = (now - self._last_change_time) / 60.0 if self._last_change_time else 1e6
 
@@ -815,14 +826,9 @@ class MpcFanFeatureManager:
                 self._last_hvac_mode,
                 hvac_mode,
             )
-            self._previous_slope = None
             # A pending response belongs to the mode its fan change was made in.
             self._response_armed = False
         self._last_hvac_mode = hvac_mode
-
-        if self._previous_slope is None:
-            self._previous_slope = vtherm_slope
-        slope_change = abs(vtherm_slope - self._previous_slope) > THRESHOLD_SLOPE
 
         # Signed error against the regulated setpoint (positive = needs more
         # heating/cooling): the historical CSV column. Comfort -- and learning --
@@ -897,8 +903,9 @@ class MpcFanFeatureManager:
         # dead time and same classifier as the MPC: gating this on is_ready()
         # left the learner on the 10-minute default while the controller was
         # working with a measured 24-30 minutes, so samples were taken inside the
-        # real transient and labelled ESTABLISHED.
-        learned_dead_time = self._learning.get_dead_time(hvac_mode)
+        # real transient and labelled ESTABLISHED. Both use the learned dead time
+        # capped at DEAD_TIME_MAX_FOR_GATE (MPCController.gate_dead_time).
+        learned_dead_time = MPCController.gate_dead_time(self._learning.get_dead_time(hvac_mode))
         phase = MPCController.detect_phase(minutes_since_change, learned_dead_time)
 
         if self._should_collect_slope_sample(
@@ -924,22 +931,7 @@ class MpcFanFeatureManager:
             )
             self._last_sample[(hvac_mode, current_fan)] = (vtherm_slope, now)  # type: ignore[index]
 
-        if hvac_mode not in PROFILE_HVAC_MODES:
-            # Dead time is the heating/cooling lag. In dry or fan_only the slope
-            # moves for other reasons, and the pinned-speed commands would
-            # otherwise feed it events of their own.
-            self._response_armed = False
-        elif slope_change and self._response_armed:
-            response_time = minutes_since_change
-            if response_time > 60.0:
-                # Too late to be a response to the change: stop waiting for one.
-                self._response_armed = False
-            elif response_time >= 2.0 and not is_window_open and not is_defrost_active and not is_hvac_idle:
-                self._learning.add_response_event(response_time, hvac_mode)
-                self._response_armed = False
-
-        if slope_change:
-            self._previous_slope = vtherm_slope
+        self._detect_response(hvac_mode, current_temp, minutes_since_change, is_window_open or is_defrost_active or is_hvac_idle)
 
         self._last_decision = {
             **decision,
@@ -983,7 +975,7 @@ class MpcFanFeatureManager:
             )
             await self._vtherm.async_set_underlying_fan_mode(effective_fan)
             self._last_sent_fan_mode = effective_fan
-            self._register_fan_change(time.time())
+            self._register_fan_change(time.time(), current_temp, self._change_direction(current_fan, effective_fan))
             await self.async_save()
             return True
 
@@ -1034,13 +1026,51 @@ class MpcFanFeatureManager:
             return False
         return current_fan not in (self._last_observed_fan, self._last_sent_fan_mode)
 
-    def _register_fan_change(self, now: float) -> None:
+    def _change_direction(self, previous_fan: str | None, new_fan: str | None) -> int:
+        """Return +1 for a change to a stronger speed, -1 to a weaker one, 0 if unknown."""
+        ladder = self.fan_modes or []
+        if previous_fan not in ladder or new_fan not in ladder:
+            return 0
+        delta = ladder.index(new_fan) - ladder.index(previous_fan)
+        return (delta > 0) - (delta < 0)
+
+    def _register_fan_change(self, now: float, current_temp: float | None = None, direction: int = 0) -> None:
         """Restart everything that is measured from the last fan change."""
         self._last_change_time = now
-        self._previous_slope = None
-        self._response_armed = True
+        self._response_armed = direction != 0 and current_temp is not None
+        self._response_start_temp = current_temp
+        self._response_direction = direction
         if self._mpc is not None:
             self._mpc.notify_fan_change()
+
+    def _detect_response(self, hvac_mode: str, current_temp: float, minutes_since_change: float, disturbed: bool) -> None:
+        """Record the dead time of the last fan change, measured on the temperature.
+
+        The response is the first change of at least one sensor step, since the
+        change, in the direction the change should move the room: cooler after
+        a climb in cool, warmer after a climb in heat, the reverse after a step
+        down. Detecting it on VTherm's slope EMA instead fired on the very next
+        sensor reading, whatever its direction, so the "dead time" was the wait
+        for that reading (17.5-28.5 min on a 0.2 degC sensor). Only heat/cool
+        record events (in dry or fan_only the room moves for other reasons), only
+        between 2 and 60 minutes, and never while disturbed.
+        """
+        if hvac_mode not in PROFILE_HVAC_MODES:
+            self._response_armed = False
+            return
+        if not self._response_armed or self._response_start_temp is None or self._mpc is None:
+            return
+        if minutes_since_change > 60.0:
+            # Too late to be a response to the change: stop waiting for one.
+            self._response_armed = False
+            return
+        cooling_sign = -1.0 if hvac_mode == "cool" else 1.0
+        moved = (current_temp - self._response_start_temp) * cooling_sign * self._response_direction
+        if moved < self._mpc.sensor_resolution - 1e-6:
+            return
+        if minutes_since_change >= 2.0 and not disturbed:
+            self._learning.add_response_event(minutes_since_change, hvac_mode)
+        self._response_armed = False
 
     async def _async_record(self, **kwargs) -> None:
         """Append one row to the data-collection CSV, when enabled."""

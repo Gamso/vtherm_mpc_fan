@@ -9,14 +9,20 @@
                     "deadband": "Bande morte (°C)",
                     "min_interval": "Intervalle minimum (minutes)",
                     "data_collection": "Activer la collecte de données (bêta)",
-                    "defrost_entity": "Entité dégivrage (optionnel)"
+                    "defrost_entity": "Entité dégivrage (optionnel)",
+                    "exploration_probe": "Sonde d'exploration (essayer une vitesse inférieure non mesurée)",
+                    "exploration_ucb": "Bonus d'exploration (avancé)",
+                    "exploration_under_load": "Mesurer les vitesses intermédiaires en charge (avancé)"
                 },
                 "data_description": {
                     "target_vtherm": "Le VTherm auquel se rattacher. Son cycle de contrôle cadence ce contrôleur, et c'est la vitesse de ventilation de son climate sous-jacent qui sera pilotée.",
                     "deadband": "Plage : 0.0-5.0 °C. Défaut : 0.2 °C.",
                     "min_interval": "Plage : 1-60 min. Défaut : 10 min. Sert à la fois de plancher et (x3) de plafond à l'intervalle adaptatif déduit du temps mort appris.",
                     "data_collection": "Enregistre une ligne CSV par cycle de contrôle dans le dossier de configuration Home Assistant, à côté de configuration.yaml : vtherm_mpc_fan_data_XXXXXXXX.csv (max 10 Mo, rotation automatique). Utile pour reproduire le comportement de l'algorithme et identifier des améliorations pendant la phase bêta.",
-                    "defrost_entity": "Optionnel : binary sensor, sensor ou input_boolean indiquant quand la PAC est en dégivrage. VTherm ne remonte pas cette information, elle doit donc être fournie ici. L'activité du compresseur et la température extérieure sont lues directement depuis VTherm et ne demandent aucune configuration."
+                    "defrost_entity": "Optionnel : binary sensor, sensor ou input_boolean indiquant quand la PAC est en dégivrage. VTherm ne remonte pas cette information, elle doit donc être fournie ici. L'activité du compresseur et la température extérieure sont lues directement depuis VTherm et ne demandent aucune configuration.",
+                    "exploration_probe": "Quand la pièce tient dans la bande morte, de temps en temps (au plus toutes les 6 h par vitesse), descendre d'une vitesse vers une vitesse jamais mesurée pour l'apprendre. Abandonnée dès que la pièce sort de la bande morte d'un pas de capteur. Défaut : activée.",
+                    "exploration_ucb": "Près de la consigne, favoriser dans le coût les vitesses peu mesurées quand leurs trajectoires prédites sont proches de la meilleure. Défaut : désactivé.",
+                    "exploration_under_load": "Quand le contrôleur monte hors d'une reprise, s'arrêter d'abord sur la plus basse vitesse non mesurée prédite capable de progresser. Allonge la montée d'environ un temps mort. Défaut : désactivé."
                 }
             },
             "native_auto_fan": {
@@ -52,7 +58,10 @@
                     "fan_mode_order_4": "Vitesse — rang 5",
                     "fan_mode_order_5": "Vitesse — rang 6",
                     "fan_mode_order_6": "Vitesse — rang 7",
-                    "fan_mode_order_7": "Vitesse — rang 8 (la plus forte, si 8 vitesses)"
+                    "fan_mode_order_7": "Vitesse — rang 8 (la plus forte, si 8 vitesses)",
+                    "exploration_probe": "Sonde d'exploration (essayer une vitesse inférieure non mesurée)",
+                    "exploration_ucb": "Bonus d'exploration (avancé)",
+                    "exploration_under_load": "Mesurer les vitesses intermédiaires en charge (avancé)"
                 },
                 "data_description": {
                     "deadband": "Plage : 0.0-5.0 °C. Défaut : 0.2 °C.",
@@ -60,7 +69,10 @@
                     "data_collection": "Enregistre une ligne CSV par cycle de contrôle dans le dossier de configuration Home Assistant, à côté de configuration.yaml : vtherm_mpc_fan_data_XXXXXXXX.csv (max 10 Mo, rotation automatique). Utile pour reproduire le comportement de l'algorithme et identifier des améliorations pendant la phase bêta.",
                     "defrost_entity": "Optionnel : binary sensor, sensor ou input_boolean indiquant quand la PAC est en dégivrage.",
                     "fixed_fan_hvac_modes": "Dans ces modes, la ventilation est réglée sur la vitesse fixe ci-dessous, par exemple dry et fan_only. heat et cool sont toujours régulés par le MPC et ne sont pas listés. La vitesse est appliquée dès l'entrée dans le mode ; après un changement manuel de vitesse, ou après un redémarrage ou un rechargement, elle n'est (ré)appliquée qu'une fois l'intervalle minimum écoulé. Rien n'est envoyé tant qu'une fenêtre est ouverte, que l'appareil est éteint ou en dégivrage.",
-                    "fixed_fan_speed": "La vitesse utilisée dans les modes à vitesse fixe ci-dessus (ex. superhigh). Obligatoire dès qu'au moins un mode à vitesse fixe est sélectionné."
+                    "fixed_fan_speed": "La vitesse utilisée dans les modes à vitesse fixe ci-dessus (ex. superhigh). Obligatoire dès qu'au moins un mode à vitesse fixe est sélectionné.",
+                    "exploration_probe": "Quand la pièce tient dans la bande morte, de temps en temps (au plus toutes les 6 h par vitesse), descendre d'une vitesse vers une vitesse jamais mesurée pour l'apprendre. Abandonnée dès que la pièce sort de la bande morte d'un pas de capteur. Défaut : activée.",
+                    "exploration_ucb": "Près de la consigne, favoriser dans le coût les vitesses peu mesurées quand leurs trajectoires prédites sont proches de la meilleure. Défaut : désactivé.",
+                    "exploration_under_load": "Quand le contrôleur monte hors d'une reprise, s'arrêter d'abord sur la plus basse vitesse non mesurée prédite capable de progresser. Allonge la montée d'environ un temps mort. Défaut : désactivé."
                 }
             }
         },

@@ -1752,7 +1752,7 @@ def test_no_change_inside_the_deadband_on_the_short_side() -> None:
     learning.set_mode_effective_slope("low", "heat", 0.1)
     learning.set_mode_effective_slope("medium", "heat", 0.4)
     learning.set_mode_effective_slope("high", "heat", 0.9)
-    mpc = MPCController(learning=learning, deadband=0.2, min_interval=10, fan_modes=FAN_MODES)
+    mpc = MPCController(learning=learning, deadband=0.2, min_interval=10, fan_modes=FAN_MODES, exploration_probe=False)
 
     result = mpc.evaluate(current_temp=19.9, target_temp=20.0, vtherm_slope=0.05, hvac_mode="heat", current_fan="medium", minutes_since_change=60.0)
 
@@ -1819,3 +1819,167 @@ def test_an_unlearned_weaker_speed_is_never_rated_above_the_current_one() -> Non
         slope, learned = mpc.get_live_mode_slope(weaker, "cool")
         assert learned is False
         assert slope < current
+
+
+# --- Step 5: exploration and dead-time gate ---------------------------------
+class _Clock:
+    """A settable wall clock for ThermalLearning."""
+
+    def __init__(self, now: float = 1_000_000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _probe_setup(clock: _Clock | None = None, **mpc_kwargs) -> MPCController:
+    """medium and high measured, low only seeded (losing ground): medium holds the room."""
+    learning = ThermalLearning(clock=clock)
+    learning.set_mode_effective_slope("low", "heat", -0.3)
+    for _ in range(12):
+        learning.add_slope_sample("medium", 0.0, 0.0, "heat", dwell_minutes=10.0)
+        learning.add_slope_sample("high", 0.6, 0.0, "heat", dwell_minutes=10.0)
+    return MPCController(learning=learning, deadband=0.2, min_interval=10, fan_modes=FAN_MODES, **mpc_kwargs)
+
+
+def _hold_medium(mpc: MPCController, *, temp: float = 20.0, minutes: float = 60.0, fan: str = "medium") -> dict:
+    """One heating cycle with the room at *temp* (setpoint 20) on *fan*."""
+    return mpc.evaluate(current_temp=temp, target_temp=20.0, vtherm_slope=0.0, hvac_mode="heat", current_fan=fan, minutes_since_change=minutes)
+
+
+def test_an_unmeasured_weaker_speed_is_probed_while_the_room_holds() -> None:
+    """In band, established, no bias: step down to the unmeasured speed to measure it."""
+    clock = _Clock()
+    mpc = _probe_setup(clock)
+
+    result = _hold_medium(mpc)
+
+    assert result["mpc_fan_mode"] == "low"
+    assert result["mpc_would_change_now"] == "yes"
+    assert "Exploration probe" in result["mpc_reason"]
+    assert result["mpc_exploration_probes"] == 1
+    assert mpc.learning.last_probe_time("low", "heat") == clock.now
+
+
+def test_a_probe_is_not_repeated_within_six_hours() -> None:
+    """The same speed is probed again only after PROBE_INTERVAL_HOURS."""
+    clock = _Clock()
+    mpc = _probe_setup(clock)
+    _hold_medium(mpc)
+
+    clock.now += 5 * 3600
+    assert _hold_medium(mpc)["mpc_fan_mode"] == "medium"
+
+    clock.now += 2 * 3600
+    assert _hold_medium(mpc)["mpc_fan_mode"] == "low"
+    assert mpc.learning.probe_count == 2
+
+
+@pytest.mark.parametrize(
+    ("temp", "minutes"),
+    [(19.7, 60.0), (20.0, 12.0)],
+    ids=["outside the deadband", "not established"],
+)
+def test_no_probe_outside_a_steady_hold(temp: float, minutes: float) -> None:
+    """A probe needs the room inside the deadband and an established regime."""
+    mpc = _probe_setup()
+
+    result = _hold_medium(mpc, temp=temp, minutes=minutes)
+
+    assert "Exploration probe" not in result["mpc_reason"]
+
+
+def test_no_probe_when_disabled_or_when_the_weaker_speed_is_measured() -> None:
+    """Option off, or nothing left to measure below: no probe."""
+    assert _hold_medium(_probe_setup(exploration_probe=False))["mpc_fan_mode"] == "medium"
+
+    mpc = _probe_setup()
+    for _ in range(12):
+        mpc.learning.add_slope_sample("low", -0.3, 0.0, "heat", dwell_minutes=10.0)
+    assert "Exploration probe" not in _hold_medium(mpc)["mpc_reason"]
+
+
+def test_a_probe_is_abandoned_once_the_room_leaves_the_band() -> None:
+    """Past deadband + one sensor step, the hold is released and the climb is immediate."""
+    mpc = _probe_setup()
+    _hold_medium(mpc)
+    mpc.notify_fan_change()
+
+    held = _hold_medium(mpc, temp=19.9, minutes=6.0, fan="low")
+    assert held["mpc_fan_mode"] == "low"
+    assert "Learning hold" in held["mpc_reason"]
+
+    abandoned = _hold_medium(mpc, temp=19.55, minutes=11.0, fan="low")
+    assert "Exploration probe abandoned" in abandoned["mpc_reason"]
+    assert abandoned["mpc_fan_mode"] in ("medium", "high")
+    assert abandoned["mpc_would_change_now"] == "yes"
+
+
+def test_probe_timestamps_survive_a_restart() -> None:
+    """Probe times and count are stored with the learning data."""
+    clock = _Clock()
+    mpc = _probe_setup(clock)
+    _hold_medium(mpc)
+
+    restored = ThermalLearning.from_dict(mpc.learning.to_dict(), clock=clock)
+
+    assert restored.last_probe_time("low", "heat") == clock.now
+    assert restored.probe_count == 1
+
+
+def test_the_information_bonus_favours_a_poorly_measured_speed_when_enabled() -> None:
+    """S2: with near-identical trajectories the unmeasured speed wins only with the bonus."""
+    learning = ThermalLearning()
+    learning.set_mode_effective_slope("low", "heat", 0.05)
+    for _ in range(12):
+        learning.add_slope_sample("medium", 0.05, 0.0, "heat", dwell_minutes=10.0)
+        learning.add_slope_sample("high", 0.06, 0.0, "heat", dwell_minutes=10.0)
+
+    def run(ucb: bool) -> dict:
+        mpc = MPCController(learning=learning, deadband=0.3, min_interval=10, fan_modes=FAN_MODES, exploration_probe=False, exploration_ucb=ucb)
+        return mpc.evaluate(current_temp=20.0, target_temp=20.0, vtherm_slope=0.05, hvac_mode="heat", current_fan="medium", minutes_since_change=60.0)
+
+    assert run(False)["mpc_fan_mode"] == "medium"
+    assert run(True)["mpc_fan_mode"] == "low"
+
+
+def test_a_climb_stops_on_the_lowest_unmeasured_rung_when_measuring_under_load() -> None:
+    """S3: a climb lands first on an unmeasured rung predicted to make progress under load.
+
+    medium is seeded at -0.1 degC/h, so the climb guard (which only protects
+    rungs that look viable on their own) lets low -> high skip it. With a +0.2
+    degC/h disturbance helping, medium would make progress: measuring it under
+    load is the only way to learn its gain.
+    """
+    fan_modes = ["low", "medium", "high", "superhigh"]
+    learning = ThermalLearning()
+    for _ in range(12):
+        learning.add_slope_sample("low", -0.3, 0.5, "heat", dwell_minutes=10.0)
+        learning.add_slope_sample("high", 1.2, 0.5, "heat", dwell_minutes=10.0)
+        learning.add_slope_sample("superhigh", 1.6, 0.5, "heat", dwell_minutes=10.0)
+    learning.set_mode_effective_slope("medium", "heat", -0.1)
+
+    def run(under_load: bool) -> dict:
+        mpc = MPCController(learning=learning, deadband=0.2, min_interval=10, fan_modes=fan_modes, exploration_probe=False, exploration_under_load=under_load)
+        mpc._disturbance_bias = 0.2  # noqa: SLF001
+        return mpc.evaluate(current_temp=19.3, target_temp=20.0, vtherm_slope=-0.1, hvac_mode="heat", current_fan="low", minutes_since_change=60.0)
+
+    off, on = run(False), run(True)
+    assert fan_modes.index(off["mpc_fan_mode"]) > 1, off["mpc_reason"]
+    assert on["mpc_fan_mode"] == "medium", on["mpc_reason"]
+    assert "under load" in on["mpc_reason"]
+
+
+def test_the_learning_gate_caps_a_long_dead_time() -> None:
+    """A 30-minute learned dead time sets the horizon, but the phase and hold use 15."""
+    learning = ThermalLearning()
+    for _ in range(5):
+        learning.add_response_event(30.0, "heat")
+    mpc = _build_mpc(learning)
+
+    assert MPCController.gate_dead_time(30.0) == 15.0
+    assert MPCController.detect_phase(23.0, MPCController.gate_dead_time(30.0)) == "ESTABLISHED"
+    result = mpc.evaluate(current_temp=19.9, target_temp=20.0, vtherm_slope=0.0, hvac_mode="heat", current_fan="low", minutes_since_change=25.0)
+    assert result["mpc_dead_time"] == 30.0
+    # Learning hold of an unmeasured speed: 1.5 x 15 + 10 = 32.5 min, not 55.
+    assert "/32.5 min" in result["mpc_reason"]

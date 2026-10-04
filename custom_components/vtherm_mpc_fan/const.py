@@ -18,6 +18,12 @@ CONF_DEFROST_ENTITY = "defrost_entity"
 CONF_FAN_MODE_ORDER = "fan_mode_order"  # explicit weakest-to-strongest order, overrides the climate entity's
 CONF_FIXED_FAN_HVAC_MODES = "fixed_fan_hvac_modes"  # HVAC modes (other than heat/cool) in which the fan is pinned to a fixed speed
 CONF_FIXED_FAN_SPEED = "fixed_fan_speed"  # the speed pinned in CONF_FIXED_FAN_HVAC_MODES
+# Exploration strategies (see mpc_controller.py). The opportunistic downward
+# probe is on by default; the information bonus and the measurement under load
+# are opt-in.
+CONF_EXPLORATION_PROBE = "exploration_probe"
+CONF_EXPLORATION_UCB = "exploration_ucb"
+CONF_EXPLORATION_UNDER_LOAD = "exploration_under_load"
 
 # Feature-manager identity registered with the VTherm API.
 FEATURE_MANAGER_MPC_FAN = "mpc_fan"
@@ -58,6 +64,9 @@ NATIVE_AUTO_FAN_CONFLICT = "versatile_thermostat/auto_fan_mode"
 DEFAULT_DEADBAND = 0.2
 DEFAULT_MIN_INTERVAL = 10
 DEFAULT_DATA_COLLECTION = True
+DEFAULT_EXPLORATION_PROBE = True
+DEFAULT_EXPLORATION_UCB = False
+DEFAULT_EXPLORATION_UNDER_LOAD = False
 
 # Fallback control-cycle length, used only until the runtime reports its own
 # ``cycle_min``. It sets the MPC simulation step, so it should match the real
@@ -78,10 +87,17 @@ STORAGE_KEY = "vtherm_mpc_fan.learning_data"
 LEARNING_DATA_SAVE_INTERVAL = timedelta(minutes=5)
 
 # Controller thresholds
-THRESHOLD_SLOPE = 0.1  # °C/h – minimum slope delta to trigger re-evaluation
 THRESHOLD_TARGET_DROP = -1.0  # °C  – setpoint drop that triggers immediate speed cut
 DEFAULT_DEAD_TIME = 10.0  # minutes – fallback dead time before learning is ready
 DEAD_TIME_SAFETY_FACTOR = 1.5  # multiplier applied to learned dead time for effective timeout
+# The learned dead time is what a fan change takes to show on the sensor: with a
+# 0.2 degC sensor, mostly the wait for its next step (17.5-28.5 min measured),
+# not the air's transport delay (a few minutes on a wall split). It still sets
+# the prediction horizon and the adaptive change interval, but the learning gate,
+# the phase split and the learning hold use it capped at this many minutes, so a
+# long sensor wait cannot hold an unmeasured speed for ~50 minutes before the
+# first sample is even allowed.
+DEAD_TIME_MAX_FOR_GATE = 15.0
 
 # Phase detection
 PHASE_DEAD_TIME = "DEAD_TIME"

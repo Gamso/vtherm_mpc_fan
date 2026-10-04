@@ -620,29 +620,64 @@ async def test_an_external_fan_change_restarts_the_dead_time() -> None:
 
 
 @pytest.mark.asyncio
-async def test_only_the_first_slope_move_after_a_change_is_a_response_event() -> None:
-    """One fan change, one response event.
+async def test_the_dead_time_is_the_first_sensor_step_in_the_expected_direction() -> None:
+    """One fan change, one response event, measured on the temperature.
 
-    Every slope jump inside the 60-minute window used to be recorded as another
-    response to the same change, so the median dead time drifted toward the
-    middle of the window -- and everything gated on it (change interval,
-    learning gate, simulated delay) stretched with it.
+    A climb in cool must cool the room: a reading moving the wrong way is not
+    the response, the first step of one sensor resolution the right way is, and
+    nothing after it counts again. Detecting it on the slope EMA fired on the
+    next reading whatever its direction -- the "dead time" was the wait for it.
     """
     import time
 
-    runtime = _make_runtime(last_temperature_slope=-0.2)
+    runtime = _make_runtime(current_temperature=24.6)
     manager = await _build_manager(runtime, hass=_hass_with_auto_fan("vtherm-uid"))
     await manager.refresh_state()
-    manager._last_change_time = time.time() - 10 * 60  # noqa: SLF001
-    manager._response_armed = True  # noqa: SLF001
+    manager._register_fan_change(time.time() - 10 * 60, 24.6, +1)  # noqa: SLF001  (low -> stronger)
 
-    runtime.last_temperature_slope = -0.5
+    runtime.current_temperature = 24.8  # wrong way
+    await manager.refresh_state()
+    assert manager.learning.response_event_count() == 0
+
+    runtime.current_temperature = 24.4  # one 0.2 step cooler than at the change
+    await manager.refresh_state()
+    assert manager.learning.response_event_count() == 1
+    assert manager.learning.get_dead_time("cool") == pytest.approx(10.0, abs=0.5)
+
+    runtime.current_temperature = 24.0
     await manager.refresh_state()
     assert manager.learning.response_event_count() == 1
 
-    runtime.last_temperature_slope = -0.9
+
+@pytest.mark.asyncio
+async def test_a_step_down_expects_the_room_to_move_the_other_way() -> None:
+    """After a weaker speed in cool the response is the room warming."""
+    import time
+
+    runtime = _make_runtime(current_temperature=24.0)
+    manager = await _build_manager(runtime, hass=_hass_with_auto_fan("vtherm-uid"))
+    await manager.refresh_state()
+    manager._register_fan_change(time.time() - 12 * 60, 24.0, -1)  # noqa: SLF001
+
+    runtime.current_temperature = 23.8
+    await manager.refresh_state()
+    assert manager.learning.response_event_count() == 0
+    runtime.current_temperature = 24.2
     await manager.refresh_state()
     assert manager.learning.response_event_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_the_change_direction_follows_the_ladder() -> None:
+    """Stronger is +1, weaker -1, unknown speeds 0 (no event is armed)."""
+    manager = await _build_manager()
+    manager._sync_fan_modes()  # noqa: SLF001
+
+    assert manager._change_direction("low", "high") == 1  # noqa: SLF001
+    assert manager._change_direction("superhigh", "silent") == -1  # noqa: SLF001
+    assert manager._change_direction("low", "turbo") == 0  # noqa: SLF001
+    manager._register_fan_change(1.0, 24.0, 0)  # noqa: SLF001
+    assert manager._response_armed is False  # noqa: SLF001
 
 
 @pytest.mark.asyncio
@@ -811,8 +846,8 @@ async def test_fixed_fan_after_a_restart_waits_the_min_interval_from_the_first_c
 async def test_pinned_speed_commands_generate_no_response_events() -> None:
     """The pin's own commands must not teach the model a dead time.
 
-    Every command arms the response detector; in dry the slope still moves (a
-    dehumidifier changes the room), so each pinned command used to record a
+    Every command arms the response detector; in dry the room still moves (a
+    dehumidifier changes it), so each pinned command used to record a
     "dry" response event. Five of them made the adaptive interval trust a dead
     time learned outside heat/cool.
     """
@@ -827,10 +862,9 @@ async def test_pinned_speed_commands_generate_no_response_events() -> None:
     hass.states.get(runtime.entity_id).attributes["fan_mode"] = "superhigh"
     await manager.refresh_state()
 
-    for slope in (-0.6, -0.1, -0.7, 0.0, -0.8):
-        manager._last_change_time = time.time() - 10 * 60  # noqa: SLF001
-        manager._response_armed = True  # noqa: SLF001  (as after any command)
-        runtime.last_temperature_slope = slope
+    for temp in (23.4, 24.2, 23.0, 24.4, 22.8):
+        manager._register_fan_change(time.time() - 10 * 60, runtime.current_temperature, +1)  # noqa: SLF001  (as after any command)
+        runtime.current_temperature = temp
         await manager.refresh_state()
 
     assert manager.learning.response_event_count() == 0
@@ -838,18 +872,17 @@ async def test_pinned_speed_commands_generate_no_response_events() -> None:
 
 @pytest.mark.asyncio
 async def test_a_pending_response_does_not_cross_an_hvac_mode_change() -> None:
-    """A fan change made in dry is not the cause of a slope move seen in cool."""
+    """A fan change made in dry is not the cause of a temperature move seen in cool."""
     import time
 
-    runtime = _make_runtime(vtherm_hvac_mode="dry", last_temperature_slope=-0.2)
+    runtime = _make_runtime(vtherm_hvac_mode="dry", current_temperature=25.0)
     manager = await _build_manager(runtime, hass=_hass_with_auto_fan("vtherm-uid"))
     await manager.refresh_state()
-    manager._last_change_time = time.time() - 10 * 60  # noqa: SLF001
-    manager._response_armed = True  # noqa: SLF001
+    manager._register_fan_change(time.time() - 10 * 60, 25.0, +1)  # noqa: SLF001
 
     runtime.vtherm_hvac_mode = "cool"
     await manager.refresh_state()
-    runtime.last_temperature_slope = -0.9
+    runtime.current_temperature = 24.4
     await manager.refresh_state()
 
     assert manager.learning.response_event_count() == 0
