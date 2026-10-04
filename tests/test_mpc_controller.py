@@ -871,7 +871,7 @@ def test_mpc_disturbance_bias_decays_during_defrost() -> None:
 
 
 def test_monotone_constraint_enforces_ordering() -> None:
-    """An inverted weak profile is clamped down, leaving the stronger ones untouched."""
+    """An inverted pair is pooled at its weighted mean and separated; the rest is untouched."""
     learning = ThermalLearning()
 
     # Create inverted profiles: silent reads stronger than low (the real-world bug)
@@ -891,14 +891,13 @@ def test_monotone_constraint_enforces_ordering() -> None:
     monotone = mpc.build_monotone_slopes(["silent", "low", "med", "high", "superhigh"], "heat")
     assert isinstance(monotone, dict)
 
-    # Equal sample counts, so the violation resolves downward: silent's estimate is
-    # discarded and re-synthesised strictly below low rather than dragging low up.
+    # Equal weights: the violating pair is pooled at its mean (0.265); on a tie of
+    # weights the stronger rank keeps the pooled value and the weaker one is
+    # placed one ladder step below it, never tied with it.
+    assert monotone["low"] == pytest.approx(0.265, abs=0.001)
+    assert monotone["silent"] == pytest.approx(0.265 / mpc_module.LADDER_CAPACITY_RATIO, abs=0.001)
     assert monotone["silent"] < monotone["low"]
-    # low sits at exactly 0.0, where multiplicative spacing would collapse, so the
-    # absolute fallback separation applies.
-    assert monotone["silent"] == pytest.approx(-0.05, abs=0.001)
     # Profiles that were already ordered keep their learned values exactly.
-    assert monotone["low"] == pytest.approx(0.0, abs=0.001)
     assert monotone["med"] == pytest.approx(0.45, abs=0.001)
     assert monotone["high"] == pytest.approx(0.96, abs=0.001)
     assert monotone["superhigh"] == pytest.approx(1.35, abs=0.001)
@@ -944,11 +943,10 @@ def test_monotone_constraint_partial_profiles_enforces_known_pairs() -> None:
     assert "med" not in result
     assert "high" in result
     assert "superhigh" in result
-    # Equal sample counts: the weaker mode is the one rewritten, so superhigh keeps
-    # its own learned value instead of being inflated to high's, and high lands one
+    # Equal weights: pooled at the mean, superhigh keeps it and high lands one
     # ladder step below it rather than tied with it.
-    assert result["superhigh"] == pytest.approx(1.075, abs=0.001)
-    assert result["high"] == pytest.approx(1.075 / mpc_module.LADDER_CAPACITY_RATIO, abs=0.001)
+    assert result["superhigh"] == pytest.approx((1.59 + 1.075) / 2, abs=0.001)
+    assert result["high"] == pytest.approx(result["superhigh"] / mpc_module.LADDER_CAPACITY_RATIO, abs=0.001)
     assert result["high"] < result["superhigh"]
 
 
@@ -975,13 +973,14 @@ def test_monotone_constraint_trusts_the_better_sampled_profile() -> None:
     )
     result = mpc.build_monotone_slopes(["silent", "low", "med", "high", "superhigh"], "cool")
 
-    # The two well-sampled profiles keep their learned values...
-    assert result["high"] == pytest.approx(0.5, abs=0.001)
+    # The well-sampled profiles barely move: superhigh not at all, high only by
+    # the weight of a 10-sample outlier against 145 samples...
     assert result["superhigh"] == pytest.approx(0.9, abs=0.001)
-    # ...and the 10-sample outlier is rewritten one ladder step below high, not
-    # pinned onto it: an exact tie would leave the MPC unable to tell med from
-    # high thermally, so the energy term would always pick med.
-    assert result["med"] == pytest.approx(0.5 / mpc_module.LADDER_CAPACITY_RATIO, abs=0.001)
+    assert result["high"] == pytest.approx(0.5, abs=0.1)
+    # ...and the outlier is placed one ladder step below high, not pinned onto
+    # it: an exact tie would leave the MPC unable to tell med from high
+    # thermally, so the energy term would always pick med.
+    assert result["med"] == pytest.approx(result["high"] / mpc_module.LADDER_CAPACITY_RATIO, abs=0.001)
     assert result["med"] < result["high"]
 
 
@@ -1001,11 +1000,11 @@ def test_monotone_constraint_raises_a_poorly_sampled_stronger_mode() -> None:
     )
     result = mpc.build_monotone_slopes(["silent", "low", "med", "high", "superhigh"], "cool")
 
-    assert result["high"] == pytest.approx(0.9, abs=0.001)  # 800 samples: untouched
+    assert result["high"] == pytest.approx(0.9, abs=0.01)  # 800 samples: barely moved
     # Lifted a ladder step *above* high, not tied with it: tying them would make the
     # energy term always prefer high, so superhigh would never run again and its
     # profile could never recover from being thin.
-    assert result["superhigh"] == pytest.approx(0.9 * mpc_module.LADDER_CAPACITY_RATIO, abs=0.001)
+    assert result["superhigh"] == pytest.approx(result["high"] * mpc_module.LADDER_CAPACITY_RATIO, abs=0.001)
     assert result["superhigh"] > result["high"]
 
 
@@ -1983,3 +1982,103 @@ def test_the_learning_gate_caps_a_long_dead_time() -> None:
     assert result["mpc_dead_time"] == 30.0
     # Learning hold of an unmeasured speed: 1.5 x 15 + 10 = 32.5 min, not 55.
     assert "/32.5 min" in result["mpc_reason"]
+
+
+# --- Step 6: learned model ----------------------------------------------------
+def test_two_speeds_learned_at_exactly_the_same_slope_are_separated() -> None:
+    """F11: a strict tie between learned profiles is split, the better sampled keeping its value."""
+    learning = ThermalLearning()
+    for _ in range(40):
+        learning.add_slope_sample("high", -0.8, 1.0, "cool")
+    for _ in range(20):
+        learning.add_slope_sample("medium", -0.8, 1.0, "cool")
+    learning.set_mode_effective_slope("low", "cool", 0.2)
+    mpc = _build_mpc(learning)
+
+    result = mpc.build_monotone_slopes(FAN_MODES, "cool")
+
+    assert result["high"] == pytest.approx(0.8)
+    assert result["low"] < result["medium"] < result["high"]
+    # One ladder step below 0.8 (0.44) would pass halfway to low (0.5): respaced
+    # halfway between high and that bound instead.
+    assert result["medium"] == pytest.approx(0.65, abs=0.001)
+
+
+def test_a_partial_profile_does_not_block_a_multi_rank_step_down() -> None:
+    """A profile never measured as far as 1 degC is not proof it cannot hold."""
+    learning = ThermalLearning()
+    for err in (0.0, 0.1, 0.2) * 4:
+        learning.add_slope_sample("low", -(-0.05 + 0.1 * err), err, "cool")
+    learning.set_mode_effective_slope("medium", "cool", 0.6)
+    learning.set_mode_effective_slope("high", "cool", 1.2)
+    mpc = _build_mpc(learning, min_interval=10)
+
+    assert learning.is_profile_partial("low", "cool")
+    result = mpc.evaluate(current_temp=23.0, target_temp=24.0, vtherm_slope=0.0, hvac_mode="cool", current_fan="high", minutes_since_change=60.0)
+
+    assert "Blocked 2-rank drop" not in result["mpc_reason"]
+
+
+def test_a_profile_is_not_extrapolated_past_its_envelope() -> None:
+    """Measured only at errors 0-0.3, a speed is evaluated at 0.3, not at 1 degC."""
+    learning = ThermalLearning()
+    for err in (0.0, 0.1, 0.2, 0.3) * 4:
+        learning.add_slope_sample("low", 0.1 + 0.5 * err, err, "heat")
+
+    fit = learning.get_mode_fit("low", "heat")
+    assert fit.partial is True
+    assert fit.reference_error == pytest.approx(0.3)
+    assert learning.get_mode_effective_slope("low", "heat") == pytest.approx(0.25, abs=0.01)
+    assert learning.get_mode_effective_slope_at("low", "heat", 2.0) == pytest.approx(0.25, abs=0.01)
+
+
+def test_thompson_sampling_draws_around_the_learned_ladder_when_enabled() -> None:
+    """With the option on, the ladder values are drawn from N(value, sigma^2); off they are fixed."""
+    learning = ThermalLearning()
+    learning.set_mode_effective_slope("low", "heat", 0.2)
+    learning.set_mode_effective_slope("medium", "heat", 0.6)
+    learning.set_mode_effective_slope("high", "heat", 1.2)
+
+    fixed = _build_mpc(learning)
+    assert fixed.build_monotone_slopes(FAN_MODES, "heat") == fixed.build_monotone_slopes(FAN_MODES, "heat")
+
+    sampled = MPCController(learning=learning, deadband=0.2, min_interval=10, fan_modes=FAN_MODES, thompson_sampling=True, rng=random.Random(3))
+    draws = [sampled.build_monotone_slopes(FAN_MODES, "heat", sample=True)["medium"] for _ in range(200)]
+    assert min(draws) < 0.6 < max(draws)
+    assert all(ladder == sorted(ladder) for ladder in ([*sampled.build_monotone_slopes(FAN_MODES, "heat", sample=True).values()] for _ in range(50)))
+
+
+def test_cold_start_follows_a_step_law_until_a_profile_exists() -> None:
+    """No profile at all: one rank per 0.3 degC beyond the deadband, never down while short."""
+    fan_modes = ["silent", "low", "med", "high", "superhigh"]
+    mpc = MPCController(learning=ThermalLearning(), deadband=0.2, min_interval=10, fan_modes=fan_modes)
+
+    far = mpc.evaluate(current_temp=24.9, target_temp=24.0, vtherm_slope=0.0, hvac_mode="cool", current_fan="silent", minutes_since_change=60.0)
+    assert far["mpc_fan_mode"] == "high"  # 0.9 - 0.2 = 0.7 -> 3 ranks
+    assert "Cold start" in far["mpc_reason"]
+
+    short = MPCController(learning=ThermalLearning(), deadband=0.2, min_interval=10, fan_modes=fan_modes)
+    held = short.evaluate(current_temp=24.3, target_temp=24.0, vtherm_slope=0.0, hvac_mode="cool", current_fan="superhigh", minutes_since_change=60.0)
+    assert held["mpc_fan_mode"] == "superhigh"
+
+    over = MPCController(learning=ThermalLearning(), deadband=0.2, min_interval=10, fan_modes=fan_modes)
+    down = over.evaluate(current_temp=23.7, target_temp=24.0, vtherm_slope=0.0, hvac_mode="cool", current_fan="high", minutes_since_change=60.0)
+    assert down["mpc_fan_mode"] == "med"
+
+
+def test_the_profile_summary_exposes_its_uncertainty() -> None:
+    """slope_sigma shrinks with the evidence; seeds carry a fixed guess."""
+    import time
+    from unittest.mock import patch
+
+    learning = ThermalLearning()
+    start = time.time()
+    rng = random.Random(1)
+    for i in range(60):
+        with patch("time.time", return_value=start + 600 * i):
+            learning.add_slope_sample("high", -(0.6 + rng.gauss(0, 0.2)), 0.5, "cool")
+    learning.set_mode_effective_slope("low", "cool", 0.1)
+
+    profiles = learning.get_mode_profiles("cool", ["low", "high"])
+    assert 0 < profiles["high"]["slope_sigma"] < 0.1
+    assert profiles["low"]["slope_sigma"] == pytest.approx(0.3)

@@ -104,20 +104,25 @@ class TestThermalLearning:
         assert learning.get_mode_effective_slope("silent", "heat") == pytest.approx(0.15, abs=0.001)
         assert learning.get_mode_effective_slope("med", "heat") == pytest.approx(0.5, abs=0.01)
 
-    def test_median_resists_outliers(self):
-        """Median should resist a single extreme outlier sample."""
+    def test_the_fit_resists_outliers_when_the_error_varies(self):
+        """Theil-Sen keeps the line when 3 of 15 samples are contaminated.
+
+        The previous test of this name only passed because every sample shared
+        one error, which sent the fit to its median fallback; with a varying
+        error least squares followed the three outliers (slope 0.15 + 0.5 e
+        fitted as a gain of ~1.5).
+        """
         learning = ThermalLearning()
+        errors = [0.2, 0.4, 0.6, 0.8, 1.0, 1.2] * 2
+        for err in errors:
+            learning.add_slope_sample("silent", 0.15 + 0.5 * err, err, hvac_mode="heat")
+        for err in (1.0, 1.1, 1.2):
+            learning.add_slope_sample("silent", 3.0, err, hvac_mode="heat")  # inertia contamination
 
-        # 12 normal samples at ~0.15, plus 3 outlier at 1.29 (inertia contamination)
-        for _ in range(12):
-            learning.add_slope_sample("silent", 0.15, 0.2, hvac_mode="heat")
-        for _ in range(3):
-            learning.add_slope_sample("silent", 1.29, 0.2, hvac_mode="heat")
-
-        slope = learning.get_mode_effective_slope("silent", "heat")
-        # Median of [0.15]*12 + [1.29]*3 = 0.15 (most values are 0.15)
-        assert slope is not None
-        assert slope == pytest.approx(0.15, abs=0.01)
+        intercept, gain = learning.get_mode_slope_model("silent", "heat")
+        assert gain == pytest.approx(0.5, abs=0.1)
+        assert intercept == pytest.approx(0.15, abs=0.1)
+        assert learning.get_mode_effective_slope("silent", "heat") == pytest.approx(0.65, abs=0.1)
 
     def test_gap_model_learns_positive_gain(self):
         """A profile whose slope scales with the comfort error yields a+b·error."""
@@ -336,8 +341,10 @@ def test_storage_cap_keeps_rare_profile_samples() -> None:
 def test_legacy_samples_are_kept_but_weigh_less() -> None:
     """Pre-format-2 samples (error vs the regulated setpoint) survive, at a reduced weight.
 
-    Twelve legacy samples say 0.9, twelve current ones 0.3, at the same errors:
-    a plain mean would sit at 0.6; at weight 0.25 the fit sits at 0.42.
+    Twelve legacy samples say 0.9, twelve current ones 0.3, at the same errors.
+    Unweighted, the robust fit would sit anywhere between the two; at weight
+    0.25 the twelve legacy samples weigh as three current ones and the weighted
+    median follows the current samples.
     """
     import time
 
@@ -352,8 +359,7 @@ def test_legacy_samples_are_kept_but_weigh_less() -> None:
     for i in range(12):
         restored.add_slope_sample("high", 0.3, 0.5 + 0.1 * (i % 4), hvac_mode="heat", regulation_offset=0.0)
 
-    expected = (12 * LEGACY_SAMPLE_WEIGHT * 0.9 + 12 * 0.3) / (12 * LEGACY_SAMPLE_WEIGHT + 12)
-    assert restored.get_mode_effective_slope("high", "heat") == pytest.approx(expected, abs=1e-6)
+    assert restored.get_mode_effective_slope("high", "heat") == pytest.approx(0.3, abs=1e-6)
 
 
 def test_store_round_trip_keeps_the_format_and_legacy_marking() -> None:

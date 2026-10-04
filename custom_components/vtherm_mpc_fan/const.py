@@ -24,6 +24,7 @@ CONF_FIXED_FAN_SPEED = "fixed_fan_speed"  # the speed pinned in CONF_FIXED_FAN_H
 CONF_EXPLORATION_PROBE = "exploration_probe"
 CONF_EXPLORATION_UCB = "exploration_ucb"
 CONF_EXPLORATION_UNDER_LOAD = "exploration_under_load"
+CONF_THOMPSON_SAMPLING = "thompson_sampling"
 
 # Feature-manager identity registered with the VTherm API.
 FEATURE_MANAGER_MPC_FAN = "mpc_fan"
@@ -67,6 +68,7 @@ DEFAULT_DATA_COLLECTION = True
 DEFAULT_EXPLORATION_PROBE = True
 DEFAULT_EXPLORATION_UCB = False
 DEFAULT_EXPLORATION_UNDER_LOAD = False
+DEFAULT_THOMPSON_SAMPLING = False
 
 # Fallback control-cycle length, used only until the runtime reports its own
 # ``cycle_min``. It sets the MPC simulation step, so it should match the real

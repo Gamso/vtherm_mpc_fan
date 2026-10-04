@@ -242,7 +242,7 @@ class EffectiveSlopeNumber(NumberEntity):
         else:
             quality = "poor"
         # Gap-dependent slope model: effective_slope(error) = intercept + gain·error.
-        # The displayed value is this model evaluated at REFERENCE_SLOPE_ERROR.
+        # The displayed value is this model evaluated at ``reference_error``.
         model = learning.get_mode_slope_model(self._fan_mode, self._hvac_mode)
         if model is None:
             slope_intercept = None
@@ -250,6 +250,7 @@ class EffectiveSlopeNumber(NumberEntity):
         else:
             slope_intercept = round(model[0], 3)
             slope_gain = round(model[1], 3)
+        fit = learning.get_mode_fit(self._fan_mode, self._hvac_mode)
         r_squared = learning.get_mode_slope_r2(self._fan_mode, self._hvac_mode)
         time_constant = learning.get_mode_time_constant(self._fan_mode, self._hvac_mode)
         return {
@@ -275,7 +276,12 @@ class EffectiveSlopeNumber(NumberEntity):
             "quality": quality,
             "slope_intercept": slope_intercept,
             "slope_gain": slope_gain,
-            "reference_error": REFERENCE_SLOPE_ERROR,
+            # The value is the model at this error: REFERENCE_SLOPE_ERROR, or the
+            # largest error the profile was measured at when smaller (partial).
+            "reference_error": round(fit.reference_error, 2) if fit is not None else REFERENCE_SLOPE_ERROR,
+            "partial": fit.partial if fit is not None else None,
+            "slope_sigma": round(fit.slope_sigma, 3) if fit is not None and fit.slope_sigma is not None else None,
+            "effective_samples": round(fit.effective_samples, 1) if fit is not None and fit.effective_samples is not None else None,
             "model_r_squared": round(r_squared, 3) if r_squared is not None else None,
             "thermal_time_constant_h": round(time_constant, 2) if time_constant is not None else None,
         }

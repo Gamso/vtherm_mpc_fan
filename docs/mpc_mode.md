@@ -129,21 +129,46 @@ the distance to the setpoint. A single scalar (the historical median) is structu
 many samples collected near equilibrium, where the slope is naturally shallow — it under-states the
 fan's real working power.
 
-Each profile therefore learns a linear model by ordinary least squares over its
-`(comfort_error, effective_slope)` samples:
+Each profile therefore learns a linear model over its `(comfort_error, effective_slope)` samples:
 
 ```text
 effective_slope(error) = a + b * error      (b clamped to >= 0)
 ```
 
-- `learning.get_mode_slope_model()` returns `(a, b)`; `get_mode_slope_gain()` returns `b`.
-- `learning.get_mode_effective_slope()` reports the representative **working** slope, i.e. the model
-  evaluated at `REFERENCE_SLOPE_ERROR` (1 °C). For legacy/synthetic constant profiles (`b == 0`) this
-  is exactly the previous median estimator, so behaviour is unchanged for those.
+- **Robust fit**: `b` is the weighted median of the pairwise slopes (Theil–Sen; at most
+  `THEIL_SEN_MAX_POINTS` samples, evenly spread in time), `a` the weighted median of `y − b·x`;
+  legacy samples weigh `LEGACY_SAMPLE_WEIGHT`.
+- **Autocorrelation and shrinkage**: `n_eff = Σw / (1 + 2ρ)`, ρ the lag-1 autocorrelation of the
+  residuals within a run of samples; `b ← (n_eff·b + GAIN_PRIOR_SAMPLES·b_pool) / (n_eff +
+  GAIN_PRIOR_SAMPLES)`, `b_pool` the within-speed Theil–Sen gain pooled over the HVAC mode's speeds.
+- **No extrapolation**: the envelope `error_max` is the largest error measured;
+  `get_mode_effective_slope()` reports the line at `reference_error = min(REFERENCE_SLOPE_ERROR,
+  error_max)`, and the simulator caps the error at `error_max`. A profile with `error_max <
+  REFERENCE_SLOPE_ERROR` is *partial* (`is_profile_partial()`); the multi-rank step-down guard treats
+  it as unmeasured.
+- **Uncertainty**: `slope_sigma = 1.4826·MAD(residuals) / sqrt(n_eff)`, inflated by the distance of
+  the reference error from the samples' mean error; a seed carries `SEEDED_SLOPE_SIGMA`.
+- **Regulation offset**: an optional shrunk term `c·(offset − (α + β·error))` (see *Comfort setpoint*).
+- `learning.get_mode_fit()` returns the whole `ProfileFit`; `get_mode_slope_model()` returns `(a, b)`.
 - The simulator recomputes the slope **at each step** from the simulated error, so the projection
   decelerates realistically as the room approaches the setpoint instead of cooling/heating at a fixed
-  rate (which produced phantom overshoot past the target), and uses the higher real power when the
-  room is far from target (faster, more accurate catch-up).
+  rate (which produced phantom overshoot past the target).
+
+### Monotone ladder
+
+`build_monotone_slopes()` is a weighted isotonic regression (pool-adjacent-violators) over the speed
+ranks, each learned profile weighing its `n_eff` (a seed `MIN_MODE_PROFILE_SAMPLES`). Inside a pooled
+block — or between two profiles learned at exactly the same value — the heaviest profile keeps the
+block value and the others are separated one `LADDER_CAPACITY_RATIO` step per rank, respaced evenly
+when that would pass halfway to the neighbouring block. With `sample=True` (option
+`thompson_sampling`), each value is first drawn from `N(value, slope_sigma²)`.
+
+### Cold start
+
+While no profile of the HVAC mode exists at all (neither measured nor seeded), the decision is a step
+law on the comfort error (`STEP_LAW_ERROR_PER_RANK` = 0.3 °C per rank beyond the deadband, never down
+while short, one rank down past the deadband on the other side), under the usual min interval,
+learning hold and escalation. The simulation still runs for the forecasts and diagnostics.
 
 ### Disturbance Handling
 

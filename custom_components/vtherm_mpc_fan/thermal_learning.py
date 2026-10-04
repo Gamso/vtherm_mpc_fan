@@ -65,6 +65,17 @@ MIN_AUTOCORRELATION_PAIRS = 5
 # cannot then invent a steep gain from a few autocorrelated points.
 GAIN_PRIOR_SAMPLES = 10.0
 
+# The line is fitted by a weighted Theil-Sen estimator (weighted median of the
+# pairwise slopes, then weighted median of the intercepts): a few contaminated
+# samples (a door opened, a transient mislabelled established) cannot drag it,
+# where least squares followed any three outliers out of fifteen. Pairs are
+# O(n^2), so at most THEIL_SEN_MAX_POINTS samples, evenly spread in time, enter
+# the estimator; every sample still enters the effective sample size.
+THEIL_SEN_MAX_POINTS = 150
+# Uncertainty assumed for a profile the user seeded by hand (degC/h): a guess,
+# not a measurement.
+SEEDED_SLOPE_SIGMA = 0.3
+
 # The regulation offset (sign-aligned, positive = VTherm asks the unit for more)
 # is a proxy for how hard the inverter compressor is driven, which the fan speed
 # alone does not capture. It enters a profile's fit as a second regressor,
@@ -97,6 +108,31 @@ class ProfileFit:
     offset_gain: float = 0.0
     offset_base: float = 0.0
     offset_trend: float = 0.0
+    # Largest comfort error the measurements covered (None: a seed, no envelope).
+    # The line is never evaluated past it: a speed only ever seen near the
+    # setpoint says nothing about what it does 1 degC away.
+    error_max: float | None = None
+    # Standard deviation (degC/h) of the representative slope estimate.
+    slope_sigma: float | None = None
+
+    @property
+    def reference_error(self) -> float:
+        """The comfort error the representative slope is evaluated at (no extrapolation)."""
+        if self.error_max is None:
+            return REFERENCE_SLOPE_ERROR
+        return max(0.0, min(REFERENCE_SLOPE_ERROR, self.error_max))
+
+    @property
+    def partial(self) -> bool:
+        """True when the measurements never reached REFERENCE_SLOPE_ERROR."""
+        return self.error_max is not None and self.error_max < REFERENCE_SLOPE_ERROR
+
+    def slope_at(self, error: float) -> float:
+        """Return the modelled slope at *error*, floored at 0 and capped at the envelope."""
+        error = max(error, 0.0)
+        if self.error_max is not None:
+            error = min(error, max(self.error_max, 0.0))
+        return self.intercept + self.gain * error
 
     def offset_correction(self, error: float, demand: float | None) -> float:
         """Return the slope correction for an unusual (sign-aligned) regulation offset, 0 when unknown."""
@@ -152,6 +188,36 @@ def weighted_median(values: list[float], weights: list[float]) -> float:
         if cumulative == half and index + 1 < len(pairs):
             return (value + pairs[index + 1][0]) / 2.0
     return pairs[-1][0]
+
+
+def weighted_theil_sen(points: list[tuple[float, float, float]]) -> tuple[float, float] | None:
+    """Weighted Theil-Sen fit of y on x over ``(x, y, w)``: (intercept, slope).
+
+    The slope is the weighted median of the pairwise slopes (pair weight
+    w_i * w_j, pairs with no x spread skipped), the intercept the weighted
+    median of y - slope * x. None when no pair has an x spread.
+    """
+    slopes: list[float] = []
+    weights: list[float] = []
+    for index, (x_i, y_i, w_i) in enumerate(points):
+        for x_j, y_j, w_j in points[index + 1 :]:
+            if abs(x_j - x_i) < 1e-6:
+                continue
+            slopes.append((y_j - y_i) / (x_j - x_i))
+            weights.append(w_i * w_j)
+    if not slopes:
+        return None
+    slope = weighted_median(slopes, weights)
+    intercept = weighted_median([y - slope * x for x, y, _ in points], [w for _, _, w in points])
+    return intercept, slope
+
+
+def thin_evenly(items: list, limit: int) -> list:
+    """Return at most *limit* items of *items*, evenly spread over the list."""
+    if len(items) <= limit:
+        return items
+    step = len(items) / limit
+    return [items[int(index * step)] for index in range(limit)]
 
 
 def weighted_line(points: list[tuple[float, float, float]]) -> tuple[float, float, float, float] | None:
@@ -615,36 +681,65 @@ class ThermalLearning:
             # measurement visibly pulls the profile toward what was observed.
             median_constant = statistics.median(constants)
             if not points:
-                return ProfileFit(median_constant, 0.0, None)
+                return ProfileFit(median_constant, 0.0, None, slope_sigma=SEEDED_SLOPE_SIGMA)
             median_measured = weighted_median([y for _, y, _ in points], [w for _, _, w in points])
             weight = len(points) / (len(points) + len(constants))
-            return ProfileFit(median_constant + weight * (median_measured - median_constant), 0.0, None)
+            return ProfileFit(median_constant + weight * (median_measured - median_constant), 0.0, None, slope_sigma=SEEDED_SLOPE_SIGMA)
 
         total = sum(w for _, _, w in points)
-        mean_y = sum(w * y for _, y, w in points) / total
-        line = weighted_line(points)
-        if line is None:
+        error_max = max(x for x, _, _ in points)
+        robust = weighted_theil_sen(thin_evenly(points, THEIL_SEN_MAX_POINTS))
+        if robust is None:
             # All samples taken at (nearly) the same error: no slope can be fitted.
             median_y = weighted_median([y for _, y, _ in points], [w for _, _, w in points])
-            n_eff = self._effective_sample_count(measured, [y - median_y for _, y, _ in points], total)
-            constant = ProfileFit(median_y, 0.0, None, effective_samples=n_eff)
+            residuals = [y - median_y for _, y, _ in points]
+            n_eff = self._effective_sample_count(measured, residuals, total)
+            constant = ProfileFit(
+                median_y,
+                0.0,
+                None,
+                effective_samples=n_eff,
+                error_max=error_max,
+                slope_sigma=self._slope_sigma(residuals, [w for _, _, w in points], n_eff),
+            )
             return self._fit_offset_term(constant, measured, sign, hvac_mode)
 
-        intercept_a, gain_b, _, mean_x = line
+        intercept_a, gain_b = robust
         n_eff = self._effective_sample_count(measured, [y - (intercept_a + gain_b * x) for x, y, _ in points], total)
         gain_b = max(0.0, gain_b)
         pooled = self._pooled_gain(hvac_mode)
         gain_b = (n_eff * gain_b + GAIN_PRIOR_SAMPLES * pooled) / (n_eff + GAIN_PRIOR_SAMPLES)
-        intercept_a = mean_y - gain_b * mean_x
+        intercept_a = weighted_median([y - gain_b * x for x, y, _ in points], [w for _, _, w in points])
 
         # Coefficient of determination against the (clamped, shrunk) fitted line.
+        mean_y = sum(w * y for _, y, w in points) / total
         ss_tot = sum(w * (y - mean_y) ** 2 for _, y, w in points)
+        residuals = [y - (intercept_a + gain_b * x) for x, y, _ in points]
         if ss_tot < 1e-9:
             r_squared = None
         else:
-            ss_res = sum(w * (y - (intercept_a + gain_b * x)) ** 2 for x, y, w in points)
+            ss_res = sum(w * r * r for (_, _, w), r in zip(points, residuals))
             r_squared = max(0.0, 1.0 - ss_res / ss_tot)
-        return self._fit_offset_term(ProfileFit(intercept_a, gain_b, r_squared, effective_samples=n_eff), measured, sign, hvac_mode)
+        mean_x = sum(w * x for x, _, w in points) / total
+        sxx = sum(w * (x - mean_x) ** 2 for x, _, w in points) * (n_eff / total)
+        reference = max(0.0, min(REFERENCE_SLOPE_ERROR, error_max))
+        sigma = self._slope_sigma(residuals, [w for _, _, w in points], n_eff)
+        if sigma is not None and sxx > 1e-9:
+            sigma *= (1.0 + n_eff * (reference - mean_x) ** 2 / sxx) ** 0.5
+        fit = ProfileFit(intercept_a, gain_b, r_squared, effective_samples=n_eff, error_max=error_max, slope_sigma=sigma)
+        return self._fit_offset_term(fit, measured, sign, hvac_mode)
+
+    @staticmethod
+    def _slope_sigma(residuals: list[float], weights: list[float], n_eff: float) -> float | None:
+        """Return the standard deviation of a fitted level: robust scale / sqrt(n_eff).
+
+        The scale is 1.4826 x the weighted median absolute residual, floored at
+        0.02 degC/h so a profile of identical readings is not taken as certain.
+        """
+        if n_eff <= 0:
+            return None
+        scale = 1.4826 * weighted_median([abs(r) for r in residuals], weights)
+        return max(scale, 0.02) / n_eff**0.5
 
     @staticmethod
     def _covers_measured_profile(measured: list) -> bool:
@@ -684,24 +779,27 @@ class ThermalLearning:
 
         Each speed keeps its own intercept; only the dependence on the error is
         shared, which is what the profiles have in common (the compressor's
-        response to the gap). Clamped non-negative, 0 when nothing varies.
+        response to the gap). Robust like the per-profile fit: the weighted
+        median of the pairwise slopes taken *within* each speed. Clamped
+        non-negative, 0 when nothing varies.
         """
         if hvac_mode in self._pooled_gain_cache:
             return self._pooled_gain_cache[hvac_mode]
         sign = -1.0 if hvac_mode == "cool" else 1.0
         by_fan: dict[str, list[tuple[float, float, float]]] = {}
-        for s in self._slope_samples:
+        for s in sorted(self._slope_samples, key=lambda sample: sample[0]):
             if s[3] == hvac_mode and is_measurement(s):
                 by_fan.setdefault(s[1], []).append((s[4], sign * s[2], sample_weight(s)))
-        sxy = 0.0
-        sxx = 0.0
+        slopes: list[float] = []
+        weights: list[float] = []
         for points in by_fan.values():
-            total = sum(w for _, _, w in points)
-            mean_x = sum(w * x for x, _, w in points) / total
-            mean_y = sum(w * y for _, y, w in points) / total
-            sxx += sum(w * (x - mean_x) ** 2 for x, _, w in points)
-            sxy += sum(w * (x - mean_x) * (y - mean_y) for x, y, w in points)
-        pooled = max(0.0, sxy / sxx) if sxx >= 1e-6 else 0.0
+            thinned = thin_evenly(points, THEIL_SEN_MAX_POINTS)
+            for index, (x_i, y_i, w_i) in enumerate(thinned):
+                for x_j, y_j, w_j in thinned[index + 1 :]:
+                    if abs(x_j - x_i) >= 1e-6:
+                        slopes.append((y_j - y_i) / (x_j - x_i))
+                        weights.append(w_i * w_j)
+        pooled = max(0.0, weighted_median(slopes, weights)) if slopes else 0.0
         self._pooled_gain_cache[hvac_mode] = pooled
         return pooled
 
@@ -736,7 +834,11 @@ class ThermalLearning:
         offset_gain = sum(rd * ry for rd, ry in residuals) / (spread_sq + OFFSET_PRIOR_SAMPLES * OFFSET_PRIOR_SPREAD**2)
         if offset_gain <= 0.0:
             return fit
-        return ProfileFit(fit.intercept, fit.gain, fit.r_squared, fit.effective_samples, offset_gain, base, slope_d)
+        return ProfileFit(fit.intercept, fit.gain, fit.r_squared, fit.effective_samples, offset_gain, base, slope_d, fit.error_max, fit.slope_sigma)
+
+    def get_mode_fit(self, fan_mode: str, hvac_mode: str) -> ProfileFit | None:
+        """Return the full fitted model of a profile (see ProfileFit), None if unknown."""
+        return self._fit_mode_slope(fan_mode, hvac_mode)
 
     def get_mode_slope_model(self, fan_mode: str, hvac_mode: str) -> tuple[float, float] | None:
         """Return the gap-dependent slope model ``(intercept_a, gain_b)`` for a profile.
@@ -794,13 +896,11 @@ class ThermalLearning:
 
         The error is floored at 0: at/below the setpoint there is no driving
         force, so the modelled active cooling/heating rate is the intercept only.
-        Returns None if the profile is not learned yet.
+        It is also capped at the largest error the measurements covered: the
+        line is never extrapolated. Returns None if the profile is not learned yet.
         """
-        model = self.get_mode_slope_model(fan_mode, hvac_mode)
-        if model is None:
-            return None
-        intercept_a, gain_b = model
-        return intercept_a + gain_b * max(error, 0.0)
+        fit = self._fit_mode_slope(fan_mode, hvac_mode)
+        return None if fit is None else fit.slope_at(error)
 
     def get_mode_effective_slope(self, fan_mode: str, hvac_mode: str) -> float | None:
         """Return the representative "working" effective slope for a profile.
@@ -809,6 +909,11 @@ class ThermalLearning:
         representative non-trivial gap — so the reported value reflects the fan's
         real cooling/heating power instead of the near-equilibrium median (which is
         structurally diluted by the many samples collected close to the setpoint).
+        A profile whose measurements never reached that gap is evaluated at the
+        largest one they did (``ProfileFit.reference_error``): extrapolating a line
+        fitted on errors of 0-0.3 degC to 1 degC turned noise into capacity (P95 of
+        2.5 degC/h for a true 0.3 with realistic noise) and the profile is then
+        *partial*.
 
         For legacy/synthetic constant profiles (gain == 0) this is exactly the old
         median estimator, preserving backward compatibility.
@@ -819,11 +924,20 @@ class ThermalLearning:
 
         Returns None if fewer than MIN_MODE_PROFILE_SAMPLES are available.
         """
-        model = self.get_mode_slope_model(fan_mode, hvac_mode)
-        if model is None:
+        fit = self._fit_mode_slope(fan_mode, hvac_mode)
+        if fit is None:
             return None
-        intercept_a, gain_b = model
-        return intercept_a + gain_b * REFERENCE_SLOPE_ERROR
+        return fit.intercept + fit.gain * fit.reference_error
+
+    def is_profile_partial(self, fan_mode: str, hvac_mode: str) -> bool:
+        """True when a measured profile never covered REFERENCE_SLOPE_ERROR."""
+        fit = self._fit_mode_slope(fan_mode, hvac_mode)
+        return fit is not None and fit.partial
+
+    def get_mode_slope_sigma(self, fan_mode: str, hvac_mode: str) -> float | None:
+        """Return the uncertainty (degC/h) of a profile's representative slope."""
+        fit = self._fit_mode_slope(fan_mode, hvac_mode)
+        return None if fit is None else fit.slope_sigma
 
     def get_profile_spread(self, fan_mode: str, hvac_mode: str) -> float | None:
         """Return the MAD/median ratio for a profile's absolute slopes.
@@ -931,7 +1045,7 @@ class ThermalLearning:
             else:
                 intercept_a, gain, r_squared = fit.intercept, fit.gain, fit.r_squared
                 offset_gain = fit.offset_gain
-                effective_slope = intercept_a + gain * REFERENCE_SLOPE_ERROR
+                effective_slope = intercept_a + gain * fit.reference_error
                 time_constant = (1.0 / gain) if gain >= 1e-3 else None
             profiles[fan_mode] = {
                 "effective_slope": round(effective_slope, 3) if effective_slope is not None else None,
@@ -942,6 +1056,9 @@ class ThermalLearning:
                 "effective_samples": round(fit.effective_samples, 1) if fit is not None and fit.effective_samples is not None else None,
                 "measured_minutes": round(self.get_mode_measured_minutes(fan_mode, hvac_mode), 1),
                 "measured": self.has_measured_profile(fan_mode, hvac_mode),
+                "reference_error": round(fit.reference_error, 2) if fit is not None else None,
+                "partial": fit.partial if fit is not None else None,
+                "slope_sigma": round(fit.slope_sigma, 3) if fit is not None and fit.slope_sigma is not None else None,
                 "legacy_samples": sum(1 for s in self._slope_samples if s[1] == fan_mode and s[3] == hvac_mode and len(s) == 5 and s[4] is not None),
                 "samples": sample_count,
                 "real_samples": self.get_mode_real_sample_count(fan_mode, hvac_mode),

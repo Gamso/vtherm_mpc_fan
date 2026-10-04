@@ -19,6 +19,7 @@ from .const import (
     CONF_EXPLORATION_UCB,
     CONF_EXPLORATION_UNDER_LOAD,
     CONF_FAN_MODE_ORDER,
+    CONF_THOMPSON_SAMPLING,
     CONF_FIXED_FAN_HVAC_MODES,
     CONF_FIXED_FAN_SPEED,
     CONF_MIN_INTERVAL,
@@ -29,6 +30,7 @@ from .const import (
     DEFAULT_EXPLORATION_UCB,
     DEFAULT_EXPLORATION_UNDER_LOAD,
     DEFAULT_MIN_INTERVAL,
+    DEFAULT_THOMPSON_SAMPLING,
     DOMAIN,
     PROFILE_HVAC_MODES,
     VTHERM_DOMAIN,
@@ -217,6 +219,10 @@ def _settings_schema(defaults: dict[str, Any]) -> dict:
         vol.Optional(
             CONF_EXPLORATION_UNDER_LOAD,
             default=defaults.get(CONF_EXPLORATION_UNDER_LOAD, DEFAULT_EXPLORATION_UNDER_LOAD),
+        ): selector.BooleanSelector(),
+        vol.Optional(
+            CONF_THOMPSON_SAMPLING,
+            default=defaults.get(CONF_THOMPSON_SAMPLING, DEFAULT_THOMPSON_SAMPLING),
         ): selector.BooleanSelector(),
     }
 

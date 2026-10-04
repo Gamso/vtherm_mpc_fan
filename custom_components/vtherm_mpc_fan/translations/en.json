@@ -12,7 +12,8 @@
                     "defrost_entity": "Defrost Entity (optional)",
                     "exploration_probe": "Exploration probe (try an unmeasured weaker speed)",
                     "exploration_ucb": "Exploration bonus (advanced)",
-                    "exploration_under_load": "Measure intermediate speeds under load (advanced)"
+                    "exploration_under_load": "Measure intermediate speeds under load (advanced)",
+                    "thompson_sampling": "Thompson sampling (advanced)"
                 },
                 "data_description": {
                     "target_vtherm": "The VTherm to attach to. Its control cycle drives this controller, and its underlying climate is the one whose fan speed gets set.",
@@ -22,7 +23,8 @@
                     "defrost_entity": "Optional: binary sensor, sensor or input_boolean that indicates when the heat pump is in defrost mode. VTherm does not report this, so it has to be supplied here. Compressor activity and outdoor temperature are read from VTherm directly and need no configuration.",
                     "exploration_probe": "While the room holds inside the deadband, now and then (at most every 6 h per speed) step one speed down to a speed that has never been measured, so it gets learned. Abandoned as soon as the room drifts past the deadband by one sensor step. Default: on.",
                     "exploration_ucb": "Near the setpoint, favour poorly measured speeds in the cost when their predicted trajectories are close to the best one. Default: off.",
-                    "exploration_under_load": "When the controller climbs outside a recovery, stop first at the lowest unmeasured speed that is predicted to make progress. Lengthens the climb by about one dead time. Default: off."
+                    "exploration_under_load": "When the controller climbs outside a recovery, stop first at the lowest unmeasured speed that is predicted to make progress. Lengthens the climb by about one dead time. Default: off.",
+                    "thompson_sampling": "Each cycle, draw every learned speed's slope from its uncertainty before deciding, so poorly known speeds get tried now and then. Default: off."
                 }
             },
             "native_auto_fan": {
@@ -61,7 +63,8 @@
                     "fan_mode_order_7": "Fan speed — rank 8 (strongest, if 8 speeds)",
                     "exploration_probe": "Exploration probe (try an unmeasured weaker speed)",
                     "exploration_ucb": "Exploration bonus (advanced)",
-                    "exploration_under_load": "Measure intermediate speeds under load (advanced)"
+                    "exploration_under_load": "Measure intermediate speeds under load (advanced)",
+                    "thompson_sampling": "Thompson sampling (advanced)"
                 },
                 "data_description": {
                     "deadband": "Range: 0.0-5.0 °C. Default: 0.2 °C.",
@@ -72,7 +75,8 @@
                     "fixed_fan_speed": "The speed used in the fixed-speed modes above (e.g. superhigh). Required when at least one fixed-speed mode is selected.",
                     "exploration_probe": "While the room holds inside the deadband, now and then (at most every 6 h per speed) step one speed down to a speed that has never been measured, so it gets learned. Abandoned as soon as the room drifts past the deadband by one sensor step. Default: on.",
                     "exploration_ucb": "Near the setpoint, favour poorly measured speeds in the cost when their predicted trajectories are close to the best one. Default: off.",
-                    "exploration_under_load": "When the controller climbs outside a recovery, stop first at the lowest unmeasured speed that is predicted to make progress. Lengthens the climb by about one dead time. Default: off."
+                    "exploration_under_load": "When the controller climbs outside a recovery, stop first at the lowest unmeasured speed that is predicted to make progress. Lengthens the climb by about one dead time. Default: off.",
+                    "thompson_sampling": "Each cycle, draw every learned speed's slope from its uncertainty before deciding, so poorly known speeds get tried now and then. Default: off."
                 }
             }
         },

@@ -12,7 +12,8 @@
                     "defrost_entity": "Entité dégivrage (optionnel)",
                     "exploration_probe": "Sonde d'exploration (essayer une vitesse inférieure non mesurée)",
                     "exploration_ucb": "Bonus d'exploration (avancé)",
-                    "exploration_under_load": "Mesurer les vitesses intermédiaires en charge (avancé)"
+                    "exploration_under_load": "Mesurer les vitesses intermédiaires en charge (avancé)",
+                    "thompson_sampling": "Échantillonnage de Thompson (avancé)"
                 },
                 "data_description": {
                     "target_vtherm": "Le VTherm auquel se rattacher. Son cycle de contrôle cadence ce contrôleur, et c'est la vitesse de ventilation de son climate sous-jacent qui sera pilotée.",
@@ -22,7 +23,8 @@
                     "defrost_entity": "Optionnel : binary sensor, sensor ou input_boolean indiquant quand la PAC est en dégivrage. VTherm ne remonte pas cette information, elle doit donc être fournie ici. L'activité du compresseur et la température extérieure sont lues directement depuis VTherm et ne demandent aucune configuration.",
                     "exploration_probe": "Quand la pièce tient dans la bande morte, de temps en temps (au plus toutes les 6 h par vitesse), descendre d'une vitesse vers une vitesse jamais mesurée pour l'apprendre. Abandonnée dès que la pièce sort de la bande morte d'un pas de capteur. Défaut : activée.",
                     "exploration_ucb": "Près de la consigne, favoriser dans le coût les vitesses peu mesurées quand leurs trajectoires prédites sont proches de la meilleure. Défaut : désactivé.",
-                    "exploration_under_load": "Quand le contrôleur monte hors d'une reprise, s'arrêter d'abord sur la plus basse vitesse non mesurée prédite capable de progresser. Allonge la montée d'environ un temps mort. Défaut : désactivé."
+                    "exploration_under_load": "Quand le contrôleur monte hors d'une reprise, s'arrêter d'abord sur la plus basse vitesse non mesurée prédite capable de progresser. Allonge la montée d'environ un temps mort. Défaut : désactivé.",
+                    "thompson_sampling": "À chaque cycle, tirer la pente de chaque vitesse apprise selon son incertitude avant de décider, pour que les vitesses mal connues soient essayées de temps en temps. Défaut : désactivé."
                 }
             },
             "native_auto_fan": {
@@ -61,7 +63,8 @@
                     "fan_mode_order_7": "Vitesse — rang 8 (la plus forte, si 8 vitesses)",
                     "exploration_probe": "Sonde d'exploration (essayer une vitesse inférieure non mesurée)",
                     "exploration_ucb": "Bonus d'exploration (avancé)",
-                    "exploration_under_load": "Mesurer les vitesses intermédiaires en charge (avancé)"
+                    "exploration_under_load": "Mesurer les vitesses intermédiaires en charge (avancé)",
+                    "thompson_sampling": "Échantillonnage de Thompson (avancé)"
                 },
                 "data_description": {
                     "deadband": "Plage : 0.0-5.0 °C. Défaut : 0.2 °C.",
@@ -72,7 +75,8 @@
                     "fixed_fan_speed": "La vitesse utilisée dans les modes à vitesse fixe ci-dessus (ex. superhigh). Obligatoire dès qu'au moins un mode à vitesse fixe est sélectionné.",
                     "exploration_probe": "Quand la pièce tient dans la bande morte, de temps en temps (au plus toutes les 6 h par vitesse), descendre d'une vitesse vers une vitesse jamais mesurée pour l'apprendre. Abandonnée dès que la pièce sort de la bande morte d'un pas de capteur. Défaut : activée.",
                     "exploration_ucb": "Près de la consigne, favoriser dans le coût les vitesses peu mesurées quand leurs trajectoires prédites sont proches de la meilleure. Défaut : désactivé.",
-                    "exploration_under_load": "Quand le contrôleur monte hors d'une reprise, s'arrêter d'abord sur la plus basse vitesse non mesurée prédite capable de progresser. Allonge la montée d'environ un temps mort. Défaut : désactivé."
+                    "exploration_under_load": "Quand le contrôleur monte hors d'une reprise, s'arrêter d'abord sur la plus basse vitesse non mesurée prédite capable de progresser. Allonge la montée d'environ un temps mort. Défaut : désactivé.",
+                    "thompson_sampling": "À chaque cycle, tirer la pente de chaque vitesse apprise selon son incertitude avant de décider, pour que les vitesses mal connues soient essayées de temps en temps. Défaut : désactivé."
                 }
             }
         },

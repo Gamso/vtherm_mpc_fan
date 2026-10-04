@@ -1055,3 +1055,19 @@ async def test_the_csv_row_carries_the_user_setpoint_and_the_regulation_offset()
     assert kwargs["user_target_temp"] == pytest.approx(24.0)
     assert kwargs["regulation_offset"] == pytest.approx(-0.6)
     assert kwargs["comfort_error"] == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_exploration_options_reach_the_controller() -> None:
+    """The probe is on by default; the other strategies only when opted in."""
+    default = await _build_manager()
+    assert default.mpc._exploration_probe is True  # noqa: SLF001
+    assert default.mpc._exploration_ucb is False  # noqa: SLF001
+    assert default.mpc._exploration_under_load is False  # noqa: SLF001
+    assert default.mpc._thompson_sampling is False  # noqa: SLF001
+
+    opted = await _build_manager(exploration_probe=False, exploration_ucb=True, exploration_under_load=True, thompson_sampling=True)
+    assert opted.mpc._exploration_probe is False  # noqa: SLF001
+    assert opted.mpc._exploration_ucb is True  # noqa: SLF001
+    assert opted.mpc._exploration_under_load is True  # noqa: SLF001
+    assert opted.mpc._thompson_sampling is True  # noqa: SLF001

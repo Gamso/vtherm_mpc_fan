@@ -6,10 +6,12 @@ from collections import deque
 from dataclasses import dataclass
 import logging
 import math
+import random
 from typing import Any
 
 from .const import (
     DEAD_TIME_MAX_FOR_GATE,
+    MIN_MODE_PROFILE_SAMPLES,
     DEAD_TIME_SAFETY_FACTOR,
     DEFAULT_DEAD_TIME,
     DEFAULT_CYCLE_MINUTES,
@@ -138,6 +140,16 @@ LEARNING_HOLD_EXTRA_MINUTES = 10.0
 # speed came straight from the two weakest ones.
 MULTI_RANK_JUMP_ERROR = 1.0  # degC
 
+# --- Cold start -------------------------------------------------------------
+# While no speed of the HVAC mode has a profile at all (neither measured nor
+# seeded), the simulation would only compare guesses. The industry's rule is
+# used instead: a step law on the comfort error, one rank per
+# STEP_LAW_ERROR_PER_RANK beyond the deadband, never down while short, one rank
+# down when past the deadband on the other side. The usual gates (min
+# interval, learning hold, escalation) still apply, and the speeds it visits
+# are what the first profiles are learned from.
+STEP_LAW_ERROR_PER_RANK = 0.3  # degC
+
 # --- Exploration strategies ---------------------------------------------------
 # The guards above keep an unmeasured speed long enough to be measured, but only
 # once the cost has chosen it -- and a cost driven by estimates seldom chooses a
@@ -161,6 +173,11 @@ PROBE_MAX_BIAS = 0.1  # degC/h
 # in-band hysteresis for one rank (0.6) between an unmeasured speed and one with
 # two hours of measurements, not more.
 INFO_BONUS = 1.0
+#
+# Thompson sampling (off by default, option thompson_sampling): each cycle every
+# learned profile's representative slope is drawn from N(value, slope_sigma^2)
+# before the ladder is made monotone, so a poorly known speed is sometimes
+# credited with what it might do and gets tried, without any explicit rule.
 #
 # S3, measurement under load (off by default, option exploration_under_load):
 # when a climb is decided outside a recovery, stop at the lowest unmeasured rung
@@ -287,8 +304,12 @@ class MPCController:
         exploration_probe: bool = True,
         exploration_ucb: bool = False,
         exploration_under_load: bool = False,
+        thompson_sampling: bool = False,
+        rng: random.Random | None = None,
     ) -> None:
         self._learning = learning
+        self._thompson_sampling = thompson_sampling
+        self._rng = rng or random.Random()
         self._exploration_probe = exploration_probe
         self._exploration_ucb = exploration_ucb
         self._exploration_under_load = exploration_under_load
@@ -613,7 +634,13 @@ class MPCController:
         # because of a speed chosen for its information, not for comfort.
         change_allowed = probe_abandoned or minutes_since_change >= effective_min_interval
         phase = self.detect_phase(minutes_since_change, gate_dead_time)
-        monotone_slopes = self.build_monotone_slopes(fan_modes, hvac_mode, error=current_error, regulation_offset=regulation_offset)
+        monotone_slopes = self.build_monotone_slopes(
+            fan_modes,
+            hvac_mode,
+            error=current_error,
+            regulation_offset=regulation_offset,
+            sample=self._thompson_sampling,
+        )
         current_mode_slope, current_known_profile = self._get_mode_slope(
             active_fan,
             hvac_mode,
@@ -627,8 +654,8 @@ class MPCController:
         # disturbance bias clean: it only captures genuine external disturbances
         # (solar gain, occupancy) instead of the systematic variation of cooling
         # power with the distance to setpoint.
-        current_mode_gain = self._learning.get_mode_slope_gain(active_fan, hvac_mode) if current_known_profile else 0.0
-        expected_slope_now = self._gap_slope(current_mode_slope, current_mode_gain, current_error)
+        current_shape = self._gap_shape(active_fan, hvac_mode, current_known_profile)
+        expected_slope_now = self._gap_slope(current_mode_slope, *current_shape, current_error)
         self._update_disturbance_bias(
             observed_effective_slope=current_effective_slope,
             expected_effective_slope=expected_slope_now,
@@ -715,7 +742,7 @@ class MPCController:
             if not known_profile and fan_mode != active_fan:
                 mode_slope = self._bound_by_current(mode_slope, fan_modes.index(fan_mode), current_index, current_mode_slope)
             mode_slopes_snapshot[fan_mode] = (mode_slope, known_profile)
-            mode_gain = self._learning.get_mode_slope_gain(fan_mode, hvac_mode) if known_profile else 0.0
+            mode_shape = self._gap_shape(fan_mode, hvac_mode, known_profile)
             sim = self._simulate_mode(
                 current_temp=current_temp,
                 target_temp=comfort_target,
@@ -723,7 +750,7 @@ class MPCController:
                 candidate_fan=fan_mode,
                 current_effective_slope=current_effective_slope,
                 candidate_mode_slope=mode_slope,
-                candidate_mode_gain=mode_gain,
+                candidate_mode_shape=mode_shape,
                 dead_time=dead_time,
                 candidate_index=fan_modes.index(fan_mode),
                 current_index=current_index,
@@ -765,6 +792,11 @@ class MPCController:
                 # MULTI_RANK_JUMP_ERROR.
                 return _skipped_unmeasured_rung(candidate_index) is None
             if current_index - candidate_index <= 1:
+                return True
+            # A partial profile (never measured as far as REFERENCE_SLOPE_ERROR)
+            # is no proof that the speed cannot sustain progress: it is treated
+            # like an unmeasured one here.
+            if self._learning.is_profile_partial(sim.fan_mode, hvac_mode):
                 return True
             raw_slope = self._learning.get_mode_effective_slope(sim.fan_mode, hvac_mode)
             return raw_slope is None or raw_slope > MIN_VIABLE_MULTI_RANK_STEPDOWN_SLOPE
@@ -831,9 +863,9 @@ class MPCController:
         ordinary_climb = change_allowed and best_index > current_index and not (escalation or overshoot or current_error > MULTI_RANK_JUMP_ERROR)
         if self._exploration_under_load and ordinary_climb:
             for rung in fan_modes[current_index + 1 : best_index]:
-                rung_slope, _ = mode_slopes_snapshot[rung]
-                rung_gain = self._learning.get_mode_slope_gain(rung, hvac_mode)
-                if self._learning.has_measured_profile(rung, hvac_mode) or self._gap_slope(rung_slope, rung_gain, current_error) + self._disturbance_bias <= 0:
+                rung_slope, rung_known = mode_slopes_snapshot[rung]
+                rung_progress = self._gap_slope(rung_slope, *self._gap_shape(rung, hvac_mode, rung_known), current_error)
+                if self._learning.has_measured_profile(rung, hvac_mode) or rung_progress + self._disturbance_bias <= 0:
                     continue
                 best = next(sim for sim in simulations if sim.fan_mode == rung)
                 exploration_note = f"Measuring {rung} under load on the way to {fan_modes[best_index]}"
@@ -851,6 +883,19 @@ class MPCController:
             exploration_note = f"Exploration probe: trying {probe}, which has no measured profile, while the room holds"
         if probe_abandoned:
             exploration_note = f"Exploration probe abandoned: {current_error:.2f}C short of the setpoint"
+
+        cold_start = known_profiles == 0 and not overshoot
+        if cold_start:
+            law_fan = self._step_law_fan(fan_modes, current_index, current_error)
+            selection_note = ""
+            exploration_note = ""
+            if law_fan != active_fan and not change_allowed and not (fan_modes.index(law_fan) > current_index and escalation):
+                selection_note = f"Min interval holds {active_fan} until a change is allowed"
+                law_fan = active_fan
+            elif law_fan != active_fan:
+                change_allowed = True
+            best = next(sim for sim in simulations if sim.fan_mode == law_fan)
+            blocked_note = ""
 
         confidence = self._compute_confidence(known_profiles, len(fan_modes), phase, worst_spread)
         would_change_now = "yes" if change_allowed and best.fan_mode != active_fan else "no"
@@ -871,6 +916,8 @@ class MPCController:
             ],
         )
         reason = f"MPC recommends {best.fan_mode}: cost={best.total_cost:.2f}, T+10={best.predicted_temp_10m:.2f}C, T+30={best.predicted_temp_30m:.2f}C"
+        if cold_start:
+            reason = f"Cold start: no profile yet, step law on the comfort error ({current_error:+.2f}C) gives {best.fan_mode}"
         if overshoot:
             reason = f"Overshoot: {-current_error:.1f}C past the setpoint without a setpoint change, lowest allowed speed | {reason}"
         if blocked_note:
@@ -903,6 +950,25 @@ class MPCController:
             known_profiles=known_profiles,
             disturbance_bias=self._disturbance_bias,
         )
+
+    def _step_law_fan(self, fan_modes: list[str], current_index: int, current_error: float) -> str:
+        """Return the speed the cold-start step law asks for (see STEP_LAW_ERROR_PER_RANK)."""
+        if current_error > self._deadband:
+            wanted = min(len(fan_modes) - 1, math.ceil((current_error - self._deadband) / STEP_LAW_ERROR_PER_RANK - 1e-9))
+            return fan_modes[max(current_index, wanted)]
+        if current_error < -self._deadband:
+            return fan_modes[max(0, current_index - 1)]
+        return fan_modes[current_index]
+
+    def _gap_shape(self, fan_mode: str, hvac_mode: str, known_profile: bool) -> tuple[float, float, float | None]:
+        """Return (gain, reference_error, error_max) of a candidate's gap model.
+
+        An unknown profile is flat: no gain, the reference error, no envelope.
+        """
+        fit = self._learning.get_mode_fit(fan_mode, hvac_mode) if known_profile else None
+        if fit is None:
+            return 0.0, REFERENCE_SLOPE_ERROR, None
+        return fit.gain, fit.reference_error, fit.error_max
 
     @staticmethod
     def gate_dead_time(dead_time: float) -> float:
@@ -1095,13 +1161,21 @@ class MPCController:
         return max(slope, bound)
 
     @staticmethod
-    def _gap_slope(reference_slope: float, gain: float, error: float) -> float:
+    def _gap_slope(
+        reference_slope: float,
+        gain: float,
+        reference_error: float,
+        error_max: float | None,
+        error: float,
+    ) -> float:
         """Return the modelled effective slope at a given comfort error.
 
-        ``reference_slope`` is the representative slope at REFERENCE_SLOPE_ERROR
-        (a + b·REF) and ``gain`` is b, so the model at ``error`` is
-        reference_slope + b·(error − REF). The error is floored at 0 (no driving
-        force at/below setpoint). The result is floored at 0 for a speed that
+        ``reference_slope`` is the representative slope at ``reference_error``
+        (a + b·e_ref, see ``ProfileFit.reference_error``) and ``gain`` is b, so
+        the model at ``error`` is reference_slope + b·(error − e_ref). The error
+        is floored at 0 (no driving force at/below setpoint) and capped at
+        ``error_max``, the largest error the profile was measured at: the line
+        is never extrapolated. The result is floored at 0 for a speed that
         moves the room toward target, so the gap term never projects active
         cooling/heating away from the setpoint -- but a *negative* reference
         slope is a speed known (learned, seeded or observed) to lose ground, and
@@ -1109,7 +1183,10 @@ class MPCController:
         silent = -0.5 degC/h look neutral and an observed -0.3 look harmless. The
         additive disturbance bias is applied separately by the caller.
         """
-        modelled = reference_slope + gain * (max(error, 0.0) - REFERENCE_SLOPE_ERROR)
+        error = max(error, 0.0)
+        if error_max is not None:
+            error = min(error, max(error_max, 0.0))
+        modelled = reference_slope + gain * (error - reference_error)
         return max(min(0.0, reference_slope), modelled)
 
     @staticmethod
@@ -1155,92 +1232,111 @@ class MPCController:
         *,
         error: float = 0.0,
         regulation_offset: float | None = None,
+        sample: bool = False,
     ) -> dict[str, float]:
         """Return monotone-enforced slopes for all known profiles.
+
+        Fan modes are assumed ordered from weakest to strongest, so learned
+        slopes must be non-decreasing along that order. Modes without a learned
+        profile are omitted — the caller falls back to a ladder estimate.
+
+        The ladder is a weighted **isotonic regression** (pool-adjacent-
+        violators) over the speed ranks, each profile weighing its effective
+        sample size (a seed weighs MIN_MODE_PROFILE_SAMPLES). Two out-of-order
+        neighbours are pooled at their weighted mean, so a 10-sample estimate
+        barely moves a 1 000-sample one, and a consistent ladder is returned
+        untouched.
+
+        Pooled speeds -- and any two learned at exactly the same slope -- would
+        then be thermally indistinguishable, and the energy term would always
+        pick the weaker one, which starves the stronger of the samples it needs
+        (F11). Inside such a block the heaviest profile keeps the block value
+        and the others are **separated** one LADDER_CAPACITY_RATIO step per rank
+        (respaced evenly when that would pass halfway to a neighbouring block).
 
         With a ``regulation_offset`` (raw, regulated minus user setpoint), each
         profile's value includes its fitted offset correction at that offset and
         comfort ``error`` -- zero unless the profile identified one (see
-        ``ThermalLearning.get_mode_offset_correction``).
-
-        Fan modes are assumed ordered from weakest to strongest, so learned
-        slopes must be non-decreasing along that order. Modes without a learned
-        profile are omitted — the caller falls back to rank-scaled estimation.
-
-        Profiles are placed **best-sampled first**, each one clipped into the
-        window left by those already placed. So the most trusted estimate is
-        never overwritten, and a noisy estimate from a rarely-used speed cannot
-        propagate into the profiles that have the most data behind them — which
-        a plain forward ``max()`` pass does, since it always resolves upward
-        (a 10-sample ``med`` reading +1.6 would drag a 1656-sample ``superhigh``
-        from +0.9 up to +1.6).
-
-        A profile whose own estimate falls outside that window is discarded and
-        **synthesised one ladder step from the neighbour that constrained it**
-        (see LADDER_CAPACITY_RATIO) rather than pinned onto it: two speeds
-        sharing an identical slope are thermally indistinguishable to the MPC,
-        so the energy term alone would arbitrate — always picking the weaker
-        rank, which then starves the stronger one of the samples it needs to
-        ever be trusted.
-
-        Placement is a single pass in trust order, so the result is monotone by
-        construction with no iteration to converge. A ladder that is already
-        consistent is returned untouched, whatever its own spacing: the ratio
-        only ever synthesises a replacement, it is never imposed as a minimum
-        gap between measured values.
+        ``ThermalLearning.get_mode_offset_correction``). With ``sample`` (Thompson
+        sampling), each value is first drawn from N(value, slope_sigma^2).
         """
-        measured = {
-            fm: slope + self._learning.get_mode_offset_correction(fm, hvac_mode, error, regulation_offset)
-            for fm in fan_modes
-            if (slope := self._learning.get_mode_effective_slope(fm, hvac_mode)) is not None
-        }
-        if not measured:
+        values: list[float] = []
+        weights: list[float] = []
+        ranked: list[str] = []
+        for fm in fan_modes:
+            fit = self._learning.get_mode_fit(fm, hvac_mode)
+            if fit is None:
+                continue
+            value = fit.intercept + fit.gain * fit.reference_error
+            value += self._learning.get_mode_offset_correction(fm, hvac_mode, error, regulation_offset)
+            if sample and fit.slope_sigma:
+                value += self._rng.gauss(0.0, fit.slope_sigma)
+            ranked.append(fm)
+            values.append(value)
+            weights.append(max(fit.effective_samples or float(MIN_MODE_PROFILE_SAMPLES), 1e-3))
+        if not ranked:
             return {}
 
-        rank = {fm: index for index, fm in enumerate(fan_modes)}
-        counts = {fm: self._learning.get_mode_sample_count(fm, hvac_mode) for fm in measured}
+        # Weighted pool-adjacent-violators: blocks of [start, end, value, weight].
+        blocks: list[list[float]] = []
+        for index, (value, weight) in enumerate(zip(values, weights)):
+            blocks.append([index, index, value, weight])
+            while len(blocks) > 1 and blocks[-2][2] >= blocks[-1][2] - 1e-12:
+                right = blocks.pop()
+                left = blocks[-1]
+                total = left[3] + right[3]
+                left[2] = (left[2] * left[3] + right[2] * right[3]) / total
+                left[1] = right[1]
+                left[3] = total
 
-        # Place profiles best-sampled first, so every later profile is constrained
-        # by evidence at least as strong as its own and the most trusted estimate
-        # is never overwritten. On an equal sample count the stronger rank is
-        # placed first, which makes a tied violation resolve by weakening the
-        # lower speed rather than strengthening the higher one.
-        placement_order = sorted(measured, key=lambda fm: (counts[fm], rank[fm]), reverse=True)
+        enforced_values = [0.0] * len(ranked)
+        for block_index, (first, last, block_value, _) in enumerate(blocks):
+            first, last = int(first), int(last)
+            # Each block may spread up to halfway to its neighbours' values, so
+            # two adjacent blocks' separated members can never interleave.
+            lower_bound = (blocks[block_index - 1][2] + block_value) / 2 if block_index > 0 else float("-inf")
+            upper_bound = (blocks[block_index + 1][2] + block_value) / 2 if block_index + 1 < len(blocks) else float("inf")
+            members = list(range(first, last + 1))
+            anchor = max(members, key=lambda i: (weights[i], i))
+            enforced_values[anchor] = block_value
+            below = [i for i in members if i < anchor][::-1]
+            above = [i for i in members if i > anchor]
+            self._separate(enforced_values, below, block_value, lower_bound, weaker=True)
+            self._separate(enforced_values, above, block_value, upper_bound, weaker=False)
 
-        placed: dict[str, float] = {}
-        for fm in placement_order:
-            below = [v for f, v in placed.items() if rank[f] < rank[fm]]
-            above = [v for f, v in placed.items() if rank[f] > rank[fm]]
-            floor = max(below, default=float("-inf"))
-            ceiling = min(above, default=float("inf"))
-
-            value = measured[fm]
-            if value > ceiling:
-                # Own estimate claims more capacity than an already-placed stronger
-                # speed. Discard it and synthesise one ladder step below that speed
-                # rather than pinning it onto the ceiling: identical slopes are
-                # thermally indistinguishable to the MPC, so the energy term alone
-                # would arbitrate and would always pick the weaker rank.
-                value = self._one_rank_weaker(ceiling)
-            elif value < floor:
-                value = self._one_rank_stronger(floor)
-            # A synthesised value can overshoot the opposite bound when the two
-            # placed neighbours sit close together; the window wins, since ordering
-            # is the invariant the rest of the MPC depends on and separation is
-            # only a preference. Collapses to a bound only when there is genuinely
-            # no room left between the neighbours.
-            placed[fm] = min(max(value, floor), ceiling)
-
-        enforced = {fm: placed[fm] for fm in fan_modes if fm in placed}
-        if enforced != measured:
+        enforced = dict(zip(ranked, enforced_values))
+        measured = dict(zip(ranked, values))
+        if any(abs(enforced[fm] - measured[fm]) > 1e-9 for fm in ranked):
             _LOGGER.debug(
-                "Slope ordering enforced for %s: %s -> %s (samples: %s)",
+                "Slope ordering enforced for %s: %s -> %s (weights: %s)",
                 hvac_mode,
                 {fm: round(v, 3) for fm, v in measured.items()},
                 {fm: round(v, 3) for fm, v in enforced.items()},
-                counts,
+                {fm: round(w, 1) for fm, w in zip(ranked, weights)},
             )
         return enforced
+
+    def _separate(self, out: list[float], members: list[int], start: float, bound: float, *, weaker: bool) -> None:
+        """Place *members* (ordered away from the anchor) one ladder step apart from *start*.
+
+        Steps go down (``weaker``) or up from ``start``. When the steps would
+        reach ``bound`` (halfway to the neighbouring block's value), the members
+        are respaced evenly between ``start`` and ``bound`` instead, so the
+        ladder stays strictly ordered.
+        """
+        if not members:
+            return
+        stepped = []
+        value = start
+        for _ in members:
+            value = self._one_rank_weaker(value) if weaker else self._one_rank_stronger(value)
+            stepped.append(value)
+        crosses = stepped[-1] <= bound if weaker else stepped[-1] >= bound
+        if crosses and math.isfinite(bound):
+            gap = bound - start
+            stepped = [start + gap * (k + 1) / (len(members) + 1) for k in range(len(members))]
+        for index, value in zip(members, stepped):
+            out[index] = value
 
     def _update_disturbance_bias(
         self,
@@ -1299,7 +1395,7 @@ class MPCController:
         candidate_fan: str,
         current_effective_slope: float,
         candidate_mode_slope: float,
-        candidate_mode_gain: float = 0.0,
+        candidate_mode_shape: tuple[float, float, float | None] = (0.0, REFERENCE_SLOPE_ERROR, None),
         dead_time: float,
         candidate_index: int,
         current_index: int,
@@ -1309,9 +1405,9 @@ class MPCController:
         """Simulate one fan mode over the prediction horizon.
 
         The candidate's effective slope is gap-dependent: at each step it is
-        recomputed from the simulated comfort error as
-        ``candidate_mode_slope + candidate_mode_gain·(error − REFERENCE_SLOPE_ERROR)``
-        (floored at 0), plus the disturbance bias. This makes the projection
+        recomputed from the simulated comfort error by ``_gap_slope`` with the
+        candidate's ``(gain, reference_error, error_max)`` shape, plus the
+        disturbance bias. This makes the projection
         decelerate realistically as the room approaches the setpoint instead of
         cooling/heating at a constant rate, eliminating the phantom overshoot that a
         constant-slope model produces past the target.
@@ -1344,7 +1440,7 @@ class MPCController:
                 target_effective_slope = current_effective_slope
             else:
                 step_error = self._temperature_error(sim_temp, target_temp, hvac_mode)
-                target_effective_slope = self._gap_slope(candidate_mode_slope, candidate_mode_gain, step_error) + self._disturbance_bias
+                target_effective_slope = self._gap_slope(candidate_mode_slope, *candidate_mode_shape, step_error) + self._disturbance_bias
 
             thermal_power += THERMAL_POWER_BLEND * (target_effective_slope - thermal_power)
             raw_slope = -thermal_power if hvac_mode == "cool" else thermal_power
