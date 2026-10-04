@@ -11,7 +11,6 @@ to the same underlying call the service makes.
 
 from __future__ import annotations
 
-import logging
 from typing import Any, Awaitable, Callable
 
 from homeassistant.components.number import NumberEntity, NumberMode
@@ -22,6 +21,7 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import slugify
 
+from .log import get_logger
 from .const import (
     CONF_TARGET_VTHERM,
     DEVICE_NAME,
@@ -38,7 +38,7 @@ from .registry import add_entities_registry, entity_bucket, get_manager
 
 PLATFORM_NUMBER = "number"
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_logger(__name__)
 
 # Matches the bounds the set_effective_slope service already exposes, so a
 # value set through either path means the same thing.

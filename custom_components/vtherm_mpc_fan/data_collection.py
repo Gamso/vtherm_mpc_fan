@@ -25,13 +25,13 @@ ever appended, so scripts that index the historical ones keep working.
 
 import asyncio
 import csv
-import logging
 import os
 from datetime import datetime, timezone
 
 from homeassistant.core import HomeAssistant
+from .log import get_logger
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_logger(__name__)
 
 # Header used when creating a new file. Keep in sync with async_record() below.
 _HEADER = [

@@ -13,7 +13,6 @@ Assistant objects.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import logging
 import time
 from typing import Any, TYPE_CHECKING
 
@@ -22,6 +21,7 @@ from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
+from .log import get_logger, write_event_log
 from .const import (
     CONF_DATA_COLLECTION,
     CONF_DEADBAND,
@@ -72,7 +72,7 @@ from .thermal_learning import ThermalLearning
 if TYPE_CHECKING:
     from vtherm_api.interfaces import InterfaceThermostatRuntime
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_logger(__name__)
 
 ATTR_MPC_FAN_SECTION = "mpc_fan"
 
@@ -587,17 +587,14 @@ class MpcFanFeatureManager:
 
         if now >= force.until:
             self.force = None
-            _LOGGER.info("Force fan expired for %s; resuming MPC control", self._name)
+            write_event_log(_LOGGER, self, "force_fan override expired, resuming MPC control")
             return None
 
         fan_modes = self.fan_modes
         if fan_modes and force.fan_mode not in fan_modes:
             self.force = None
-            _LOGGER.warning(
-                "Forced fan '%s' is no longer valid for %s; cancelling override",
-                force.fan_mode,
-                self._name,
-            )
+            _LOGGER.warning("%s - forced fan '%s' is no longer offered; cancelling override", self, force.fan_mode)
+            write_event_log(_LOGGER, self, f"force_fan override on '{force.fan_mode}' cancelled: speed no longer offered")
             return None
 
         return force.fan_mode, force.until
@@ -812,7 +809,7 @@ class MpcFanFeatureManager:
         if self._is_external_fan_change(current_fan):
             _LOGGER.info(
                 "%s - fan mode changed to '%s' outside this plugin; restarting the dead time",
-                self._name,
+                self,
                 current_fan,
             )
             self._register_fan_change(now, current_temp, self._change_direction(self._last_observed_fan, current_fan))
@@ -970,12 +967,7 @@ class MpcFanFeatureManager:
             return False
 
         if effective_fan is not None and effective_fan != current_fan:
-            _LOGGER.info(
-                "%s - setting underlying fan mode to '%s' (%s)",
-                self._name,
-                effective_fan,
-                effective_reason,
-            )
+            write_event_log(_LOGGER, self, f"fan mode {current_fan} -> {effective_fan} ({effective_reason})")
             await self._vtherm.async_set_underlying_fan_mode(effective_fan)
             self._last_sent_fan_mode = effective_fan
             self._register_fan_change(time.time(), current_temp, self._change_direction(current_fan, effective_fan))
@@ -999,7 +991,7 @@ class MpcFanFeatureManager:
         if available and fixed_speed not in available:
             _LOGGER.debug(
                 "%s - fixed fan '%s' is not offered by the underlying; ignoring pin",
-                self._name,
+                self,
                 fixed_speed,
             )
             return None

@@ -10,7 +10,6 @@ The control cycle lives in :mod:`manager`, the decision logic in
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from typing import Any
 
@@ -21,6 +20,7 @@ from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 
+from .log import get_logger, write_event_log
 from .const import (
     CONF_TARGET_VTHERM,
     CONF_THERMOSTAT_CLIMATE,
@@ -35,7 +35,7 @@ from .factory import MpcFanManagerFactory
 from .manager import FanOverride
 from .registry import clear_registry, domain_data, managers
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_logger(__name__)
 
 PLATFORMS = [Platform.SENSOR, Platform.NUMBER]
 
@@ -182,7 +182,7 @@ def _register_services(hass: HomeAssistant) -> None:
 
         if duration_minutes <= 0:
             manager.force = None
-            _LOGGER.info("Force fan cancelled for %s; resuming MPC control", manager.vtherm_name)
+            write_event_log(_LOGGER, manager, "force_fan override cancelled, resuming MPC control")
         else:
             available = manager.fan_modes or []
             if available and fan_mode not in available:
@@ -191,12 +191,7 @@ def _register_services(hass: HomeAssistant) -> None:
                 fan_mode=fan_mode,
                 until=time.time() + duration_minutes * 60.0,
             )
-            _LOGGER.info(
-                "Forcing fan '%s' for %s for %.0f min",
-                fan_mode,
-                manager.vtherm_name,
-                duration_minutes,
-            )
+            write_event_log(_LOGGER, manager, f"force_fan override: '{fan_mode}' for {duration_minutes:.0f} min")
 
         # Apply now rather than waiting for the next VTherm cycle.
         await manager.refresh_state()

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
+from .log import get_logger
 from .const import (
     CONF_TARGET_VTHERM,
     CONF_THERMOSTAT_CLIMATE,
@@ -21,7 +21,7 @@ if TYPE_CHECKING:
         InterfaceThermostatRuntime,
     )
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_logger(__name__)
 
 
 class MpcFanManagerFactory:

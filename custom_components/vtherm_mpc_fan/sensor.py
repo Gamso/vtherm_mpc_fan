@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.config_entries import ConfigEntry
@@ -11,6 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .log import get_logger
 from .const import (
     CONF_TARGET_VTHERM,
     DEVICE_NAME,
@@ -23,7 +23,7 @@ from .registry import add_entities_registry, entity_bucket, get_manager
 
 PLATFORM_SENSOR = "sensor"
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_logger(__name__)
 
 
 class _SmartFanEntity(SensorEntity):

@@ -1071,3 +1071,18 @@ async def test_exploration_options_reach_the_controller() -> None:
     assert opted.mpc._exploration_ucb is True  # noqa: SLF001
     assert opted.mpc._exploration_under_load is True  # noqa: SLF001
     assert opted.mpc._thompson_sampling is True  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_every_fan_change_is_an_event_line_in_the_vtherm_log(caplog) -> None:
+    """A command is logged as a NEW EVENT line prefixed with the manager, like the core's events."""
+    import logging
+
+    runtime = _make_runtime()
+    manager = await _build_manager(runtime)
+
+    with caplog.at_level(logging.INFO, logger="custom_components.vtherm_mpc_fan"):
+        changed = await manager.refresh_state()
+
+    assert changed is True
+    assert "MpcFanManager-Living room - ---------------------> NEW EVENT: fan mode low -> " in caplog.text

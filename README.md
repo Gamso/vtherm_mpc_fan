@@ -492,6 +492,7 @@ Versatile Thermostat's configuration form proposes an auto-fan mode by default, 
 | **Fan not changing at all, no error** | Another plugin may already be driving this fan — check the VTherm's `mpc_fan.conflicting_plugin` attribute. See [Coexisting with other fan plugins](#coexisting-with-other-fan-plugins). |
 | **Too many fan changes**        | Increase `deadband` or `min_interval`.                                                                                                       |
 | **Temperature overshoots**      | Decrease `deadband`. Verify Versatile Thermostat is providing an accurate slope.                                                                |
+| **Where are the plugin's logs?** | They go through Versatile Thermostat's logger, so they appear in VTherm's own log export, filtered per thermostat. Each fan command and each `force_fan` override is a `NEW EVENT` line prefixed with `MpcFanManager-<thermostat name>`. |
 | **Learning not progressing**    | Verify the HVAC is running and no window is open. Check whether `cycle_min` on the VTherm is unusually long.                                   |
 | **A weak fan speed's learned slope looks wrong** | Check its `measured_minutes` and `effective_samples` before trusting the value — under 90 minutes of measured regime it isn't a measured profile. See [Per-Mode Fan Profiles](#per-mode-fan-profiles). |
 

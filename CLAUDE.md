@@ -18,6 +18,7 @@ integration lives under `custom_components/vtherm_mpc_fan/`. Key modules:
 | `config_flow.py` | Config and options UI flows |
 | `sensor.py` / `number.py` | HA entity platforms (diagnostics as sensors, editable per-profile effective slopes as numbers) |
 | `data_collection.py` | CSV logger for offline analysis (`vtherm_mpc_fan_data_*.csv` in the HA config dir) |
+| `log.py` | `get_logger()` / `write_event_log()`: `vtherm_api`'s `VThermLogger` and "NEW EVENT" line (plain `logging` fallback), so the plugin's records reach VTherm's log export. Every HA-side module logs through it; `mpc_controller.py` and `thermal_learning.py` stay on plain `logging` (importable without HA or `vtherm_api`) |
 
 ## Domain Vocabulary
 
