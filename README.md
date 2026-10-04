@@ -19,6 +19,8 @@ A Model Predictive Control (MPC) fan-speed controller for [Versatile Thermostat]
   - [Configuration Parameters](#configuration-parameters)
   - [One control cycle](#one-control-cycle)
   - [MPC Controller](#mpc-controller)
+    - [Which setpoint](#which-setpoint)
+    - [Setpoint drop and overshoot](#setpoint-drop-and-overshoot)
     - [Cost Function](#cost-function)
     - [Hysteresis and Guards](#hysteresis-and-guards)
     - [Phase Detection](#phase-detection)
@@ -190,6 +192,15 @@ This ensures that every candidate fan speed is simulated for a full 30-minute wi
 
 See [docs/mpc_mode.md](docs/mpc_mode.md) for the full technical design.
 
+### Which setpoint
+
+VTherm's auto-regulation shifts the user's setpoint (`target_temperature`) into a *regulated* one (`regulated_target_temperature`), the value actually sent to the unit. The MPC judges comfort — its cost, the deadband, the escalation and learning holds, the setpoint drop — against **the user's setpoint**: the regulated one drifts with the regulation (on the production trace it sat 0.6 °C below the user's in median while the strongest speed ran), and regulating the fan on it chased that drift. The difference, `regulation_offset` (regulated − user), is kept as a measurement: it is stored with every learning sample and may enter the learned model (see [Per-Mode Fan Profiles](#per-mode-fan-profiles)).
+
+### Setpoint drop and overshoot
+
+- **Setpoint drop**: the user moved the setpoint away by at least 1 °C between two cycles (lower in heat, higher in cool) and the room is now more than 1 °C past it. The MPC goes straight to the lowest speed, and slope learning pauses for 30 minutes. The status lasts until the room is back within 1 °C, or the setpoint is raised again.
+- **Overshoot**: the room is more than 1 °C past the setpoint *without* any setpoint change. The MPC selects the lowest speed the guards allow (min interval, step-down guard), and learning goes on — nothing about the room's response is abnormal.
+
 ### Cost Function
 
 Each candidate fan mode is scored with:
@@ -300,14 +311,15 @@ Profiles require at least 10 samples per mode to be considered reliable, and at 
 
 Samples are filtered out when:
 - A window is open, or the compressor is idle, or defrost is active (see the detection sections above)
-- A large setpoint drop occurred (night mode) — including a **30-minute cooldown** after the drop
+- The user dropped the setpoint (status `Setpoint drop`, night mode) — including a **30-minute cooldown** after the drop. A room past an unchanged setpoint (`Overshoot`) is still learned
+- The comfort error is below −1 °C
 - The fan mode hasn't been active long enough (**1.5× dead time**, the `ESTABLISHED` phase) for the room's response to fully reflect the current mode
 - The phase is not yet `ESTABLISHED`
 - The reading duplicates the last one accepted for that fan mode — see [Duplicate-Reading Filtering](#duplicate-reading-filtering)
 
 A near-zero slope is **not** filtered out: a speed that holds the room at the setpoint produces exactly that, and it is the measurement of the profile's intercept. (An earlier 0.15 °C/h stagnation cut censored the bottom of the distribution, which both over-estimated the weak speeds and starved the intermediate ones of the few samples they get.)
 
-The effective slope is gap-dependent: each profile fits `slope(error) = a + b × error` by least squares over its measured samples (the gain `b` clamped to be non-negative), and the reported value is that line evaluated at a representative comfort error. Profiles without enough measured samples carrying an error, or whose samples all sit at the same error, fall back to the **median** slope. While a hand-set profile has fewer than 10 measured samples, the seeded and measured medians are weighted by their counts, so every measurement visibly pulls the value instead of hiding behind the seeded one.
+The effective slope is gap-dependent: each profile fits `slope(error) = a + b × error` by least squares over its measured samples (the gain `b` clamped to be non-negative), and the reported value is that line evaluated at a representative comfort error. The error is the comfort error against the user's setpoint. Samples recorded by earlier versions measured it against the regulated setpoint and cannot be corrected (the offset was not stored): they are kept, so an upgrade loses no profile, but weigh a quarter of a current sample and age out with the 7-day window and the per-profile retention (`legacy_samples` in the profile attributes). When the regulation offset varied enough over a profile's samples (standard deviation ≥ 0.1 °C beyond what the error explains, ≥ 10 samples), a second, shrunk term models it — the offset is a proxy for how hard the inverter compressor is driven. Profiles without enough measured samples carrying an error, or whose samples all sit at the same error, fall back to the **median** slope. While a hand-set profile has fewer than 10 measured samples, the seeded and measured medians are weighted by their counts, so every measurement visibly pulls the value instead of hiding behind the seeded one.
 
 When two fan speeds' learned slopes are out of order (e.g. a rarely-used speed's small sample happens to read stronger than a well-sampled one above it), the better-sampled profile is trusted: the rejected estimate is not clamped onto its neighbour (which would make the two speeds thermally indistinguishable to the cost function) but re-synthesized one ladder step away from it, calibrated on the spacing of the profiles that *are* well sampled.
 
@@ -352,11 +364,12 @@ Point-in-time values with no history or automation use are not separate entities
 
 | Key                     | Description                                                                                       |
 | ----------------------- | --------------------------------------------------------------------------------------------------- |
-| `mpc_status`            | `Ready`, `Low confidence`, `Setpoint drop` (MPC steering); `Disturbed`, `Idle`, `Unavailable` (paused); `Fixed` (pinned speed), `Forced` (`force_fan`) |
+| `mpc_status`            | `Ready`, `Low confidence`, `Setpoint drop`, `Overshoot` (MPC steering); `Disturbed`, `Idle`, `Unavailable` (paused); `Fixed` (pinned speed), `Forced` (`force_fan`) |
 | `mpc_reason`            | Explanation of the current decision                                                               |
 | `mpc_fan_mode`          | Fan mode chosen (by the MPC, the pin or the override)                                             |
 | `mpc_would_change_now`  | Whether the fan is being changed right now                                                        |
 | `mpc_cost`, `mpc_confidence`, `mpc_predicted_temperature_10m`, `mpc_predicted_temperature_30m`, `mpc_dead_time`, `mpc_known_profiles`, `mpc_disturbance_bias` | Details of the last MPC evaluation |
+| `mpc_comfort_error`, `mpc_regulation_offset` | Error against the user's setpoint (positive = needs more heating/cooling), and VTherm's regulated setpoint minus the user's |
 | `fan_mode_order`        | Fan speed ladder in use, weakest first                                                            |
 | `sent_fan_mode`         | Last fan mode this plugin sent                                                                    |
 | `learning_ready`        | Whether global learning readiness has been reached                                                |

@@ -330,3 +330,72 @@ def test_storage_cap_keeps_rare_profile_samples() -> None:
 
     assert sum(1 for s in data["slope_samples"] if s[1] == "high") == 12
     assert len(data["slope_samples"]) <= tl_module.MAX_STORED_SLOPE_SAMPLES + len(rare)
+
+
+# --- Format 2: comfort error on the user's setpoint, regulation offset -----
+def test_legacy_samples_are_kept_but_weigh_less() -> None:
+    """Pre-format-2 samples (error vs the regulated setpoint) survive, at a reduced weight.
+
+    Twelve legacy samples say 0.9, twelve current ones 0.3, at the same errors:
+    a plain mean would sit at 0.6; at weight 0.25 the fit sits at 0.42.
+    """
+    import time
+
+    from custom_components.vtherm_mpc_fan.thermal_learning import LEGACY_SAMPLE_WEIGHT
+
+    now = time.time()
+    legacy = [(now - 100 - i, "high", 0.9, "heat", 0.5 + 0.1 * (i % 4)) for i in range(12)]
+    restored = ThermalLearning.from_dict({"slope_samples": legacy, "response_events": []})
+    assert restored.get_mode_effective_slope("high", "heat") == pytest.approx(0.9)
+    assert restored.get_mode_profiles("heat", ["high"])["high"]["legacy_samples"] == 12
+
+    for i in range(12):
+        restored.add_slope_sample("high", 0.3, 0.5 + 0.1 * (i % 4), hvac_mode="heat", regulation_offset=0.0)
+
+    expected = (12 * LEGACY_SAMPLE_WEIGHT * 0.9 + 12 * 0.3) / (12 * LEGACY_SAMPLE_WEIGHT + 12)
+    assert restored.get_mode_effective_slope("high", "heat") == pytest.approx(expected, abs=1e-6)
+
+
+def test_store_round_trip_keeps_the_format_and_legacy_marking() -> None:
+    """to_dict writes the format marker; legacy 5-tuples stay legacy, offsets are kept."""
+    import time
+
+    learning = ThermalLearning.from_dict({"slope_samples": [(time.time(), "low", 0.2, "cool", 0.1)], "response_events": []})
+    learning.add_slope_sample("low", -0.2, 0.1, hvac_mode="cool", regulation_offset=-0.4)
+
+    data = learning.to_dict()
+    restored = ThermalLearning.from_dict(data)
+
+    assert data["format"] == 2
+    assert [len(s) for s in restored.slope_samples] == [5, 6]
+    assert restored.slope_samples[1][5] == pytest.approx(-0.4)
+
+
+def test_the_regulation_offset_enters_the_fit_when_it_varies() -> None:
+    """With a well-spread offset the fit learns how much more a harder-pushed unit cools.
+
+    Cool: slope = 0.5 + 0.3 * error + 0.8 * demand, demand = -offset (regulated
+    below the user's setpoint pushes harder). The error is held constant so the
+    offset is the only thing explaining the spread.
+    """
+    learning = ThermalLearning()
+    for i in range(40):
+        demand = (i % 5) * 0.2
+        learning.add_slope_sample("high", -(0.5 + 0.3 * 0.4 + 0.8 * demand), 0.4, hvac_mode="cool", regulation_offset=-demand)
+
+    profile = learning.get_mode_profiles("cool", ["high"])["high"]
+    # 40 samples, demand variance 0.08 -> sum of squares 3.2, shrunk by 10 x 0.2^2.
+    assert profile["offset_gain"] == pytest.approx(0.8 * 3.2 / (3.2 + 0.4), rel=0.01)
+    # At the usual offset the correction is nil, an unusually hard push adds slope.
+    assert learning.get_mode_offset_correction("high", "cool", 0.4, -0.4) == pytest.approx(0.0, abs=1e-6)
+    assert learning.get_mode_offset_correction("high", "cool", 0.4, -0.8) > 0.1
+
+
+def test_a_steady_regulation_offset_is_ignored() -> None:
+    """An offset that never varies cannot be told apart from the intercept: no term."""
+    learning = ThermalLearning()
+    for err in [0.2, 0.4, 0.6, 0.8] * 5:
+        learning.add_slope_sample("high", -(0.5 + 0.3 * err), err, hvac_mode="cool", regulation_offset=-0.6)
+
+    assert learning.get_mode_profiles("cool", ["high"])["high"]["offset_gain"] == 0.0
+    assert learning.get_mode_offset_correction("high", "cool", 0.4, -1.5) == 0.0

@@ -99,6 +99,8 @@ class Row:
     mpc_status: str
     phase: str
     dead_time: float
+    user_target_temp: float | None = None
+    regulation_offset: float | None = None
 
 
 @dataclass
@@ -190,6 +192,8 @@ def load_csv(path: str) -> list[Row]:
                         mpc_status=r.get("mpc_status", ""),
                         phase=r.get("phase", ""),
                         dead_time=float(r["dead_time"]) if r.get("dead_time") else 10.0,
+                        user_target_temp=float(r["user_target_temp"]) if r.get("user_target_temp") else None,
+                        regulation_offset=float(r["regulation_offset"]) if r.get("regulation_offset") else None,
                     )
                 )
             except (ValueError, KeyError) as exc:
@@ -212,16 +216,20 @@ def build_learning(rows: list[Row]) -> ThermalLearning:
             continue
         if not row.current_fan:
             continue
+        # The comfort error is taken against the user's setpoint when the trace
+        # has it (CSV from this version on), like the live learner does.
+        comfort_target = row.user_target_temp if row.user_target_temp is not None else row.target_temp
         error = (
-            row.current_temp - row.target_temp
+            row.current_temp - comfort_target
             if row.hvac_mode == "cool"
-            else row.target_temp - row.current_temp
+            else comfort_target - row.current_temp
         )
         learning.add_slope_sample(
             fan_mode=row.current_fan,
             slope=row.vtherm_slope,
             temperature_error=error,
             hvac_mode=row.hvac_mode,
+            regulation_offset=row.regulation_offset,
         )
     return learning
 
@@ -471,6 +479,7 @@ def replay(
                 is_defrost_active=row.defrost_active,
                 is_hvac_idle=row.hvac_idle,
                 minutes_since_change=sim_minutes,
+                user_target_temp=row.user_target_temp,
             )
             rec_fan = payload.get("mpc_fan_mode") or sim_fan
             would_change = payload.get("mpc_would_change_now", "no")

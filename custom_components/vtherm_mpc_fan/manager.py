@@ -47,7 +47,6 @@ from .const import (
     STORAGE_KEY,
     STORAGE_VERSION,
     THRESHOLD_SLOPE,
-    THRESHOLD_TARGET_DROP,
 )
 from .data_collection import DataCollector
 from .mpc_controller import MPCController
@@ -807,14 +806,13 @@ class MpcFanFeatureManager:
             self._previous_slope = vtherm_slope
         slope_change = abs(vtherm_slope - self._previous_slope) > THRESHOLD_SLOPE
 
-        # Signed comfort error (positive = needs more heating/cooling).
+        # Signed error against the regulated setpoint (positive = needs more
+        # heating/cooling): the historical CSV column. Comfort -- and learning --
+        # use the error against the user's setpoint, the one the MPC regulates on.
         current_error = (current_temp - target_temp) if hvac_mode == "cool" else (target_temp - current_temp)
-        # Only a regulated mode has an error direction. Read in dry or fan_only
-        # with the heating convention, a warm summer room (27 C for a 24 C
-        # setpoint) looked like a large setpoint drop on every cycle and blocked
-        # learning for 30 min after switching to cool.
-        if hvac_mode in PROFILE_HVAC_MODES and current_error < THRESHOLD_TARGET_DROP:
-            self._last_setpoint_drop_time = now
+        learning_error = comfort_error(current_temp, inputs.user_target_temp, hvac_mode)
+        if learning_error is None:
+            learning_error = current_error
 
         decision = self._mpc.evaluate(
             current_temp=current_temp,
@@ -826,7 +824,13 @@ class MpcFanFeatureManager:
             is_defrost_active=is_defrost_active,
             is_hvac_idle=is_hvac_idle,
             minutes_since_change=minutes_since_change,
+            user_target_temp=inputs.user_target_temp,
         )
+        # The learning cooldown follows a genuine setpoint drop only -- the
+        # MPC's own status, which tracks the user's setpoint from cycle to cycle.
+        # A room merely past the setpoint (status Overshoot) is still learnable.
+        if decision.get("mpc_status") == "Setpoint drop":
+            self._last_setpoint_drop_time = now
 
         active_force = self._resolve_active_force(now)
         fixed_fan = self._resolve_fixed_fan(hvac_mode)
@@ -891,7 +895,14 @@ class MpcFanFeatureManager:
         ) and not self._is_duplicate_slope(
             current_fan, hvac_mode, vtherm_slope
         ):  # type: ignore[arg-type]
-            self._learning.add_slope_sample(current_fan, vtherm_slope, current_error, hvac_mode, is_window_open)  # type: ignore[arg-type]
+            self._learning.add_slope_sample(
+                current_fan,  # type: ignore[arg-type]
+                vtherm_slope,
+                learning_error,
+                hvac_mode,
+                is_window_open,
+                regulation_offset=inputs.regulation_offset,
+            )
 
         if hvac_mode not in PROFILE_HVAC_MODES:
             # Dead time is the heating/cooling lag. In dry or fan_only the slope

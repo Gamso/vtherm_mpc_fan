@@ -914,13 +914,44 @@ async def test_unregulated_modes_never_start_the_setpoint_drop_cooldown(hvac_mod
 
 @pytest.mark.asyncio
 async def test_a_real_setpoint_drop_in_heat_still_starts_the_cooldown() -> None:
-    """The guard only narrows the trigger to regulated modes; heat keeps it."""
-    runtime = _make_runtime(vtherm_hvac_mode="heat", current_temperature=27.0, regulated_target_temperature=24.0)
+    """The user lowering the heating setpoint by 2 degC starts the learning cooldown."""
+    runtime = _make_runtime(vtherm_hvac_mode="heat", current_temperature=24.0, target_temperature=24.0, regulated_target_temperature=24.0)
+    manager = await _build_manager(runtime)
+    await manager.refresh_state()
+    assert manager._last_setpoint_drop_time == 0.0  # noqa: SLF001
+
+    runtime.target_temperature = 22.0
+    runtime.regulated_target_temperature = 22.0
+    await manager.refresh_state()
+
+    assert manager.last_decision["mpc_status"] == "Setpoint drop"
+    assert manager._last_setpoint_drop_time > 0.0  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_an_overshoot_without_a_setpoint_change_starts_no_cooldown() -> None:
+    """A room 1.5 degC past an unchanged setpoint is learnable: no 30-minute cooldown."""
+    runtime = _make_runtime(vtherm_hvac_mode="cool", current_temperature=22.5, target_temperature=24.0, regulated_target_temperature=23.2)
     manager = await _build_manager(runtime)
 
     await manager.refresh_state()
+    await manager.refresh_state()
 
-    assert manager._last_setpoint_drop_time > 0.0  # noqa: SLF001
+    assert manager.last_decision["mpc_status"] == "Overshoot"
+    assert manager._last_setpoint_drop_time == 0.0  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_learning_samples_carry_the_comfort_error_and_the_offset() -> None:
+    """Samples are taken against the user's setpoint and keep the regulation offset."""
+    runtime = _make_runtime(vtherm_hvac_mode="cool", current_temperature=24.3, target_temperature=24.0, regulated_target_temperature=23.4)
+    manager = await _build_manager(runtime, hass=_hass_with_auto_fan("vtherm-uid"))
+
+    await manager.refresh_state()
+
+    sample = manager.learning.slope_samples[-1]
+    assert sample[4] == pytest.approx(0.3)
+    assert sample[5] == pytest.approx(-0.6)
 
 
 @pytest.mark.asyncio

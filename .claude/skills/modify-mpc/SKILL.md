@@ -28,7 +28,7 @@ Unlike classic MPC, the model parameters (slopes) are **learned online** by `The
 
 The MPC controller lives in `mpc_controller.py` as `MPCController`. This project is a **VTherm Feature Manager plugin**: it has no control loop of its own. `manager.py`'s `MpcFanFeatureManager.refresh_state()` is called by VTherm once per its own control cycle, and calls `mpc_controller.evaluate()` to get a decision dict that feeds sensors/numbers, CSV logs, and the fan command.
 
-When MPC status is actionable (`Ready`, `Setpoint drop`, `Low confidence`), the manager applies the fan recommendation. When paused (`Disturbed`, `Idle`, `Not ready`), the current fan is held.
+When MPC status is actionable (`Ready`, `Setpoint drop`, `Overshoot`, `Low confidence`), the manager applies the fan recommendation. When paused (`Disturbed`, `Idle`, `Not ready`), the current fan is held.
 
 ### Key Flow in `evaluate()`
 
@@ -38,7 +38,7 @@ When MPC status is actionable (`Ready`, `Setpoint drop`, `Low confidence`), the 
 3. Compute effective slope, dead time, phase
 4. Update disturbance bias (EMA tracking)
 5. Pause conditions: window-open, defrost, HVAC idle → return "Disturbed"
-6. Setpoint drop → return lowest mode immediately
+6. Setpoint drop (genuine user setpoint move, `_track_setpoint`) → return lowest mode immediately; a comfort error < −1 °C without one is `Overshoot` (lowest mode the guards allow, after the simulation)
 7. Build monotone slope map (over the learned profiles, partial ladders included)
 8. Simulate ALL fan modes over the horizon (30 min default)
 9. Select best by lowest cost

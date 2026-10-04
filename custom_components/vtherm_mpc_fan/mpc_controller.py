@@ -213,6 +213,15 @@ class MPCController:
         self._cycle_minutes = cycle_minutes
         self._disturbance_bias = 0.0
         self._error_at_lock_start: float | None = None
+        # Setpoint-drop detection works on the *user's* setpoint, cycle to cycle
+        # (see _track_setpoint): the comfort setpoint and HVAC mode seen last,
+        # and whether a genuine drop is still being followed.
+        self._last_comfort_target: float | None = None
+        self._last_comfort_hvac_mode: str | None = None
+        self._setpoint_drop_active = False
+        # Values every payload of the current evaluate() carries (comfort error,
+        # regulation offset...), whichever return path it leaves by.
+        self._cycle_extras: dict[str, Any] = {}
         # Snapshot of what every candidate slope resolved to on the last
         # evaluate() call: {hvac_mode, slopes: {fan_mode: (slope, is_learned)}}.
         # Lets diagnostics show the live rank-scaled estimate a not-yet-learned
@@ -364,21 +373,38 @@ class MPCController:
         is_defrost_active: bool = False,
         is_hvac_idle: bool = False,
         minutes_since_change: float = 0.0,
+        user_target_temp: float | None = None,
     ) -> dict:
-        """Evaluate the best fan mode for the current cycle."""
+        """Evaluate the best fan mode for the current cycle.
+
+        ``target_temp`` is the setpoint VTherm sends to the underlying (its
+        ``regulated_target_temperature``) and ``user_target_temp`` the user's own
+        (``target_temperature``). Comfort -- the cost, the deadband, the
+        escalation, the learning hold, the setpoint drop -- is judged against the
+        user's setpoint: the regulated one drifts with VTherm's auto-regulation
+        (0.6 degC below the user's in median on the production trace while the
+        strongest speed ran), and regulating the fan on it chased that drift.
+        When ``user_target_temp`` is None, ``target_temp`` is used for both.
+        """
         _LOGGER.debug(
-            "MPC evaluate: hvac=%s current_temp=%.2f target=%.2f slope=%.3f current_fan=%s minutes_since_change=%.1f window_open=%s",
+            "MPC evaluate: hvac=%s current_temp=%.2f target=%.2f user_target=%s slope=%.3f current_fan=%s minutes_since_change=%.1f window_open=%s",
             hvac_mode,
             current_temp,
             target_temp,
+            user_target_temp,
             vtherm_slope,
             current_fan,
             minutes_since_change,
             is_window_open,
         )
+        comfort_target = user_target_temp if user_target_temp is not None else target_temp
+        regulation_offset = (target_temp - user_target_temp) if user_target_temp is not None else None
+        self._cycle_extras = {"regulation_offset": regulation_offset}
 
         # Only heat/cool have a defined comfort-error direction and learned profiles.
         if hvac_mode not in PROFILE_HVAC_MODES:
+            self._last_comfort_target = None
+            self._setpoint_drop_active = False
             return self._payload(
                 status="Idle",
                 fan_mode=current_fan,
@@ -397,7 +423,9 @@ class MPCController:
 
         active_fan = current_fan if current_fan in fan_modes else fan_modes[0]
         current_effective_slope = -vtherm_slope if hvac_mode == "cool" else vtherm_slope
-        current_error = self._temperature_error(current_temp, target_temp, hvac_mode)
+        current_error = self._temperature_error(current_temp, comfort_target, hvac_mode)
+        self._cycle_extras["comfort_error"] = current_error
+        self._track_setpoint(comfort_target, hvac_mode)
         # Mode-specific: a heat pump's heating lag and cooling lag are different
         # numbers, and this dead time drives the change gate, the phase split and
         # every candidate's change_delay. Omitting the argument pools both modes'
@@ -426,7 +454,7 @@ class MPCController:
             effective_min_interval = max(effective_min_interval, learning_hold_minutes)
         change_allowed = minutes_since_change >= effective_min_interval
         phase = self.detect_phase(minutes_since_change, dead_time)
-        monotone_slopes = self.build_monotone_slopes(fan_modes, hvac_mode)
+        monotone_slopes = self.build_monotone_slopes(fan_modes, hvac_mode, error=current_error, regulation_offset=regulation_offset)
         current_mode_slope, current_known_profile = self._get_mode_slope(
             active_fan,
             hvac_mode,
@@ -469,16 +497,25 @@ class MPCController:
                 disturbance_bias=self._disturbance_bias,
             )
 
-        # Setpoint drop: when the target moves far away (e.g. night setpoint),
-        # there is no point running the full MPC cost optimisation — the answer
-        # is always the lowest mode.
+        # Setpoint drop: when the user moves the setpoint far away (e.g. night
+        # setpoint), there is no point running the full MPC cost optimisation --
+        # the answer is always the lowest mode. Only a genuine move of the user's
+        # setpoint qualifies (see _track_setpoint). A room that is merely past
+        # the setpoint by as much, with no setpoint change, is an Overshoot: it
+        # runs the normal selection, restricted to the lowest speed the guards
+        # allow, and starts no learning cooldown.
+        overshoot = False
         if current_error < THRESHOLD_TARGET_DROP:
+            overshoot = not self._setpoint_drop_active
+        else:
+            self._setpoint_drop_active = False
+        if current_error < THRESHOLD_TARGET_DROP and not overshoot:
             lowest_fan = fan_modes[0]
             would_change = "yes" if active_fan != lowest_fan else "no"
             return self._payload(
                 status="Setpoint drop",
                 fan_mode=lowest_fan,
-                reason=f"Setpoint drop: target moved away ({current_error:.1f}°C), minimum speed",
+                reason=f"Setpoint drop: setpoint moved away ({current_error:.1f}°C), minimum speed",
                 would_change_now=would_change,
                 dead_time=dead_time,
                 known_profiles=self._count_known_profiles(fan_modes, hvac_mode),
@@ -520,7 +557,7 @@ class MPCController:
             mode_gain = self._learning.get_mode_slope_gain(fan_mode, hvac_mode) if known_profile else 0.0
             sim = self._simulate_mode(
                 current_temp=current_temp,
-                target_temp=target_temp,
+                target_temp=comfort_target,
                 hvac_mode=hvac_mode,
                 current_fan=active_fan,
                 candidate_fan=fan_mode,
@@ -586,6 +623,11 @@ class MPCController:
                 blocked_slope = self._learning.get_mode_effective_slope(unfiltered_best.fan_mode, hvac_mode)
                 blocked_note = f"Blocked {ranks}-rank drop to {unfiltered_best.fan_mode}: its own profile ({blocked_slope:.2f}C/h) can't sustain progress"
 
+        if overshoot:
+            # The lowest speed the step-down guard lets us reach, not the cost
+            # optimum: the room is a full degree past the setpoint already.
+            best = min(eligible_simulations, key=lambda item: fan_modes.index(item.fan_mode))
+
         if not change_allowed and best.fan_mode != active_fan:
             best_index = fan_modes.index(best.fan_mode)
             if best_index > current_index and error_growth_since_change > DEAD_TIME_ESCALATION_GROWTH:
@@ -594,7 +636,7 @@ class MPCController:
             else:
                 selection_note = f"Min interval holds {active_fan} until a change is allowed"
                 best = current_simulation
-        elif change_allowed and best.fan_mode != active_fan:
+        elif change_allowed and best.fan_mode != active_fan and not overshoot:
             best_index = fan_modes.index(best.fan_mode)
             required_gain = self._required_switch_gain(
                 current_error=current_error,
@@ -611,7 +653,7 @@ class MPCController:
                     candidate=best,
                     active_fan=active_fan,
                     hvac_mode=hvac_mode,
-                    target_temp=target_temp,
+                    target_temp=comfort_target,
                     current_error=current_error,
                     candidate_index=best_index,
                     current_index=current_index,
@@ -624,6 +666,8 @@ class MPCController:
         confidence = self._compute_confidence(known_profiles, len(fan_modes), phase, worst_spread)
         would_change_now = "yes" if change_allowed and best.fan_mode != active_fan else "no"
         status = "Ready" if confidence >= 0.5 else "Low confidence"
+        if overshoot:
+            status = "Overshoot"
         _LOGGER.debug(
             "MPC candidates: %s",
             [
@@ -638,6 +682,8 @@ class MPCController:
             ],
         )
         reason = f"MPC recommends {best.fan_mode}: cost={best.total_cost:.2f}, T+10={best.predicted_temp_10m:.2f}C, T+30={best.predicted_temp_30m:.2f}C"
+        if overshoot:
+            reason = f"Overshoot: {-current_error:.1f}C past the setpoint without a setpoint change, lowest allowed speed | {reason}"
         if blocked_note:
             reason += f" | {blocked_note}"
         if selection_note:
@@ -692,10 +738,36 @@ class MPCController:
             return False
         if minutes_since_change >= learning_hold_minutes:
             return False
-        if current_error > MULTI_RANK_JUMP_ERROR:
+        if current_error > MULTI_RANK_JUMP_ERROR or current_error < THRESHOLD_TARGET_DROP:
             return False
         overshooting_and_worsening = current_error < -self._deadband and error_growth_since_change < -DEAD_TIME_ESCALATION_GROWTH
         return not overshooting_and_worsening
+
+    def _track_setpoint(self, comfort_target: float, hvac_mode: str) -> None:
+        """Follow the user's setpoint from cycle to cycle to spot a genuine drop.
+
+        A drop is a move of the setpoint *away from the room's demand* of at
+        least ``|THRESHOLD_TARGET_DROP|`` between two cycles in the same HVAC
+        mode: lower in heat, higher in cool. It arms the Setpoint-drop status,
+        which lasts while the comfort error stays below THRESHOLD_TARGET_DROP
+        (see evaluate()) and is cancelled by any setpoint move that asks for
+        more. Comparing errors instead (the previous rule) fired on any room 1
+        degC past the setpoint, and with the regulated setpoint as reference it
+        fired on VTherm's own regulation drift: 27 % of the active time of the
+        production trace was spent in a "Setpoint drop" no user had made.
+        """
+        previous = self._last_comfort_target
+        previous_mode = self._last_comfort_hvac_mode
+        self._last_comfort_target = comfort_target
+        self._last_comfort_hvac_mode = hvac_mode
+        if previous is None or previous_mode != hvac_mode:
+            return
+        demand_change = (comfort_target - previous) if hvac_mode == "heat" else (previous - comfort_target)
+        if demand_change <= THRESHOLD_TARGET_DROP + 1e-9:
+            self._setpoint_drop_active = True
+            _LOGGER.debug("MPC: setpoint moved away by %.2f°C, setpoint drop armed", -demand_change)
+        elif demand_change > 0:
+            self._setpoint_drop_active = False
 
     def _count_known_profiles(self, fan_modes: list[str], hvac_mode: str) -> int:
         """Return how many fan modes have a learned profile for this hvac mode.
@@ -834,8 +906,20 @@ class MPCController:
             scaled = value + MIN_LADDER_SEPARATION
         return scaled
 
-    def build_monotone_slopes(self, fan_modes: list[str], hvac_mode: str) -> dict[str, float]:
+    def build_monotone_slopes(
+        self,
+        fan_modes: list[str],
+        hvac_mode: str,
+        *,
+        error: float = 0.0,
+        regulation_offset: float | None = None,
+    ) -> dict[str, float]:
         """Return monotone-enforced slopes for all known profiles.
+
+        With a ``regulation_offset`` (raw, regulated minus user setpoint), each
+        profile's value includes its fitted offset correction at that offset and
+        comfort ``error`` -- zero unless the profile identified one (see
+        ``ThermalLearning.get_mode_offset_correction``).
 
         Fan modes are assumed ordered from weakest to strongest, so learned
         slopes must be non-decreasing along that order. Modes without a learned
@@ -863,7 +947,11 @@ class MPCController:
         only ever synthesises a replacement, it is never imposed as a minimum
         gap between measured values.
         """
-        measured = {fm: slope for fm in fan_modes if (slope := self._learning.get_mode_effective_slope(fm, hvac_mode)) is not None}
+        measured = {
+            fm: slope + self._learning.get_mode_offset_correction(fm, hvac_mode, error, regulation_offset)
+            for fm in fan_modes
+            if (slope := self._learning.get_mode_effective_slope(fm, hvac_mode)) is not None
+        }
         if not measured:
             return {}
 
@@ -1170,6 +1258,8 @@ class MPCController:
             "mpc_known_profiles": known_profiles,
             "mpc_disturbance_bias": round(disturbance_bias, 3) if disturbance_bias is not None else None,
         }
+        for key, value in self._cycle_extras.items():
+            payload[f"mpc_{key}"] = round(value, 3) if isinstance(value, float) else value
         _LOGGER.debug(
             "MPC decision: status=%s fan_mode=%s would_change_now=%s cost=%s confidence=%s known_profiles=%d dead_time=%s bias=%s reason=%s",
             status,

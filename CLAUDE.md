@@ -21,7 +21,9 @@ integration lives under `custom_components/vtherm_mpc_fan/`. Key modules:
 
 ## Domain Vocabulary
 
-- **error**: always positive when the system needs more heating/cooling (`target - current` in heat, `current - target` in cool)
+- **error**: always positive when the system needs more heating/cooling (`target - current` in heat, `current - target` in cool). The MPC's comfort error uses the **user's** setpoint (`target_temperature`), not VTherm's `regulated_target_temperature`; their difference is the `regulation_offset` (regulated − user), stored with each slope sample
+- **setpoint drop / overshoot**: `Setpoint drop` only follows a genuine move of the user's setpoint (≥ 1 °C away from the demand between two cycles, `MPCController._track_setpoint`) and starts the learning cooldown; a room > 1 °C past an unchanged setpoint is `Overshoot` (lowest speed the guards allow, no cooldown)
+- **legacy samples**: 5-tuple slope samples from stores older than `LEARNING_DATA_FORMAT` 2; their error was measured against the regulated setpoint, so they weigh `LEGACY_SAMPLE_WEIGHT` in the fits
 - **effective_slope**: learned slope per fan mode, gap-dependent (`slope(error) = intercept + gain * error`, least-squares fit in `ThermalLearning`); raw slope comes from VTherm's own EMA
 - **dead_time**: thermal lag between a fan change and first observable slope response (learned via response events). Resolved **per hvac mode** — heating lag and cooling lag are different numbers, and `get_dead_time()` pools every mode when called without one. It gates the change interval, the phase split and each candidate's simulated `change_delay`.
 - **trusted dead time**: whether the learned dead time may raise the change interval above the configured floor. Gated per HVAC mode on `response_event_count(hvac_mode)` (see `MIN_RESPONSE_EVENTS_FOR_ADAPTIVE_INTERVAL`) — response events are only recorded in heat/cool, and events stored from other modes are ignored — **not** on `ThermalLearning.is_ready()` — that flag counts *slope* samples, which a coarse room sensor (0.2 °C steps are common) accumulates so slowly it can stay false indefinitely while the dead time is already well established.
@@ -97,7 +99,7 @@ Tests that need a real Home Assistant core (setup/unload, services, flows) reque
 
 ## Key Constants (const.py)
 
-- `THRESHOLD_TARGET_DROP = -1.0` — setpoint-drop trigger (°C)
+- `THRESHOLD_TARGET_DROP = -1.0` — setpoint-drop trigger (°C): the user's setpoint moving away by this much, and the comfort error below it
 - `DEFAULT_DEADBAND` — tunable via options flow
 - `CONF_DEFROST_ENTITY` — optional entity for external defrost signal; fallback only, the underlying's own `hvac_action` is checked first
 - `CONF_FAN_MODE_ORDER` — optional explicit weakest-to-strongest fan speed order, overrides what the underlying climate reports

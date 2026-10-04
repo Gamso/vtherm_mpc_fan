@@ -288,8 +288,10 @@ def test_mpc_still_reports_known_profiles_on_a_setpoint_drop() -> None:
     _prime_learning_profiles(learning)
     mpc = _build_mpc(learning)
 
-    # Night setpoint: the target drops away below the room, so the comfort error
-    # goes strongly negative (< THRESHOLD_TARGET_DROP) and the MPC shortcuts.
+    # Night setpoint: the user drops the target away below the room, so the
+    # comfort error goes strongly negative (< THRESHOLD_TARGET_DROP) and the
+    # MPC shortcuts.
+    _evaluate_heat(mpc, current_temp=22.0, target_temp=22.0, current_fan="medium")
     result = mpc.evaluate(
         current_temp=22.0,
         target_temp=20.0,
@@ -614,8 +616,21 @@ async def test_data_collector_records_mpc_columns(tmp_path: Path) -> None:
     assert row[header.index("mpc_disturbance")] == "-0.25"
 
 
+def _evaluate_heat(mpc: MPCController, *, current_temp: float, target_temp: float, current_fan: str, user_target_temp: float | None = None) -> dict:
+    """Run one heating cycle well past the min interval (establishes the previous setpoint)."""
+    return mpc.evaluate(
+        current_temp=current_temp,
+        target_temp=target_temp,
+        vtherm_slope=0.0,
+        hvac_mode="heat",
+        current_fan=current_fan,
+        minutes_since_change=60.0,
+        user_target_temp=user_target_temp,
+    )
+
+
 def test_mpc_setpoint_drop_forces_lowest_mode() -> None:
-    """When target drops significantly, MPC should go to the lowest fan mode."""
+    """When the user drops the target significantly, MPC should go to the lowest fan mode."""
     learning = ThermalLearning()
     _prime_learning_profiles(learning)
     mpc = MPCController(
@@ -624,6 +639,7 @@ def test_mpc_setpoint_drop_forces_lowest_mode() -> None:
         min_interval=10,
         fan_modes=FAN_MODES,
     )
+    _evaluate_heat(mpc, current_temp=20.4, target_temp=20.5, current_fan="high")
 
     result = mpc.evaluate(
         current_temp=20.4,
@@ -649,6 +665,7 @@ def test_mpc_setpoint_drop_reports_would_change() -> None:
         min_interval=10,
         fan_modes=FAN_MODES,
     )
+    _evaluate_heat(mpc, current_temp=20.0, target_temp=20.0, current_fan="medium")
 
     result = mpc.evaluate(
         current_temp=20.0,
@@ -686,6 +703,101 @@ def test_mpc_no_setpoint_drop_when_error_above_threshold() -> None:
     )
 
     assert result["mpc_status"] != "Setpoint drop"
+
+
+def test_a_room_past_the_setpoint_without_a_setpoint_change_is_an_overshoot() -> None:
+    """No setpoint moved: the lowest speed the guards allow, status Overshoot.
+
+    The old rule fired "Setpoint drop" on any comfort error below -1 degC. On the
+    production trace that was 27 % of the active time, 42 episodes of ~2 h, all
+    triggered by VTherm's regulated setpoint drifting -- no user action.
+    """
+    learning = ThermalLearning()
+    _prime_learning_profiles(learning)
+    mpc = _build_mpc(learning)
+    _evaluate_heat(mpc, current_temp=21.2, target_temp=20.0, current_fan="high")
+
+    result = _evaluate_heat(mpc, current_temp=21.3, target_temp=20.0, current_fan="high")
+
+    assert result["mpc_status"] == "Overshoot"
+    assert result["mpc_fan_mode"] == "low"
+    assert result["mpc_would_change_now"] == "yes"
+    assert "Overshoot" in result["mpc_reason"]
+
+
+def test_an_overshoot_respects_the_step_down_guard() -> None:
+    """The lowest *allowed* speed: a multi-rank plunge to a speed that loses ground stays blocked."""
+    learning = ThermalLearning()
+    learning.set_mode_effective_slope("low", "heat", -0.3)
+    learning.set_mode_effective_slope("medium", "heat", 0.6)
+    learning.set_mode_effective_slope("high", "heat", 1.2)
+    mpc = _build_mpc(learning)
+
+    result = _evaluate_heat(mpc, current_temp=21.5, target_temp=20.0, current_fan="high")
+
+    assert result["mpc_status"] == "Overshoot"
+    assert result["mpc_fan_mode"] == "medium"
+
+
+def test_regulation_drift_is_not_a_setpoint_drop() -> None:
+    """VTherm moving its regulated setpoint is not the user moving theirs.
+
+    The user's setpoint stays 24 degC (cool) while the regulated one drifts 1.5
+    degC lower: the MPC regulates on the user's, so nothing happens.
+    """
+    learning = ThermalLearning()
+    _prime_cool_profiles(learning)
+    mpc = _build_mpc(learning)
+    for regulated in (23.8, 23.0, 22.3):
+        result = mpc.evaluate(
+            current_temp=24.0,
+            target_temp=regulated,
+            user_target_temp=24.0,
+            vtherm_slope=0.0,
+            hvac_mode="cool",
+            current_fan="medium",
+            minutes_since_change=60.0,
+        )
+
+    assert result["mpc_status"] != "Setpoint drop"
+    assert result["mpc_comfort_error"] == pytest.approx(0.0)
+    assert result["mpc_regulation_offset"] == pytest.approx(-1.7)
+
+
+def test_a_user_setpoint_raise_in_cool_is_a_setpoint_drop() -> None:
+    """In cool, asking for less cooling means a *higher* setpoint."""
+    learning = ThermalLearning()
+    _prime_cool_profiles(learning)
+    mpc = _build_mpc(learning)
+    mpc.evaluate(current_temp=22.2, target_temp=22.0, user_target_temp=22.0, vtherm_slope=0.0, hvac_mode="cool", current_fan="high", minutes_since_change=60.0)
+
+    result = mpc.evaluate(current_temp=22.2, target_temp=24.0, user_target_temp=24.0, vtherm_slope=0.0, hvac_mode="cool", current_fan="high", minutes_since_change=60.0)
+
+    assert result["mpc_status"] == "Setpoint drop"
+    assert result["mpc_fan_mode"] == "low"
+
+
+def test_comfort_is_judged_against_the_user_setpoint() -> None:
+    """The cost and status use the user's setpoint; the regulated one only sets the offset."""
+    learning = ThermalLearning()
+    _prime_cool_profiles(learning)
+    mpc = _build_mpc(learning)
+
+    result = mpc.evaluate(current_temp=24.1, target_temp=23.4, user_target_temp=24.0, vtherm_slope=0.0, hvac_mode="cool", current_fan="medium", minutes_since_change=60.0)
+
+    assert result["mpc_comfort_error"] == pytest.approx(0.1)
+    assert result["mpc_regulation_offset"] == pytest.approx(-0.6)
+    # Without the user setpoint the regulated one is used for both.
+    fallback = _build_mpc(learning).evaluate(current_temp=24.1, target_temp=23.4, vtherm_slope=0.0, hvac_mode="cool", current_fan="medium", minutes_since_change=60.0)
+    assert fallback["mpc_comfort_error"] == pytest.approx(0.7)
+    assert fallback["mpc_regulation_offset"] is None
+
+
+def _prime_cool_profiles(learning: ThermalLearning) -> None:
+    """Seed a low/medium/high cooling ladder."""
+    learning.set_mode_effective_slope("low", "cool", 0.2)
+    learning.set_mode_effective_slope("medium", "cool", 0.6)
+    learning.set_mode_effective_slope("high", "cool", 1.2)
 
 
 def test_mpc_pauses_during_defrost() -> None:

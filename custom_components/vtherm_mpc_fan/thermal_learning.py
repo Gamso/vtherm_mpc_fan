@@ -4,6 +4,7 @@ import logging
 import time
 import statistics
 from collections import Counter
+from dataclasses import dataclass
 
 from .const import (
     MIN_SAMPLES_LEARNING,
@@ -17,6 +18,122 @@ from .const import (
 #: Cap on persisted slope samples (see to_dict). ~7 days at 2-min intervals.
 MAX_STORED_SLOPE_SAMPLES = 5000
 
+# --- Persisted sample format ------------------------------------------------
+# A slope sample is a tuple, persisted as a JSON list:
+#   (timestamp, fan_mode, raw_slope, hvac_mode, comfort_error, regulation_offset)
+# Older stores hold shorter tuples, all still accepted by from_dict():
+#   3 items: no hvac_mode, no error          -> hvac "unknown", error None
+#   4 items: no error                        -> error None (a constant, like a seed)
+#   5 items: "legacy" measurement            -> see LEGACY_SAMPLE_WEIGHT
+# ``regulation_offset`` is VTherm's regulated setpoint minus the user's (raw
+# degC, None when unknown). The store also carries ``format`` (see
+# LEARNING_DATA_FORMAT); an older version of the plugin ignores both the key
+# and the trailing tuple items, so the format is readable in both directions.
+LEARNING_DATA_FORMAT = 2
+
+# Samples recorded before format 2 carry an error measured against VTherm's
+# *regulated* setpoint, not the user's. The two differ by the auto-regulation
+# offset, which was not stored (0.6 degC in median on the production trace while
+# the strongest speed ran), so their error cannot be recomputed. They are kept --
+# an existing installation must not lose its profiles on upgrade -- but weigh
+# this much of a current sample in the fits, and they age out of the 7-day
+# window / per-profile retention like any other sample.
+LEGACY_SAMPLE_WEIGHT = 0.25
+
+# The regulation offset (sign-aligned, positive = VTherm asks the unit for more)
+# is a proxy for how hard the inverter compressor is driven, which the fan speed
+# alone does not capture. It enters a profile's fit as a second regressor,
+# slope = a + b*error + c*offset_residual, only when it varied enough to be
+# identified, and with c shrunk toward 0 as if OFFSET_PRIOR_SAMPLES observations
+# with an offset spread of OFFSET_PRIOR_SPREAD had shown no effect.
+OFFSET_MIN_SAMPLES = 10
+OFFSET_MIN_SPREAD = 0.1  # degC, standard deviation of the offset not explained by the error
+OFFSET_PRIOR_SAMPLES = 10.0
+OFFSET_PRIOR_SPREAD = 0.2  # degC
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileFit:
+    """The fitted slope model of one (fan_mode, hvac_mode) profile.
+
+    ``slope(error, offset) = intercept + gain * error
+    + offset_gain * (offset - (offset_base + offset_trend * error))``
+
+    where ``offset`` is the sign-aligned regulation offset. ``offset_base`` and
+    ``offset_trend`` describe the offset usually seen at a given error, so the
+    offset term only adds what the error does not already explain, and is zero
+    whenever the offset is the usual one (or unknown).
+    """
+
+    intercept: float
+    gain: float
+    r_squared: float | None
+    offset_gain: float = 0.0
+    offset_base: float = 0.0
+    offset_trend: float = 0.0
+
+    def offset_correction(self, error: float, demand: float | None) -> float:
+        """Return the slope correction for an unusual (sign-aligned) regulation offset, 0 when unknown."""
+        if demand is None or self.offset_gain == 0.0:
+            return 0.0
+        return self.offset_gain * (demand - (self.offset_base + self.offset_trend * error))
+
+
+def demand_offset(regulation_offset: float | None, hvac_mode: str) -> float | None:
+    """Return the regulation offset sign-aligned so that positive means "asks for more".
+
+    In heat a regulated setpoint above the user's pushes the unit harder; in
+    cool it is a regulated setpoint *below* the user's.
+    """
+    if regulation_offset is None:
+        return None
+    return -regulation_offset if hvac_mode == "cool" else regulation_offset
+
+
+def sample_weight(sample) -> float:
+    """Return a measurement's weight in the fits (see LEGACY_SAMPLE_WEIGHT)."""
+    return 1.0 if len(sample) > 5 else LEGACY_SAMPLE_WEIGHT
+
+
+def sample_offset(sample) -> float | None:
+    """Return a sample's raw regulation offset, None when unknown or legacy."""
+    return sample[5] if len(sample) > 5 else None
+
+
+def weighted_median(values: list[float], weights: list[float]) -> float:
+    """Return the weighted median; the plain median when every weight is equal."""
+    if len(set(weights)) <= 1:
+        return statistics.median(values)
+    pairs = sorted(zip(values, weights))
+    half = sum(weights) / 2.0
+    cumulative = 0.0
+    for index, (value, weight) in enumerate(pairs):
+        cumulative += weight
+        if cumulative > half:
+            return value
+        if cumulative == half and index + 1 < len(pairs):
+            return (value + pairs[index + 1][0]) / 2.0
+    return pairs[-1][0]
+
+
+def weighted_line(points: list[tuple[float, float, float]]) -> tuple[float, float, float, float] | None:
+    """Weighted least squares of y on x over ``(x, y, w)``: (intercept, slope, sxx, mean_x).
+
+    None when x has no spread (sxx below 1e-6).
+    """
+    total = sum(w for _, _, w in points)
+    if total <= 0:
+        return None
+    mean_x = sum(w * x for x, _, w in points) / total
+    mean_y = sum(w * y for _, y, w in points) / total
+    sxx = sum(w * (x - mean_x) ** 2 for x, _, w in points)
+    if sxx < 1e-6:
+        return None
+    sxy = sum(w * (x - mean_x) * (y - mean_y) for x, y, w in points)
+    slope = sxy / sxx
+    return mean_y - slope * mean_x, slope, sxx, mean_x
+
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -25,7 +142,7 @@ class ThermalLearning:
 
     def __init__(self):
         # Data collection with sliding window
-        self._slope_samples = []  # (timestamp, fan_mode, slope, hvac_mode, temperature_error)
+        self._slope_samples = []  # (timestamp, fan_mode, slope, hvac_mode, temperature_error, regulation_offset)
         self._response_events = []  # (timestamp, response_time_minutes) - thermal response from fan change to slope change
         self._learning_window_hours = 168  # 7 days sliding window
         self._min_samples = MIN_SAMPLES_LEARNING  # Minimum samples for initial readiness (48-72h typical activity)
@@ -43,7 +160,7 @@ class ThermalLearning:
         # Per-profile regression results, keyed (fan_mode, hvac_mode). Every
         # entity and every MPC candidate reads the same few fits several times
         # per cycle; they only change when the sample list does.
-        self._fit_cache: dict[tuple[str, str], tuple[float, float, float | None] | None] = {}
+        self._fit_cache: dict[tuple[str, str], ProfileFit | None] = {}
 
     def reset(self) -> None:
         """Reset all learning data and statistics."""
@@ -59,8 +176,20 @@ class ThermalLearning:
         self._profile_ready_logged.clear()
         _LOGGER.info("Learning: reset requested; data cleared")
 
-    def add_slope_sample(self, fan_mode: str, slope: float, temperature_error: float = 0, hvac_mode: str = "unknown", is_window_open: bool = False):
+    def add_slope_sample(
+        self,
+        fan_mode: str,
+        slope: float,
+        temperature_error: float = 0,
+        hvac_mode: str = "unknown",
+        is_window_open: bool = False,
+        regulation_offset: float | None = None,
+    ):
         """Record slope only if in normal operating range.
+
+        ``temperature_error`` is the comfort error against the *user's* setpoint
+        and ``regulation_offset`` VTherm's regulated setpoint minus the user's
+        (raw degC, None when unknown): see ``ProfileFit`` for how it is used.
 
         Samples are filtered out when:
         - Setpoint drop / night mode (error < -1°C)
@@ -90,7 +219,7 @@ class ThermalLearning:
             _LOGGER.debug("Learning: Skipped sample (window open)")
             return
 
-        self._slope_samples.append((time.time(), fan_mode, slope, hvac_mode, temperature_error))
+        self._slope_samples.append((time.time(), fan_mode, slope, hvac_mode, temperature_error, regulation_offset))
         self._fit_cache.clear()
         profile_samples = self.get_mode_sample_count(fan_mode, hvac_mode)
         _LOGGER.debug(
@@ -340,30 +469,33 @@ class ThermalLearning:
             return DEFAULT_DEAD_TIME
         return statistics.median(response_times)
 
-    def _fit_mode_slope(self, fan_mode: str, hvac_mode: str) -> tuple[float, float, float | None] | None:
+    def _fit_mode_slope(self, fan_mode: str, hvac_mode: str) -> ProfileFit | None:
         """Return the profile's fit, computed once per change of the sample list.
 
-        See :meth:`_compute_mode_fit` for the model. The result is a tuple (or
-        None) and is never mutated by callers, so it is safe to share.
+        See :meth:`_compute_mode_fit` for the model. The result is a frozen
+        ``ProfileFit`` (or None), so it is safe to share.
         """
         key = (fan_mode, hvac_mode)
         if key not in self._fit_cache:
             self._fit_cache[key] = self._compute_mode_fit(fan_mode, hvac_mode)
         return self._fit_cache[key]
 
-    def _compute_mode_fit(self, fan_mode: str, hvac_mode: str) -> tuple[float, float, float | None] | None:
-        """Fit the gap-dependent slope model and return (intercept_a, gain_b, r_squared).
+    def _compute_mode_fit(self, fan_mode: str, hvac_mode: str) -> ProfileFit | None:
+        """Fit the gap-dependent slope model of one profile.
 
-        The effective cooling/heating rate is not constant: it scales with the
-        comfort error (distance to the setpoint), per Newton's law of cooling.
-        We model it as a linear relationship:
+        The effective cooling/heating rate is not constant: it grows with the
+        comfort error (distance to the user's setpoint) -- mostly because the
+        inverter compressor is driven harder further from it. We model it as a
+        linear relationship:
 
             effective_slope(error) = a + b * error
 
-        fitted by ordinary least squares over the profile's (error, effective_slope)
-        samples. ``error`` is the signed comfort error (positive = needs more
-        cooling/heating). ``effective_slope`` is positive when moving towards target
-        (raw VTherm slope is inverted in cooling).
+        fitted by weighted least squares over the profile's (error,
+        effective_slope) samples, legacy samples weighing LEGACY_SAMPLE_WEIGHT.
+        ``error`` is the signed comfort error (positive = needs more
+        cooling/heating). ``effective_slope`` is positive when moving towards
+        target (raw VTherm slope is inverted in cooling). When the regulation
+        offset varied enough, a shrunk second term models it (see ProfileFit).
 
         ``r_squared`` is the coefficient of determination of the fit (0..1); it is
         ``None`` for the constant fallback (no real regression was performed).
@@ -385,7 +517,8 @@ class ThermalLearning:
 
         # Only samples that carry a stored error are measurements; the others are
         # synthetic (set_mode_effective_slope) or predate the error column.
-        points = [(s[4], sign * s[2]) for s in matching if len(s) > 4 and s[4] is not None]
+        measured = [s for s in matching if len(s) > 4 and s[4] is not None]
+        points = [(s[4], sign * s[2], sample_weight(s)) for s in measured]
         constants = [sign * s[2] for s in matching if len(s) <= 4 or s[4] is None]
         if len(points) < MIN_MODE_PROFILE_SAMPLES:
             # Not enough measurements for a regression. A plain median over the
@@ -395,36 +528,68 @@ class ThermalLearning:
             # progress. Weight the two medians by their counts instead, so each
             # measurement visibly pulls the profile toward what was observed.
             median_constant = statistics.median(constants) if constants else None
-            median_measured = statistics.median([y for _, y in points]) if points else None
+            median_measured = weighted_median([y for _, y, _ in points], [w for _, _, w in points]) if points else None
             if median_constant is None:
-                return (median_measured, 0.0, None)
+                return ProfileFit(median_measured, 0.0, None)
             if median_measured is None:
-                return (median_constant, 0.0, None)
+                return ProfileFit(median_constant, 0.0, None)
             weight = len(points) / (len(points) + len(constants))
-            return (median_constant + weight * (median_measured - median_constant), 0.0, None)
+            return ProfileFit(median_constant + weight * (median_measured - median_constant), 0.0, None)
 
-        median_eff = statistics.median([y for _, y in points])
-
-        n = len(points)
-        mean_x = sum(x for x, _ in points) / n
-        mean_y = sum(y for _, y in points) / n
-        var_x = sum((x - mean_x) ** 2 for x, _ in points)
-        if var_x < 1e-6:
+        line = weighted_line(points)
+        if line is None:
             # All samples taken at (nearly) the same error: no slope can be fitted.
-            return (median_eff, 0.0, None)
+            constant = ProfileFit(weighted_median([y for _, y, _ in points], [w for _, _, w in points]), 0.0, None)
+            return self._fit_offset_term(constant, measured, sign, hvac_mode)
 
-        cov_xy = sum((x - mean_x) * (y - mean_y) for x, y in points)
-        gain_b = max(0.0, cov_xy / var_x)
-        intercept_a = mean_y - gain_b * mean_x
+        intercept_a, gain_b, _, _ = line
+        if gain_b < 0.0:
+            gain_b = 0.0
+            total = sum(w for _, _, w in points)
+            intercept_a = sum(w * y for _, y, w in points) / total
+        mean_y = sum(w * y for _, y, w in points) / sum(w for _, _, w in points)
 
         # Coefficient of determination against the (clamped) fitted line.
-        ss_tot = sum((y - mean_y) ** 2 for _, y in points)
+        ss_tot = sum(w * (y - mean_y) ** 2 for _, y, w in points)
         if ss_tot < 1e-9:
             r_squared = None
         else:
-            ss_res = sum((y - (intercept_a + gain_b * x)) ** 2 for x, y in points)
+            ss_res = sum(w * (y - (intercept_a + gain_b * x)) ** 2 for x, y, w in points)
             r_squared = max(0.0, 1.0 - ss_res / ss_tot)
-        return (intercept_a, gain_b, r_squared)
+        return self._fit_offset_term(ProfileFit(intercept_a, gain_b, r_squared), measured, sign, hvac_mode)
+
+    @staticmethod
+    def _fit_offset_term(fit: ProfileFit, measured: list, sign: float, hvac_mode: str) -> ProfileFit:
+        """Add the regulation-offset term to *fit* when the data can identify it.
+
+        Frisch-Waugh: the offset is first regressed on the error, and only the
+        part the error does not explain (its residual) is related to the slope
+        residual. That leaves ``a`` and ``b`` exactly as fitted, and keeps a
+        compressor that simply follows the error from being counted twice.
+        Skipped below OFFSET_MIN_SAMPLES samples with a known offset or when the
+        unexplained offset spread is under OFFSET_MIN_SPREAD; the gain is shrunk
+        toward 0 and clamped non-negative (more demand never cools/heats less).
+        """
+        rows = []
+        for sample in measured:
+            offset = demand_offset(sample_offset(sample), hvac_mode)
+            if offset is not None:
+                rows.append((sample[4], sign * sample[2], offset))
+        if len(rows) < OFFSET_MIN_SAMPLES:
+            return fit
+        trend = weighted_line([(x, d, 1.0) for x, _, d in rows])
+        if trend is None:
+            base, slope_d = sum(d for _, _, d in rows) / len(rows), 0.0
+        else:
+            base, slope_d = trend[0], trend[1]
+        residuals = [(d - (base + slope_d * x), y - (fit.intercept + fit.gain * x)) for x, y, d in rows]
+        spread_sq = sum(rd * rd for rd, _ in residuals)
+        if (spread_sq / len(residuals)) ** 0.5 < OFFSET_MIN_SPREAD:
+            return fit
+        offset_gain = sum(rd * ry for rd, ry in residuals) / (spread_sq + OFFSET_PRIOR_SAMPLES * OFFSET_PRIOR_SPREAD**2)
+        if offset_gain <= 0.0:
+            return fit
+        return ProfileFit(fit.intercept, fit.gain, fit.r_squared, offset_gain, base, slope_d)
 
     def get_mode_slope_model(self, fan_mode: str, hvac_mode: str) -> tuple[float, float] | None:
         """Return the gap-dependent slope model ``(intercept_a, gain_b)`` for a profile.
@@ -433,7 +598,7 @@ class ThermalLearning:
         profile has fewer than MIN_MODE_PROFILE_SAMPLES samples.
         """
         fit = self._fit_mode_slope(fan_mode, hvac_mode)
-        return None if fit is None else (fit[0], fit[1])
+        return None if fit is None else (fit.intercept, fit.gain)
 
     def get_mode_slope_gain(self, fan_mode: str, hvac_mode: str) -> float:
         """Return the gap gain ``b`` (°C/h per °C of comfort error) for a profile.
@@ -451,7 +616,7 @@ class ThermalLearning:
         Returns None when the model is a constant fallback (no regression).
         """
         fit = self._fit_mode_slope(fan_mode, hvac_mode)
-        return None if fit is None else fit[2]
+        return None if fit is None else fit.r_squared
 
     def get_mode_time_constant(self, fan_mode: str, hvac_mode: str) -> float | None:
         """Return the thermal time constant τ (hours) for a profile.
@@ -465,6 +630,17 @@ class ThermalLearning:
         if gain < 1e-3:
             return None
         return 1.0 / gain
+
+    def get_mode_offset_correction(self, fan_mode: str, hvac_mode: str, error: float, regulation_offset: float | None) -> float:
+        """Return the slope correction a profile's fit applies for this regulation offset.
+
+        ``regulation_offset`` is raw (regulated minus user setpoint). 0.0 when the
+        profile is unknown, has no offset term, or the offset is unknown.
+        """
+        fit = self._fit_mode_slope(fan_mode, hvac_mode)
+        if fit is None:
+            return 0.0
+        return fit.offset_correction(max(error, 0.0), demand_offset(regulation_offset, hvac_mode))
 
     def get_mode_effective_slope_at(self, fan_mode: str, hvac_mode: str, error: float) -> float | None:
         """Return the modelled effective slope at a given comfort error.
@@ -592,8 +768,10 @@ class ThermalLearning:
             sample_count = self.get_mode_sample_count(fan_mode, hvac_mode)
             if fit is None:
                 effective_slope = gain = r_squared = time_constant = None
+                offset_gain = None
             else:
-                intercept_a, gain, r_squared = fit
+                intercept_a, gain, r_squared = fit.intercept, fit.gain, fit.r_squared
+                offset_gain = fit.offset_gain
                 effective_slope = intercept_a + gain * REFERENCE_SLOPE_ERROR
                 time_constant = (1.0 / gain) if gain >= 1e-3 else None
             profiles[fan_mode] = {
@@ -601,6 +779,8 @@ class ThermalLearning:
                 "slope_gain": round(gain, 3) if gain is not None else None,
                 "r_squared": round(r_squared, 3) if r_squared is not None else None,
                 "thermal_time_constant_h": round(time_constant, 2) if time_constant is not None else None,
+                "offset_gain": round(offset_gain, 3) if offset_gain is not None else None,
+                "legacy_samples": sum(1 for s in self._slope_samples if s[1] == fan_mode and s[3] == hvac_mode and len(s) == 5 and s[4] is not None),
                 "samples": sample_count,
                 "real_samples": self.get_mode_real_sample_count(fan_mode, hvac_mode),
                 "ready": fit is not None,
@@ -671,6 +851,7 @@ class ThermalLearning:
             cutoff = sorted(s[0] for s in samples)[-MAX_STORED_SLOPE_SAMPLES]
             samples = self.trim_with_min_retention(samples, cutoff, PROFILE_RETENTION_SAMPLES)
         return {
+            "format": LEARNING_DATA_FORMAT,
             "slope_samples": samples,
             "response_events": self._response_events[-100:],
             "slope_count": self._slope_count,
@@ -709,9 +890,14 @@ class ThermalLearning:
         Handles backward compatibility for slope_samples across schema versions:
         - 3-tuple (timestamp, fan_mode, slope) → hvac_mode="unknown", error=None
         - 4-tuple (timestamp, fan_mode, slope, hvac_mode) → error=None
-        - 5-tuple (timestamp, fan_mode, slope, hvac_mode, temperature_error) → as-is
+        - 5-tuple (timestamp, fan_mode, slope, hvac_mode, temperature_error) → kept
+          as a 5-tuple: a *legacy* measurement, whose error was taken against the
+          regulated setpoint (see LEGACY_SAMPLE_WEIGHT)
+        - 6-tuple (…, temperature_error, regulation_offset) → current format
         Samples without a stored error simply don't contribute to the gap-slope
-        regression (they fall back to the constant median model).
+        regression (they fall back to the constant median model). Nothing is
+        dropped or rewritten: an existing installation restarts with every
+        profile it had.
         Old 2-tuple response_events are migrated to 3-tuples by appending hvac_mode="unknown".
         """
         instance = cls()

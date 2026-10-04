@@ -4,7 +4,7 @@
 
 The MPC controller is the sole decision engine for fan speed.
 It maintains a learned thermal model, scores every candidate fan mode over a 30-minute horizon, and selects the mode with the lowest cost.
-When MPC status is actionable (`Ready`, `Setpoint drop`, `Low confidence`), the integration applies the fan recommendation. When paused (`Disturbed`, `Idle`, `Unavailable`), the current fan mode is held. The MPC only regulates `heat` and `cool`; in any other HVAC mode it reports `Idle`, unless that mode has a fixed fan speed (status `Fixed`, set by the feature manager, not by the MPC). A `force_fan` override reports `Forced`.
+When MPC status is actionable (`Ready`, `Setpoint drop`, `Overshoot`, `Low confidence`), the integration applies the fan recommendation. When paused (`Disturbed`, `Idle`, `Unavailable`), the current fan mode is held. The MPC only regulates `heat` and `cool`; in any other HVAC mode it reports `Idle`, unless that mode has a fixed fan speed (status `Fixed`, set by the feature manager, not by the MPC). A `force_fan` override reports `Forced`.
 
 ## Goals
 
@@ -35,7 +35,7 @@ control cycle, right after recomputing its regulated setpoint.
 7. Append MPC information to the CSV log.
 8. Push the decision to the sensors (`update_from_mpc()`) and to the VTherm's `mpc_fan` attribute.
 9. Apply the effective fan when it differs from the current one; the MPC recommendation is
-   applied only when its status is actionable (`Ready`, `Setpoint drop`, `Low confidence`), the
+   applied only when its status is actionable (`Ready`, `Setpoint drop`, `Overshoot`, `Low confidence`), the
    current fan is held otherwise (`Disturbed`, `Idle`, `Unavailable`).
 
 ### HA Entities
@@ -61,6 +61,22 @@ full entity list is in the README.
 CSV log fields are prefixed with `mpc_*`.
 
 The MPC controller owns its runtime parameters (`deadband`, `min_interval`, `fan_modes`) and consumes learned profiles from `ThermalLearning`.
+
+## Comfort setpoint
+
+`evaluate(target_temp=..., user_target_temp=...)` receives both setpoints: `target_temp` is VTherm's
+`regulated_target_temperature` (what the unit is sent), `user_target_temp` the user's
+`target_temperature`. Every comfort quantity — the error, the simulated cost, the deadband, the
+escalation, the learning hold, the setpoint drop — uses the user's setpoint (the regulated one when
+the user's is unknown). `regulated − user` is reported as `mpc_regulation_offset` and stored with each
+learning sample.
+
+A **setpoint drop** is a move of the user's setpoint of at least `|THRESHOLD_TARGET_DROP|` away from
+the demand between two cycles (`_track_setpoint`); while the comfort error stays below
+`THRESHOLD_TARGET_DROP` the MPC returns the lowest speed and the manager pauses learning for
+`SETPOINT_DROP_LEARNING_COOLDOWN`. A comfort error below the threshold without such a move is an
+**overshoot**: the normal selection runs, then the lowest speed the step-down guard allows is taken
+(hysteresis is skipped, the min interval still applies) and no cooldown starts.
 
 ## Learned Thermal Model
 
