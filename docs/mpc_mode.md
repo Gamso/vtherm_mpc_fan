@@ -4,7 +4,7 @@
 
 The MPC controller is the sole decision engine for fan speed.
 It maintains a learned thermal model, scores every candidate fan mode over a horizon of the dead time plus 60 minutes, and selects the mode with the lowest cost.
-When MPC status is actionable (`Ready`, `Setpoint drop`, `Overshoot`, `Low confidence`), the integration applies the fan recommendation. When paused (`Disturbed`, `Idle`, `Unavailable`), the current fan mode is held. The MPC only regulates `heat` and `cool`; in any other HVAC mode it reports `Idle`, unless that mode has a fixed fan speed (status `Fixed`, set by the feature manager, not by the MPC). A `force_fan` override reports `Forced`.
+When MPC status is actionable (`Ready`, `Setpoint boost`, `Setpoint drop`, `Overshoot`, `Low confidence`), the integration applies the fan recommendation. When paused (`Disturbed`, `Idle`, `Unavailable`), the current fan mode is held. The MPC only regulates `heat` and `cool`; in any other HVAC mode it reports `Idle`, unless that mode has a fixed fan speed (status `Fixed`, set by the feature manager, not by the MPC). A `force_fan` override reports `Forced`.
 
 ## Goals
 
@@ -35,7 +35,7 @@ control cycle, right after recomputing its regulated setpoint.
 7. Append MPC information to the CSV log.
 8. Push the decision to the sensors (`update_from_mpc()`) and to the VTherm's `mpc_fan` attribute.
 9. Apply the effective fan when it differs from the current one; the MPC recommendation is
-   applied only when its status is actionable (`Ready`, `Setpoint drop`, `Overshoot`, `Low confidence`), the
+   applied only when its status is actionable (`Ready`, `Setpoint boost`, `Setpoint drop`, `Overshoot`, `Low confidence`), the
    current fan is held otherwise (`Disturbed`, `Idle`, `Unavailable`).
 
 ### HA Entities
@@ -77,6 +77,12 @@ the demand between two cycles (`_track_setpoint`); while the comfort error stays
 `SETPOINT_DROP_LEARNING_COOLDOWN`. A comfort error below the threshold without such a move is an
 **overshoot**: the normal selection runs, then the lowest speed the step-down guard allows is taken
 (hysteresis is skipped, the min interval still applies) and no cooldown starts.
+
+A **setpoint boost** is the opposite move: the user's setpoint asks for at least
+`SETPOINT_BOOST_DEMAND` (1 °C) more between two cycles — the evening drop from 24 to 22 °C in cool.
+The MPC returns the strongest speed at once (status `Setpoint boost`, min interval bypassed) and keeps
+it until the comfort error is back within the deadband; a move back, a mode change or `off` cancels it.
+A smaller raise of at least the deadband only lets a climb bypass the min interval.
 
 ## Learned Thermal Model
 
@@ -195,7 +201,9 @@ minutes, in 2-minute steps. The candidate fan action is held constant over the h
 effective slope is recomputed at each step from the simulated comfort error (see the gap-dependent
 slope model above). During the first `dead_time` minutes **every** candidate — the current speed
 included — follows the observed slope, then its own model: staying and switching start from the same
-trajectory. The simulator supports both `heat` and `cool`; cooling uses the same learned
+trajectory. The observed slope is VTherm's, bounded by `sensor_resolution × 60 / t` once the reading
+has not changed for `t` minutes (`_bounded_slope`): VTherm only recomputes its slope when the sensor
+publishes, so a room that stopped moving would otherwise keep the slope of its last step for hours. The simulator supports both `heat` and `cool`; cooling uses the same learned
 effective-power model with the sign inverted back to room-temperature evolution.
 
 Each candidate mode gets a scalar cost:
@@ -204,32 +212,52 @@ Each candidate mode gets a scalar cost:
 J(mode) =
     mean over steps of [ comfort_error × urgency
                          + 3.0 × overshoot²
-                         + 12.0 × urgency × floor_violation + 30.0 × floor_violation² ]
+                         + 12.0 × urgency × floor_violation + 30.0 × floor_violation²
+                         + 160 × (16 if t > 0 else 1) × huber_0.3(t) ]
   + 0.15 × fan_step_distance
-  + 1.0 × 1.82^rank × (0.15 inside the hold zone)
+  + 0.1 × 1.82^rank × (0.15 inside the hold zone)
 ```
 
 Where, with `e` the simulated comfort error against the user's setpoint (positive = short):
 
 - `comfort_error = max(|e| - deadband, 0)`, urgency `1 + 2 × comfort_error`
 - `overshoot = max(-e - tolerance, 0)` — going past target (`tolerance` = 0.3 inside the hold zone, else 0)
-- `floor_violation = max(e - deadband, 0)` — a shortfall beyond the deadband: below the setpoint in
-  heat, **above** it in cool
+- `floor_violation = max(e, 0)` — any shortfall: below the setpoint in heat, **above** it in cool
+- `t = e + TRACKING_TARGET_OFFSET` — the distance to a tracking target 0.12 °C inside the band on the
+  comfortable side (below the setpoint in cool, above it in heat); `huber_0.3` is quadratic up to
+  0.3 °C, linear beyond, and the short side weighs 16 times the other (`TRACKING_*`, `_tracking_cost`)
 - `fan_step_distance` penalizes unnecessary fan jumps
-- the energy term grows geometrically with the rank; one more rank costs what ~0.05–0.13 °C of
-  sustained shortfall costs (a shortfall `x` beyond the deadband costs `13x + 56x²` per step)
+- the energy term grows geometrically with the rank and is a tie-breaker: one rank is worth about
+  0.01–0.03 °C of sustained tracking error
 
-Every thermal term is zero inside the deadband: the deadband is a real "no action" zone on both sides,
-where energy alone decides. Averaging over the steps keeps the costs, the energy term and the
-hysteresis margins on one scale whatever the dead time. The minimum interval is a gate (see below),
-not a cost. The weights were calibrated on the closed-loop plant of `tests/closed_loop.py`.
+Comfort comes first. The deadband is a **decision** hysteresis (switch margins, hold zone,
+escalation), not a zone the cost ignores: with a free deadband the controller let the room sit at its
+warm edge in cool, and a 0.2 °C sensor plus a 10-minute actuator delay turned every load bump into time
+spent too warm. The asymmetric tracking term makes an excursion to the short side cheaper to prevent
+than to correct. Averaging over the steps keeps the costs, the energy term and the hysteresis margins
+on one scale whatever the dead time. The minimum interval is a gate (see below), not a cost. The
+weights were calibrated on two closed-loop plants (see [Calibration](#calibration)).
 
 The selected mode is the one with the lowest total cost.
-To avoid fan yo-yo near the setpoint, a recommendation that changes the fan must also beat the current
-mode by a minimum gain (`_required_switch_gain`: 0.2 far from target, 0.3 approaching, 0.5 inside the
-deadband, +0.2 outside the established phase, +0.1 per rank, +0.4 + 1.0/°C for a step down while under
-target). If the gain is only marginal, the MPC controller keeps the current fan and reports that
-hysteresis blocked the switch.
+A recommendation that changes the fan must also beat the current mode by a minimum gain
+(`_required_switch_gain`: 0.05 far from target, 0.075 approaching, 0.125 inside the deadband, +0.05
+outside the established phase, +0.025 per rank, +0.4 + 1.0/°C for a step down while short of the
+tracking target). These margins only filter out ties; stability comes from the guards below, which do
+not trade comfort for fewer changes. If the gain is only marginal, the MPC controller keeps the current
+fan and reports that hysteresis blocked the switch.
+
+Step-down guards, all reported in `mpc_reason`:
+
+- **Below target** (`_step_down_hold_note`) — while the room is short of the tracking target, a step
+  down waits for the established phase and for a predicted shortfall at 10 minutes under the reserve.
+- **Within the band** — while the comfort error is above `-deadband`, a weaker speed that the model
+  itself sees losing ground after the dead time (predicted error growing from 10 to 30 minutes) is not
+  taken: the cost finds it harmless over the horizon, but by the time the coarse reading shows the
+  drift and a stronger speed lands, the room is past the band.
+- **Multi-rank drop** — a drop of more than one rank goes only to a speed whose own full profile
+  sustains progress (`MIN_VIABLE_MULTI_RANK_STEPDOWN_SLOPE`); a speed with no profile or a partial one
+  does not qualify, except in an Overshoot. While the room is short of the setpoint, every step down is
+  one rank at a time.
 
 An unlearned candidate is estimated from the nearest learned profile along the ladder, then bounded by
 the current speed (`_bound_by_current`): a weaker speed is never rated above the speed running now, a
@@ -248,8 +276,8 @@ changes have been seen.
 
 A purely cost-driven controller never visits a speed it has no profile for, and a speed that is never visited never gets a profile. The guards and strategies below break that loop; all are diagnosed in `mpc_reason`.
 
-- **Learning hold** — while the current speed has no measured profile, the change interval is raised to `gate_dead_time × MIN_ESTABLISHED_RATIO + LEARNING_HOLD_EXTRA_MINUTES` (`gate_dead_time` = the learned dead time capped at `DEAD_TIME_MAX_FOR_GATE`, 15 min), so the learning gate has time to record samples before the speed is left. Released by the confirmed escalation, by an overshoot that keeps worsening past the escalation threshold, by an abandoned probe, and not applied at all past `MULTI_RANK_JUMP_ERROR` or below `THRESHOLD_TARGET_DROP`.
-- **Climb guard** — a move of more than one rank *up* may not skip an intermediate speed that has no measured profile and a positive estimated slope: that rung is selected instead, because it can only be measured under load. Exceptions: comfort error above `MULTI_RANK_JUMP_ERROR` (a setpoint step is a recovery and belongs on the strongest speed at once) and the emergency escalation. The pre-existing step-down guard (no multi-rank drop to a profile that cannot sustain progress) is unchanged.
+- **Learning hold** — while the current speed has no measured profile, the change interval is raised to `gate_dead_time × MIN_ESTABLISHED_RATIO + LEARNING_HOLD_EXTRA_MINUTES` (`gate_dead_time` = the learned dead time capped at `DEAD_TIME_MAX_FOR_GATE`, 15 min), so the learning gate has time to record samples before the speed is left. Released by the confirmed escalation, by an overshoot that keeps worsening past the escalation threshold, by an abandoned probe, and not applied at all past `out_of_band_error` (`deadband + 0.5 × sensor_resolution`: the first reading past the band edge on the short side — comfort first) or below `THRESHOLD_TARGET_DROP`.
+- **Climb guard** — a move of more than one rank *up* may not skip an intermediate speed that has no measured profile and a positive estimated slope: that rung is selected instead, because it can only be measured under load. It applies only while the room is within the band: past `out_of_band_error`, and on an emergency escalation, the climb is decided on cost alone.
 - **S1, exploration probe** (`exploration_probe`, on by default) — when the final decision is to stay, the comfort error is within the deadband, the phase is `ESTABLISHED`, `|bias| < PROBE_MAX_BIAS` (0.1 °C/h), the speed one rank below has no measured profile and was not probed for `PROBE_INTERVAL_HOURS` (6 h; `ThermalLearning.record_probe` / `last_probe_time`, persisted as `probe_times`/`probe_count`), the controller switches to it. The learning hold keeps it; the probe is abandoned (hold released, change allowed at once) when the comfort error exceeds `deadband + sensor_resolution`.
 - **S2, information bonus** (`exploration_ucb`, off) — inside the deadband, `INFO_BONUS / sqrt(1 + measured_minutes / SAMPLE_INTERVAL_MINUTES)` (1.0) is subtracted from each candidate's cost.
 - **S3, measurement under load** (`exploration_under_load`, off) — when a climb survives the guards outside a recovery (no escalation, comfort error ≤ `MULTI_RANK_JUMP_ERROR`), the lowest unmeasured rung on the way whose slope at the current error plus the bias is positive is selected instead.
@@ -292,10 +320,69 @@ Current files involved:
 
 ## Validation
 
-- `tests/closed_loop.py` is a closed-loop plant (inverter capacity following the error, actuator delay,
-  power lag, 0.2 °C sensor publishing on change, VTherm EMA slope); `tests/test_closed_loop.py` asserts
-  fewer than 0.5 fan changes per hour and a comfort MAE under 0.25 °C over 48 h on several plant
-  variants, reports the T+30 forecast error next to persistence, and drives the real feature manager
-  from a cold-ish start to check that every speed gets measured.
+- `tests/closed_loop.py` is a closed-loop plant shaped on the production trace (see
+  [Calibration](#calibration)); `tests/test_closed_loop.py` compares the controller, per variant and
+  seed, with the 8d7bccd one replayed on the same plant (comfort MAE, time within ±0.2 °C, time too
+  warm, evening descent, within documented margins), checks the evening setpoint boost, reports the T+30
+  forecast error next to persistence, and drives the real feature manager from a cold-ish start to
+  check that every speed gets measured.
 - `scripts/replay_bench.py` replays recorded CSV traces in open loop: decisions are compared, the
   temperature does not react to them. It reports the forecast MAE next to the persistence baseline.
+
+## Calibration
+
+The cost weights, the margins and the guards were chosen on two closed-loop plants, comfort first,
+against the 8d7bccd controller replayed on the same plant, variant and seed. Comfort is measured on the
+**true** room temperature against the **user's** setpoint, over the minutes the unit cools. The
+number of fan changes was not a target.
+
+**`tests/closed_loop.py`** — cooling 10:00–24:00, user setpoint 24 °C then 22 °C from 21:30, the room
+relaxing toward 26 °C at night; VTherm's auto-regulation integrating the comfort error into an offset
+(down to −0.8 °C) on which the inverter unit regulates; a 10-minute actuator delay and a 6-minute power
+lag; a 0.2 °C sensor publishing on change and VTherm's EMA slope. Seven variants × 3 seeds × 72 h, true
+profiles seeded (`partial`: low and silent unknown). Ranges over the seeds:
+
+| Variant   | Controller | Comfort MAE (°C) | ±0.2 °C (%) | Too cold (%) | Too warm (%) | Descent (min) | Changes/h | Superhigh (%) |
+|-----------|------------|------------------|-------------|--------------|--------------|---------------|-----------|---------------|
+| base      | 8d7bccd    | 0.31–0.32        | 50–59       | 22–32        | 18.1–18.7    | 94–99         | 0.57–0.79 | 41–46         |
+|           | current    | 0.27             | 60–65       | 16–22        | 18.5–18.7    | 93–94         | 1.24–1.50 | 26–32         |
+| load0.3   | 8d7bccd    | 0.36–0.37        | 41–44       | 39–42        | 16.9–17.0    | 91            | 0.69–0.76 | 32            |
+|           | current    | 0.26             | 59–60       | 23–25        | 16.5         | 84            | 0.69–0.74 | 19            |
+| load0.7   | 8d7bccd    | 0.34             | 51–52       | 26–27        | 22.1–22.5    | 114–115       | 0.48      | 69–70         |
+|           | current    | 0.29–0.30        | 62–66       | 10–16        | 22.3–23.5    | 112–114       | 1.19–1.33 | 50–53         |
+| load0.85  | 8d7bccd    | 0.35–0.37        | 47–48       | 26–27        | 26.0–26.6    | 131–137       | 0.40–0.45 | 73–78         |
+|           | current    | 0.30             | 64–65       | 9–10         | 25.4–25.8    | 124–126       | 1.17–1.21 | 60–65         |
+| gain0.2   | 8d7bccd    | 0.45–0.48        | 24–36       | 37–48        | 27.3–27.5    | 150           | 0.69–0.81 | 39–43         |
+|           | current    | 0.33–0.34        | 67–69       | 4–6          | 27.3–27.4    | 150           | 1.45–1.50 | 36            |
+| slowdelay | 8d7bccd    | 0.37             | 39–40       | 39–40        | 20.1–21.4    | 98–103        | 0.76      | 51–53         |
+|           | current    | 0.31–0.34        | 45–58       | 22–35        | 20.1–20.3    | 97–100        | 1.14–1.29 | 33–35         |
+| partial   | 8d7bccd    | 0.37–0.38        | 44–48       | 33–37        | 18.7–18.8    | 99–102        | 0.55–0.62 | 35–36         |
+|           | current    | 0.36             | 41–42       | 39           | 19.1–19.4    | 99–102        | 0.45      | 24–25         |
+
+Per variant × seed (21 runs): comfort MAE lower on all 21, time within ±0.2 °C higher on 18 (not on
+`partial`, which stays on the cool side for want of a profile to step down on), time too warm at
+most +1.2 points, evening descent at most +1.7 min. The residual warm time comes from the morning
+restart: the unit resumes on the speed it stopped on, which is a weak one for a controller that does not
+overcool the evening, so the first 10–15 minutes of the 10:00 recovery run on it.
+
+**Trace-calibrated bench** (outside the repository) — the identified plant of the production trace
+(20 Aug–4 Oct 2026, 3 variants × 3 seeds, every session replayed with its recorded outdoor
+temperature and schedule, a VTherm PI model) driving the real feature manager, with no prior learning
+(`none`) or with the state 8d7bccd had learned (`legacy`). With no prior learning, ranges over the
+seeds:
+
+| Variant | Controller | Comfort MAE (°C) | ±0.2 °C (%) | Too cold (%) | Too warm (%) | Too warm at 24 °C (%) | Too warm at 22 °C (%) | Descent (min) | Changes/h | Superhigh (%) |
+|---------|------------|------------------|-------------|--------------|--------------|-----------------------|-----------------------|---------------|-----------|---------------|
+| V1      | 8d7bccd    | 0.66–0.69        | 30–36       | 46–53        | 15.6–17.6    | 4.6–5.7               | 48–54                 | 71–80         | 0.90–0.92 | 27–33         |
+|         | current    | 0.66–0.68        | 31–36       | 48–53        | 15.6–16.6    | 4.5–5.2               | 47–52                 | 70–75         | 0.70–0.82 | 28–38         |
+| V2      | 8d7bccd    | 0.64–0.67        | 30–37       | 45–53        | 15.9–18.1    | 4.6–6.3               | 48–54                 | 69–80         | 0.91–1.07 | 32–37         |
+|         | current    | 0.63–0.66        | 32–38       | 45–52        | 15.8–17.8    | 4.8–6.0               | 47–54                 | 69–79         | 0.74–0.80 | 32–39         |
+| V3      | 8d7bccd    | 0.64–0.68        | 30–37       | 45–53        | 15.6–17.8    | 5.2–6.2               | 47–53                 | 70–78         | 0.82–1.09 | 31–37         |
+|         | current    | 0.61–0.64        | 33–40       | 43–50        | 15.9–17.5    | 5.1–6.0               | 46–53                 | 68–80         | 0.76–0.78 | 30–39         |
+
+Per variant × seed, both starts (18 runs): comfort MAE lower or equal on 17 (+0.001 on one), time
+within ±0.2 °C higher on 15 (−0.3 to −0.6 points on the others), time too warm at 22 °C lower or equal
+on all 18, time too warm at 24 °C lower or equal on 11 (at most +0.6 points), evening descent (median)
+shorter or equal on 15 (+1.5 to +3 min on the others: the room starts the descent a little warmer than
+under 8d7bccd, which overcooled the day). The mean comfort error on this bench is dominated by the
+22 °C slot, which the unit cannot reach before midnight on most evenings.

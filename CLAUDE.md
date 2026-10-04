@@ -23,7 +23,7 @@ integration lives under `custom_components/vtherm_mpc_fan/`. Key modules:
 ## Domain Vocabulary
 
 - **error**: always positive when the system needs more heating/cooling (`target - current` in heat, `current - target` in cool). The MPC's comfort error uses the **user's** setpoint (`target_temperature`), not VTherm's `regulated_target_temperature`; their difference is the `regulation_offset` (regulated − user), stored with each slope sample
-- **setpoint drop / overshoot**: `Setpoint drop` only follows a genuine move of the user's setpoint (≥ 1 °C away from the demand between two cycles, `MPCController._track_setpoint`) and starts the learning cooldown; a room > 1 °C past an unchanged setpoint is `Overshoot` (lowest speed the guards allow, no cooldown)
+- **setpoint drop / overshoot / boost**: `Setpoint drop` only follows a genuine move of the user's setpoint (≥ 1 °C away from the demand between two cycles, `MPCController._track_setpoint`) and starts the learning cooldown; a room > 1 °C past an unchanged setpoint is `Overshoot` (lowest speed the guards allow, no cooldown); a move of ≥ `SETPOINT_BOOST_DEMAND` (1 °C) *toward* more demand is `Setpoint boost` (strongest speed until back within the deadband)
 - **legacy samples**: 5-tuple slope samples from stores older than `LEARNING_DATA_FORMAT` 2; their error was measured against the regulated setpoint, so they weigh `LEGACY_SAMPLE_WEIGHT` in the fits
 - **effective_slope**: learned slope per fan mode, gap-dependent (`slope(error) = intercept + gain * error`, weighted Theil–Sen fit in `ThermalLearning`, gain shrunk toward the pooled gain with `n_eff`), evaluated at `min(REFERENCE_SLOPE_ERROR, error_max)` — never extrapolated past the errors measured (*partial* profile otherwise); raw slope comes from VTherm's own EMA
 - **dead_time**: thermal lag between a fan change and the first move of the room temperature, of at least one sensor step, in the direction the change should produce (learned via response events, `_detect_response`). Resolved **per hvac mode** — heating lag and cooling lag are different numbers, and `get_dead_time()` pools every mode when called without one. The learned value sets the horizon, the adaptive change interval and each candidate's simulated `change_delay`; the learning gate, the phase split and the learning hold use it capped at `DEAD_TIME_MAX_FOR_GATE` (15 min, `MPCController.gate_dead_time()`).
@@ -51,10 +51,12 @@ VTherm drives the cycle, not a private timer: `manager.py → MpcFanFeatureManag
 
 The MPC controller (`mpc_controller.py`) evaluates all candidate fan modes over `dead_time + DEFAULT_HORIZON_MINUTES` (60 min); every candidate, the current one included, follows the observed slope during the dead time:
 
-- **Cost function**: thermal terms averaged per step — comfort error + overshoot penalty + floor violation (shortfall *beyond the deadband*) — + mode-change distance cost + geometric mode-rank cost (`MODE_RANK_COST × MODE_POWER_RATIO ** candidate_index`, one rank ≈ 0.05–0.13 °C of sustained shortfall, scaled down near equilibrium via `HOLD_RANK_SCALE`). No term charges a predicted error inside the deadband; the min interval is a gate, not a cost
+- **Cost function**: comfort first. Thermal terms averaged per step — comfort error + overshoot penalty + floor violation (any shortfall) + asymmetric Huber tracking of a target `TRACKING_TARGET_OFFSET` (0.12 °C) inside the band on the comfortable side (`_tracking_cost`, short side × `TRACKING_SHORTFALL_FACTOR`) — + mode-change distance cost + geometric mode-rank cost (`MODE_RANK_COST` 0.1 `× MODE_POWER_RATIO ** candidate_index`, a tie-breaker: one rank ≈ 0.01–0.03 °C of sustained error, scaled down near equilibrium via `HOLD_RANK_SCALE`). The deadband is a decision hysteresis, not a free zone of the cost; the min interval is a gate, not a cost
 - **Escalation**: growth of the comfort error since the change past `max(0.15, 1.5 × sensor_resolution)` on 2 consecutive cycles (immediate past `MULTI_RANK_JUMP_ERROR`); `sensor_resolution` is auto-detected from the readings
-- **Hysteresis**: requires minimum cost improvement before switching (margin scales with proximity to target)
-- **Step-down guards**: blocks downward moves when under target and not established or predicted shortfall
+- **Hysteresis**: requires minimum cost improvement before switching (margin scales with proximity to target; the margins only filter ties)
+- **Step-down guards**: blocks downward moves when short of the tracking target and not established or predicted shortfall; within the band, never to a speed the model sees losing ground after the dead time; multi-rank drops only to a full, viable profile (any profile in Overshoot), and one rank at a time while short of the setpoint
+- **Setpoint boost**: a user move asking ≥ 1 °C more → strongest speed until back within the deadband
+- **Observed slope**: VTherm's slope bounded by `sensor_resolution × 60 / minutes since the reading last changed` (`_bounded_slope`)
 - **Disturbance bias**: EMA tracker for unmodeled effects (solar, occupancy); decays during paused periods
 - **Monotone constraint**: weighted isotonic regression (PAV) over the learned profiles (partial ladders included), ties separated one `LADDER_CAPACITY_RATIO` step apart
 - **Cold start**: while no profile of the HVAC mode exists, a step law on the comfort error replaces the cost-based choice
@@ -66,7 +68,7 @@ Every `evaluate()` return path funnels through `_payload()`, which also logs the
 
 - Framework: **pytest** in `tests/`; run with `python -m pytest tests/ -q`
 - Never use `time.sleep`; mock `time.time` via `unittest.mock.patch`, or give `ThermalLearning(clock=...)` / `from_dict(data, clock=...)` a settable clock
-- Closed-loop behaviour (changes/h, comfort MAE, exploration) is tested on the plant of `tests/closed_loop.py` (`tests/test_closed_loop.py`, which also drives the real manager); calibrate cost weights there, the replay bench is open loop
+- Closed-loop comfort (MAE, time in band, time too warm, evening descent against the user's setpoint, per variant and seed, versus the 8d7bccd controller replayed on the same plant) and exploration are tested on the plant of `tests/closed_loop.py` (`tests/test_closed_loop.py`, which also drives the real manager); calibrate cost weights there (see `docs/mpc_mode.md`, Calibration), the replay bench is open loop
 - Protected-member access (`manager._is_hvac_idle()`) is normal in tests — add `# noqa: SLF001` on that line, not a module-level pylint disable
 - Every test function and helper needs a docstring
 - Test helpers: `_build_learning()` / `_build_mpc(learning)` in `test_mpc_controller.py`; `_make_runtime()` / `_make_hass()` / `_build_manager()` in `test_manager.py` build stand-ins for VTherm's `InterfaceThermostatRuntime` and a `hass` stub respectively
@@ -115,7 +117,7 @@ Tests that need a real Home Assistant core (setup/unload, services, flows) reque
 - Fits use an effective sample size `n_eff = n/(1+2ρ)` (ρ = lag-1 autocorrelation of the residuals) and shrink each profile's gain toward the gain pooled over the HVAC mode's speeds (`GAIN_PRIOR_SAMPLES`)
 - `PROFILE_RETENTION_SAMPLES = 40` — newest samples kept per profile regardless of age, so rare speeds accumulate across 7-day windows
 - `MIN_SAMPLES_LEARNING = 120` — global readiness; sized to what the window can hold (the old 240 was unreachable on real hardware)
-- `LEARNING_HOLD_EXTRA_MINUTES`, `MULTI_RANK_JUMP_ERROR` (mpc_controller.py) — the exploration guards: hold an unmeasured current speed until it can be sampled; never climb past an unmeasured, viable-looking rung unless the error is a recovery (> 1 °C) or the escalation guard fires
+- `LEARNING_HOLD_EXTRA_MINUTES` (mpc_controller.py) and `MPCController.out_of_band_error` (deadband + half a sensor step) — the exploration guards: hold an unmeasured current speed until it can be sampled; never climb past an unmeasured, viable-looking rung — both only while the room is within the band (comfort first), and the climb rule also yields to the escalation guard
 - `PROBE_INTERVAL_HOURS`, `PROBE_MAX_BIAS` (mpc_controller.py) — the opportunistic downward probe (`CONF_EXPLORATION_PROBE`, on by default): one rank down to an unmeasured speed while the room holds; `INFO_BONUS` (`CONF_EXPLORATION_UCB`) and the measurement under load (`CONF_EXPLORATION_UNDER_LOAD`) are off by default
 
 ## Important Constraints

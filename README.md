@@ -21,7 +21,7 @@ A Model Predictive Control (MPC) fan-speed controller for [Versatile Thermostat]
   - [One control cycle](#one-control-cycle)
   - [MPC Controller](#mpc-controller)
     - [Which setpoint](#which-setpoint)
-    - [Setpoint drop and overshoot](#setpoint-drop-and-overshoot)
+    - [Setpoint boost, setpoint drop and overshoot](#setpoint-boost-setpoint-drop-and-overshoot)
     - [Cost Function](#cost-function)
     - [Hysteresis and Guards](#hysteresis-and-guards)
     - [Phase Detection](#phase-detection)
@@ -141,7 +141,7 @@ All parameters can be changed at any time via **Settings → Devices & Services 
 
 | Parameter             | Default  | Range           | Description                                                                                                                                                             |
 | ---------------------- | -------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Deadband**           | `0.2°C`  | `0.0` – `5.0°C` | Comfort zone around the user's setpoint: a predicted error inside it costs nothing, on either side, so only energy decides there. Increase to reduce fan changes.                                                                         |
+| **Deadband**           | `0.2°C`  | `0.0` – `5.0°C` | Decision hysteresis around the user's setpoint: the switch margins, the hold zone and the escalation are sized on it. The cost itself tracks a target inside the band, comfort first. Increase to reduce fan changes.                      |
 | **Min Interval**       | `10 min` | `1` – `60 min`  | Minimum time between non-emergency fan changes. Prevents rapid oscillations.                                                                                             |
 | **Data Collection**    | `true`   | —                | Records one CSV row per control cycle in the HA config folder (`vtherm_mpc_fan_data_XXXXXXXX.csv`, max 10 MB, auto-rotated). Useful for offline analysis.               |
 | **Defrost Entity**     | *(none)* | —                | Optional entity (`binary_sensor`, `sensor`, or `input_boolean`) that reports when the heat pump is in a defrost cycle. VTherm does not report this itself. See [Defrost Detection](#defrost-detection). |
@@ -207,8 +207,9 @@ See [docs/mpc_mode.md](docs/mpc_mode.md) for the full technical design.
 
 VTherm's auto-regulation shifts the user's setpoint (`target_temperature`) into a *regulated* one (`regulated_target_temperature`), the value actually sent to the unit. The MPC judges comfort — its cost, the deadband, the escalation and learning holds, the setpoint drop — against **the user's setpoint**: the regulated one drifts with the regulation (on the production trace it sat 0.6 °C below the user's in median while the strongest speed ran), and regulating the fan on it chased that drift. The difference, `regulation_offset` (regulated − user), is kept as a measurement: it is stored with every learning sample and may enter the learned model (see [Per-Mode Fan Profiles](#per-mode-fan-profiles)).
 
-### Setpoint drop and overshoot
+### Setpoint boost, setpoint drop and overshoot
 
+- **Setpoint boost**: the user moved the setpoint by at least 1 °C *toward* more demand between two cycles (lower in cool, higher in heat — the evening drop from 24 to 22 °C). The MPC sends the strongest speed at once, bypassing the min interval, and keeps it until the room is back within the deadband. A smaller raise (at least the deadband) only lets a climb bypass the min interval.
 - **Setpoint drop**: the user moved the setpoint away by at least 1 °C between two cycles (lower in heat, higher in cool) and the room is now more than 1 °C past it. The MPC goes straight to the lowest speed, and slope learning pauses for 30 minutes. The status lasts until the room is back within 1 °C, or the setpoint is raised again.
 - **Overshoot**: the room is more than 1 °C past the setpoint *without* any setpoint change. The MPC selects the lowest speed the guards allow (min interval, step-down guard), and learning goes on — nothing about the room's response is abnormal.
 
@@ -220,19 +221,20 @@ Each candidate fan mode is scored with:
 | --------------------------- | ----------------------------------------------------------------------------- |
 | **Comfort error × urgency** | Penalizes being outside the deadband (either side), with dynamic step-by-step urgency |
 | **Overshoot²**               | Penalizes going past the target temperature                                   |
-| **Floor violation**         | Penalizes a predicted *shortfall* beyond the deadband — below the setpoint in heat, above it in cool (linear + quadratic) |
+| **Floor violation**         | Penalizes any predicted *shortfall* — below the setpoint in heat, above it in cool (linear + quadratic) |
+| **Tracking**                | Huber cost of the distance to a target 0.12 °C inside the band on the comfortable side; the short side weighs 16× the other |
 | **Mode-change cost**        | Penalizes unnecessary fan jumps (proportional to step distance)              |
-| **Mode-rank cost**          | Energy: `1.0 × 1.82^rank`, so one more rank costs what ~0.05–0.13 °C of sustained shortfall costs |
+| **Mode-rank cost**          | Energy, a tie-breaker: `0.1 × 1.82^rank`, one rank is worth ~0.01–0.03 °C of sustained error |
 
-The thermal terms are averaged over the simulation steps, so costs read "per step" whatever the horizon, and inside the deadband they are zero: there the cheapest speed that keeps the predicted room inside the band wins. A sustained shortfall of `x` °C beyond the deadband costs `13x + 56x²` per step. The minimum interval is a gate, not a cost.
+Comfort comes first. The thermal terms are averaged over the simulation steps, so costs read "per step" whatever the horizon. The deadband is a decision hysteresis, not a zone the cost ignores: a 0.2 °C sensor and a command that lands ~10 minutes late make an excursion to the short side cheaper to prevent than to correct. The minimum interval is a gate, not a cost. The calibration, against the 8d7bccd controller on two closed-loop plants, is in [docs/mpc_mode.md](docs/mpc_mode.md#calibration).
 
 ### Hysteresis and Guards
 
-- **Hysteresis**: a recommendation that changes the fan must beat the current mode by a minimum cost margin. The margin is larger when near the target (0.5) and smaller when far away (0.2), plus 0.2 outside the established phase, 0.1 per rank, and 0.4 + 1.0 per °C of error for a step down while under target.
-- **Step-down hold**: blocks a jump of more than one rank down to a fan mode whose own learned profile cannot sustain progress at the current comfort error — this is what stops the controller diving straight to a speed with no track record of actually holding the room.
+- **Hysteresis**: a recommendation that changes the fan must beat the current mode by a minimum cost margin, which only filters out ties: 0.125 near the target, 0.05 far away, plus 0.05 outside the established phase, 0.025 per rank, and 0.4 + 1.0 per °C for a step down while short of the tracking target.
+- **Step-down guards**: a jump of more than one rank down goes only to a fan mode whose own full learned profile sustains progress (an unknown or partial profile does not qualify, except in an Overshoot), and while the room is short of the setpoint every step down is one rank at a time. Within the band, a weaker speed the model itself sees losing ground after the dead time is not taken: by the time the coarse reading shows the drift, the room would be past the band.
 - **Min interval**: non-emergency changes respect the configured minimum interval between fan changes.
-- **Learning hold**: while the *current* speed has no measured profile (seeded values do not count), the dwell is raised to the learning gate (1.5× the dead time capped at 15 min) plus 10 minutes so the speed can actually be sampled before it is left. A speed that is never measured is never credible on cost and never chosen again, which is how intermediate speeds stayed unknown. The hold yields to comfort: it is released by the escalation guard, by an overshoot that keeps worsening, and it never applies more than 1 °C from target.
-- **Climb guard**: rising more than one rank may not skip over an intermediate speed that has no measured profile and looks viable — that rung is tried first, because a speed can only be measured under load and load is exactly what a rising error means. Recoveries stay direct: past 1 °C of error (a setpoint step) or when the escalation guard fires, the jump goes straight to the strongest speed.
+- **Learning hold**: while the *current* speed has no measured profile (seeded values do not count), the dwell is raised to the learning gate (1.5× the dead time capped at 15 min) plus 10 minutes so the speed can actually be sampled before it is left. A speed that is never measured is never credible on cost and never chosen again, which is how intermediate speeds stayed unknown. The hold yields to comfort: it is released by the escalation guard, by an overshoot that keeps worsening, and it never applies once the room is out of the band on the short side (deadband + half a sensor step).
+- **Climb guard**: rising more than one rank may not skip over an intermediate speed that has no measured profile and looks viable — that rung is tried first, because a speed can only be measured under load and load is exactly what a rising error means. Comfort comes first: once the room is out of the band on the short side, or when the escalation guard fires, the climb is decided on cost alone.
 - **Exploration probe** (option, on by default): a cost driven by estimates seldom chooses a speed nobody measured. While the room holds inside the deadband in an established regime, with a disturbance bias under 0.1 °C/h, the controller steps **one rank down** to a weaker speed that has no measured profile and was not probed in the last 6 hours (`mpc_reason` reads `Exploration probe`). The learning hold then keeps it long enough to be measured — near equilibrium, where it would serve. The probe is abandoned, and the climb back allowed at once, as soon as the comfort error exceeds the deadband plus one sensor step. Probe times are stored with the learning data; `mpc_exploration_probes` counts them.
 - **Exploration bonus** (option, off): inside the deadband each candidate's cost is lowered by `1.0 / √(1 + n)`, `n` its measured regime in 10-minute intervals, so a poorly measured speed wins when the predicted trajectories are close.
 - **Measurement under load** (option, off): when a climb is decided outside a recovery, the controller stops first on the lowest unmeasured speed predicted to make progress (its slope at the current error plus the disturbance bias is positive). It lengthens the climb by about a dead time; it is the only way to measure how a speed's output grows with the error.
@@ -377,7 +379,7 @@ Point-in-time values with no history or automation use are not separate entities
 
 | Key                     | Description                                                                                       |
 | ----------------------- | --------------------------------------------------------------------------------------------------- |
-| `mpc_status`            | `Ready`, `Low confidence`, `Setpoint drop`, `Overshoot` (MPC steering); `Disturbed`, `Idle`, `Unavailable` (paused); `Fixed` (pinned speed), `Forced` (`force_fan`) |
+| `mpc_status`            | `Ready`, `Low confidence`, `Setpoint boost`, `Setpoint drop`, `Overshoot` (MPC steering); `Disturbed`, `Idle`, `Unavailable` (paused); `Fixed` (pinned speed), `Forced` (`force_fan`) |
 | `mpc_reason`            | Explanation of the current decision                                                               |
 | `mpc_fan_mode`          | Fan mode chosen (by the MPC, the pin or the override)                                             |
 | `mpc_would_change_now`  | Whether the fan is being changed right now                                                        |

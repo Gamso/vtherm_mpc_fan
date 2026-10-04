@@ -28,7 +28,7 @@ Unlike classic MPC, the model parameters (slopes) are **learned online** by `The
 
 The MPC controller lives in `mpc_controller.py` as `MPCController`. This project is a **VTherm Feature Manager plugin**: it has no control loop of its own. `manager.py`'s `MpcFanFeatureManager.refresh_state()` is called by VTherm once per its own control cycle, and calls `mpc_controller.evaluate()` to get a decision dict that feeds sensors/numbers, CSV logs, and the fan command.
 
-When MPC status is actionable (`Ready`, `Setpoint drop`, `Overshoot`, `Low confidence`), the manager applies the fan recommendation. When paused (`Disturbed`, `Idle`, `Unavailable`), the current fan is held.
+When MPC status is actionable (`Ready`, `Setpoint boost`, `Setpoint drop`, `Overshoot`, `Low confidence`), the manager applies the fan recommendation. When paused (`Disturbed`, `Idle`, `Unavailable`), the current fan is held.
 
 ### Key Flow in `evaluate()`
 
@@ -38,7 +38,7 @@ When MPC status is actionable (`Ready`, `Setpoint drop`, `Overshoot`, `Low confi
 3. Compute effective slope, comfort error (user setpoint), dead time (gate-capped for the phase), sensor resolution, escalation state
 4. Update disturbance bias (EMA tracking)
 5. Pause conditions: window-open, defrost, HVAC idle → return "Disturbed"
-6. Setpoint drop (genuine user setpoint move, `_track_setpoint`) → return lowest mode immediately; a comfort error < −1 °C without one is `Overshoot` (lowest mode the guards allow, after the simulation)
+6. Setpoint boost (user move asking ≥ 1 °C more) → strongest mode until back within the deadband; setpoint drop (genuine user setpoint move, `_track_setpoint`) → return lowest mode immediately; a comfort error < −1 °C without one is `Overshoot` (lowest mode the guards allow, after the simulation)
 7. Build monotone slope map (over the learned profiles, partial ladders included)
 8. Simulate ALL fan modes over the horizon (dead time + 60 min); all of them follow the observed slope during the dead time
 9. Select best by lowest cost (eligibility: climb guard, multi-rank step-down guard; overshoot → lowest eligible)
@@ -55,12 +55,13 @@ Each candidate fan mode is simulated step-by-step over the horizon:
 |---|---|---|
 | `comfort_error × urgency` | 1.0 × (1 + excess error × 2) | Penalizes being outside deadband |
 | `overshoot²` | 3.0 | Penalizes going past target |
-| `floor_violation` (linear) | 12.0 × urgency | Penalizes a shortfall beyond the deadband (below target in heat, above in cool) |
+| `floor_violation` (linear) | 12.0 × urgency | Penalizes any shortfall (below target in heat, above in cool) |
 | `floor_violation²` | 30.0 | Strongly penalizes large shortfalls |
+| tracking (`_tracking_cost`) | 160 × Huber(0.3), × 16 on the short side | Distance to a target 0.12 °C inside the band on the comfortable side |
 | `mode_change_cost` | 0.15 × distance | Penalizes switching fan modes |
-| `mode_rank_cost` | 1.0 × `1.82^rank`, scaled to 0.15× near equilibrium (`HOLD_RANK_SCALE`) | Energy: one more rank costs what ~0.05–0.13 °C of sustained shortfall costs |
+| `mode_rank_cost` | 0.1 × `1.82^rank`, scaled to 0.15× near equilibrium (`HOLD_RANK_SCALE`) | Energy, a tie-breaker: one rank ≈ 0.01–0.03 °C of sustained error |
 
-The four thermal terms are averaged over the simulation steps (per-step units); all are zero inside the deadband. Cost weights are module-level constants (e.g. `FLOOR_VIOLATION_LINEAR_WEIGHT = 12.0`); calibrate them on the closed-loop plant (`tests/closed_loop.py`, `tests/test_closed_loop.py`), not on the open-loop replay alone.
+The thermal terms are averaged over the simulation steps (per-step units). Comfort comes first: the deadband is a decision hysteresis, not a zone the cost ignores. Cost weights are module-level constants (e.g. `FLOOR_VIOLATION_LINEAR_WEIGHT = 12.0`); calibrate them on the closed-loop plant (`tests/closed_loop.py`, `tests/test_closed_loop.py`), not on the open-loop replay alone.
 
 ### Hysteresis (`_required_switch_gain`)
 
@@ -68,15 +69,15 @@ The MPC requires a minimum cost improvement before switching:
 
 | Situation | Base Margin |
 |---|---|
-| Over-target or far under | 0.2 |
-| Approaching target | 0.3 |
-| Near target (within deadband) | 0.5 |
+| Over-target or far under | 0.05 |
+| Approaching target | 0.075 |
+| Near target (within deadband) | 0.125 |
 
-Plus bonuses for non-established phase (+0.2), step distance (+0.1/step) and a step down while under target (+0.4 + 1.0/°C).
+Plus bonuses for non-established phase (+0.05), step distance (+0.025/step) and a step down while short of the tracking target (+0.4 + 1.0/°C). The margins only filter ties; stability comes from the guards.
 
 ### Step-Down Hold (`_step_down_hold_note`)
 
-Blocks downward fan moves when still under target and either not yet in ESTABLISHED phase or predicted shortfall at 10 min exceeds the reserve threshold.
+Blocks downward fan moves when still short of the tracking target and either not yet in ESTABLISHED phase or predicted shortfall at 10 min exceeds the reserve threshold; and, while the comfort error is above `-deadband`, any step down to a speed whose predicted error grows from 10 to 30 minutes (it would let the room drift back out of the band).
 
 ### Disturbance Bias (`_update_disturbance_bias`)
 

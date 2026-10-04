@@ -37,7 +37,7 @@ Keep this in sync with `_HEADER` in `custom_components/vtherm_mpc_fan/data_colle
 | `learning_ready` | `True` when the model has enough samples overall |
 | `dead_time` | Learned thermal dead time (minutes) |
 | `is_window_open` | `True`/`False` |
-| `mpc_status` | `Ready` / `Low confidence` / `Setpoint drop` / `Overshoot` / `Disturbed` / `Idle` / `Unavailable` / `Fixed` / `Forced` |
+| `mpc_status` | `Ready` / `Low confidence` / `Setpoint boost` / `Setpoint drop` / `Overshoot` / `Disturbed` / `Idle` / `Unavailable` / `Fixed` / `Forced` |
 | `mpc_fan` | Fan mode the MPC itself would choose (before force/pause overrides) |
 | `mpc_would_change` | `yes` / `no` — whether the MPC would change the fan mode right now |
 | `mpc_cost` | MPC optimization cost of the chosen mode |
