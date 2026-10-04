@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from .log import get_logger
@@ -50,7 +51,11 @@ class MpcFanManagerFactory:
         except Exception:  # pylint: disable=broad-except
             return False
 
-        if isinstance(entry_infos, dict):
+        # The Protocol types entry_infos as ``ConfigData | dict``, ConfigData being
+        # a MappingProxyType -- not a dict. Today's VTherm hands a dict, but a
+        # read-only mapping must not silently fall through to the fan-mode
+        # fallback, which is None at construction time.
+        if isinstance(entry_infos, Mapping):
             if entry_infos.get(CONF_THERMOSTAT_TYPE) != CONF_THERMOSTAT_CLIMATE:
                 return False
         elif getattr(thermostat, "underlying_fan_modes", None) is None:

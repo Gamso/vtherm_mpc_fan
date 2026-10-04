@@ -10,7 +10,15 @@ on:
 jobs:
     tests:
         runs-on: ubuntu-latest
-        name: Run tests
+        name: Run tests (vtherm_api ${{ matrix.vtherm_api }})
+        # The plugin declares vtherm_api >= 0.4.0 (the version that added the
+        # feature-manager factory registry). requirements_test.txt resolves to
+        # the latest release, so the floor is pinned in a job of its own --
+        # otherwise it would never be exercised.
+        strategy:
+            fail-fast: false
+            matrix:
+                vtherm_api: ["latest", "0.4.0"]
         steps:
             - name: Check out repository
               uses: actions/checkout@v4
@@ -25,6 +33,11 @@ jobs:
             - name: Install dependencies
               run: |
                   pip install -r requirements_test.txt
+
+            - name: Pin vtherm_api to the supported floor
+              if: matrix.vtherm_api != 'latest'
+              run: |
+                  pip install "vtherm_api==${{ matrix.vtherm_api }}"
 
             - name: Run tests
               run: |

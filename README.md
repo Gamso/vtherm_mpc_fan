@@ -15,6 +15,7 @@ A Model Predictive Control (MPC) fan-speed controller for [Versatile Thermostat]
     - [HACS (Recommended)](#hacs-recommended)
     - [Manual Installation](#manual-installation)
   - [Requirements](#requirements)
+    - [Version policy](#version-policy)
   - [Quick Setup](#quick-setup)
   - [Configuration Parameters](#configuration-parameters)
   - [One control cycle](#one-control-cycle)
@@ -111,9 +112,16 @@ Alternatively, click the button below to open this repository directly in HACS:
 
 ## Requirements
 
-- **Versatile Thermostat ≥ 10.2.0**, which provides `vtherm_api` (the plugin API this project registers with)
+- **Versatile Thermostat ≥ 10.2.0**, which provides `vtherm_api` ≥ 0.4.0 (the plugin API this project registers with) — see [Version policy](#version-policy)
 - An **`over_climate` VTherm already configured** in VTherm, on top of a climate entity that exposes **two or more manual fan speeds** (e.g. `low`, `medium`, `high`)
 - VTherm's own auto-fan left **off** (*Auto fan mode* = `None`) on that VTherm — the plugin stands down while it is on, see [Coexisting with other fan plugins](#coexisting-with-other-fan-plugins)
+
+### Version policy
+
+- The plugin only uses the `vtherm_api` surface of **0.4.0** (the feature-manager factory registry, `regulated_target_temperature`, the underlying fan modes, `get_vtherm_logger` / `write_event_log`); nothing from 0.5.0 is required. 0.4.0 shipped with Versatile Thermostat 10.2.0, hence that floor.
+- `vtherm_api` is **not** declared in `manifest.json`: it is installed by Versatile Thermostat (10.2–10.4 require `>=0.4.0`, 10.5 `>=0.5.0`), which is also what the official `vtherm_auto_fan_extended` plugin does. Declaring it would make Home Assistant install the API without the thermostat, and the plugin would then load but never be called — instead of reporting that Versatile Thermostat is missing.
+- The tests declare `vtherm_api>=0.4.0,<1.0`, and CI runs them against both the floor (0.4.0) and the latest release, including a check of the plugin's classes against the API's runtime-checkable Protocols.
+- Set the VTherm's *Auto fan mode* to `None`: VTherm's built-in auto-fan is a competing controller (see [Coexisting with other fan plugins](#coexisting-with-other-fan-plugins)).
 
 ---
 

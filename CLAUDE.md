@@ -90,7 +90,9 @@ black --check custom_components tests   # formatting, enforced by CI (pyproject.
 pylint custom_components/vtherm_mpc_fan # enforced by CI (.pylintrc)
 ```
 
-CI (`.github/workflows/`) runs on every push and PR: pytest, black, pylint, `validate.sh`, hassfest and the HACS action.
+CI (`.github/workflows/`) runs on every push and PR: pytest (twice: latest `vtherm_api` and the 0.4.0 floor), black, pylint, `validate.sh`, hassfest and the HACS action.
+
+**Version policy**: the plugin uses only the `vtherm_api` 0.4.0 surface (Versatile Thermostat ≥ 10.2.0) and does not declare `vtherm_api` in `manifest.json` — VTherm installs it, as for the official `vtherm_auto_fan_extended`. `requirements_test.txt` pins `>=0.4.0,<1.0`; `tests/test_factory.py` checks the factory and the manager against the API's runtime-checkable Protocols. Any new `vtherm_api` member used must either exist in 0.4.0 or be read with a `getattr` fallback.
 
 Tests that need a real Home Assistant core (setup/unload, services, flows) request the `integration` fixture from `tests/conftest.py`; everything else uses the lightweight stand-ins above.
 
