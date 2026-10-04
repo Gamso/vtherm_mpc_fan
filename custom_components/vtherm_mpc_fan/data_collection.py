@@ -11,7 +11,16 @@ CSV columns (in order):
   mpc_status, mpc_fan,
   mpc_would_change, mpc_cost, mpc_confidence,
   mpc_temp_10m, mpc_temp_30m, mpc_known_profiles,
-  mpc_disturbance, defrost_active, hvac_idle
+  mpc_disturbance, defrost_active, hvac_idle, outdoor_temp,
+  user_target_temp, regulation_offset, comfort_error
+
+``target_temp`` and ``current_error`` are the *regulated* setpoint VTherm sends
+to the underlying (``regulated_target_temperature``) and the error against it,
+as they always were. ``user_target_temp`` is the user's own setpoint
+(``target_temperature``), ``regulation_offset`` is regulated minus user (degC,
+raw, not sign-aligned), and ``comfort_error`` is the signed error against the
+user's setpoint (positive = needs more heating/cooling). New columns are only
+ever appended, so scripts that index the historical ones keep working.
 """
 
 import asyncio
@@ -57,6 +66,9 @@ _HEADER = [
     "defrost_active",
     "hvac_idle",
     "outdoor_temp",
+    "user_target_temp",
+    "regulation_offset",
+    "comfort_error",
 ]
 
 # Rotate the file when it exceeds this size (bytes). 10 MB keeps ~200 000 rows.
@@ -102,6 +114,9 @@ class DataCollector:
         defrost_active: bool = False,
         is_hvac_idle: bool = False,
         outdoor_temp: float | None = None,
+        user_target_temp: float | None = None,
+        regulation_offset: float | None = None,
+        comfort_error: float | None = None,
     ) -> None:
         """Append one row to the CSV file outside the event loop."""
         mpc = mpc_decision or {}
@@ -137,6 +152,9 @@ class DataCollector:
             int(defrost_active),
             int(is_hvac_idle),
             round(outdoor_temp, 2) if outdoor_temp is not None else "",
+            round(user_target_temp, 3) if user_target_temp is not None else "",
+            round(regulation_offset, 3) if regulation_offset is not None else "",
+            round(comfort_error, 3) if comfort_error is not None else "",
         ]
         async with self._io_lock:
             await self._hass.async_add_executor_job(self._write_row, row)

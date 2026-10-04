@@ -106,6 +106,25 @@ def apply_configured_fan_order(detected: list[str], configured: list[str] | None
     return ordered
 
 
+@dataclass(slots=True, frozen=True)
+class CycleInputs:
+    """The runtime readings one control cycle works from.
+
+    ``target_temp`` is the regulated setpoint (what VTherm sends to the
+    underlying), ``user_target_temp`` the user's own setpoint, and
+    ``regulation_offset`` regulated minus user (raw degC, None when either is
+    unknown).
+    """
+
+    vtherm_slope: float
+    current_temp: float
+    target_temp: float
+    user_target_temp: float | None
+    regulation_offset: float | None
+    hvac_mode: str
+    current_fan: str | None
+
+
 @dataclass(slots=True)
 class FanOverride:
     """A manual fan pin set by the ``force_fan`` service.
@@ -147,6 +166,17 @@ def build_data_collection_decision(
         "projected_temperature_error": projected_error,
         "minutes_since_last_change": minutes_since_change,
     }
+
+
+def comfort_error(current_temp: float, user_target_temp: float | None, hvac_mode: str) -> float | None:
+    """Return the signed error against the user's setpoint, None when it is unknown.
+
+    Positive means the room needs more heating (heat) or cooling (cool). Only a
+    regulated mode has a direction, so any other mode yields None.
+    """
+    if user_target_temp is None or hvac_mode not in PROFILE_HVAC_MODES:
+        return None
+    return (current_temp - user_target_temp) if hvac_mode == "cool" else (user_target_temp - current_temp)
 
 
 def filter_supported_fan_modes(raw_modes: list[str] | None) -> list[str]:
@@ -666,18 +696,24 @@ class MpcFanFeatureManager:
     # ------------------------------------------------------------------
     # Control cycle
     # ------------------------------------------------------------------
-    def _read_inputs(self) -> tuple[float, float, float, str, str | None] | None:
-        """Return (slope, current_temp, target_temp, hvac_mode, current_fan).
+    def _read_inputs(self) -> CycleInputs | None:
+        """Return this cycle's runtime readings, or None when they are unusable.
 
         Returns None when the runtime cannot supply usable numbers -- VTherm can
         briefly expose None during restarts, and a skipped cycle is preferable to
         feeding the model a guess.
+
+        Two setpoints are read. ``target_temperature`` is the user's; VTherm's
+        auto-regulation then shifts it into ``regulated_target_temperature``,
+        the value actually sent to the underlying. ``target_temp`` keeps its
+        historical meaning (the regulated one, falling back to the user's), and
+        the user's is carried alongside, ``None`` when the runtime has none.
         """
         vtherm = self._vtherm
         current_temp = vtherm.current_temperature
-        target_temp = vtherm.regulated_target_temperature
-        if target_temp is None:
-            target_temp = vtherm.target_temperature
+        regulated = vtherm.regulated_target_temperature
+        user_target = vtherm.target_temperature
+        target_temp = regulated if regulated is not None else user_target
         slope = vtherm.last_temperature_slope
         hvac_mode = vtherm.vtherm_hvac_mode
 
@@ -694,12 +730,21 @@ class MpcFanFeatureManager:
             slope_value = float(slope if slope is not None else 0.0)
             current_value = float(current_temp)
             target_value = float(target_temp)
+            user_value = float(user_target) if user_target is not None else None
+            regulated_value = float(regulated) if regulated is not None else None
         except (TypeError, ValueError):
             _LOGGER.debug("Skipping cycle for %s: non-numeric runtime data", self._name)
             return None
 
-        current_fan = self._current_fan_mode()
-        return slope_value, current_value, target_value, str(hvac_mode), current_fan
+        return CycleInputs(
+            vtherm_slope=slope_value,
+            current_temp=current_value,
+            target_temp=target_value,
+            user_target_temp=user_value,
+            regulation_offset=(regulated_value - user_value) if regulated_value is not None and user_value is not None else None,
+            hvac_mode=str(hvac_mode),
+            current_fan=self._current_fan_mode(),
+        )
 
     def _current_fan_mode(self) -> str | None:
         """Return the fan mode currently set on the underlying climate."""
@@ -720,7 +765,11 @@ class MpcFanFeatureManager:
         inputs = self._read_inputs()
         if inputs is None:
             return False
-        vtherm_slope, current_temp, target_temp, hvac_mode, current_fan = inputs
+        vtherm_slope = inputs.vtherm_slope
+        current_temp = inputs.current_temp
+        target_temp = inputs.target_temp
+        hvac_mode = inputs.hvac_mode
+        current_fan = inputs.current_fan
 
         is_window_open = self._is_window_open()
         is_defrost_active = self._is_defrost_active()
@@ -883,6 +932,7 @@ class MpcFanFeatureManager:
             current_error=current_error,
             minutes_since_change=minutes_since_change,
             forced=active_force is not None,
+            inputs=inputs,
         )
 
         self._push_to_entities()
@@ -968,6 +1018,7 @@ class MpcFanFeatureManager:
         decision = kwargs["decision"]
         hvac_mode = kwargs["hvac_mode"]
         vtherm_slope = kwargs["vtherm_slope"]
+        inputs: CycleInputs = kwargs["inputs"]
         collector_decision = build_data_collection_decision(
             effective_fan=kwargs["effective_fan"],
             effective_reason=kwargs["effective_reason"],
@@ -995,6 +1046,9 @@ class MpcFanFeatureManager:
             defrost_active=kwargs["is_defrost_active"],
             is_hvac_idle=kwargs["is_hvac_idle"],
             outdoor_temp=self._vtherm.current_outdoor_temperature,
+            user_target_temp=inputs.user_target_temp,
+            regulation_offset=inputs.regulation_offset,
+            comfort_error=comfort_error(inputs.current_temp, inputs.user_target_temp, hvac_mode),
         )
 
     def _push_to_entities(self) -> None:

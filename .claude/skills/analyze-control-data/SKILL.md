@@ -22,8 +22,8 @@ Keep this in sync with `_HEADER` in `custom_components/vtherm_mpc_fan/data_colle
 | `timestamp` | ISO datetime of each control cycle |
 | `hvac_mode` | `heat` or `cool` |
 | `current_temp` | Sensor temperature (°C) |
-| `target_temp` | Active setpoint (°C) |
-| `current_error` | Signed comfort error (positive = needs action) |
+| `target_temp` | Regulated setpoint VTherm sends to the unit (`regulated_target_temperature`, °C) |
+| `current_error` | Signed error against `target_temp` (positive = needs action) |
 | `vtherm_slope` | EMA-smoothed slope from VTherm (°C/h) |
 | `effective_slope` | Slope actually used for decisions (sign-aligned: positive = cooling/heating progress) |
 | `projected_temp` / `projected_error` | Simple linear projection from the current slope (not the MPC's own horizon simulation) |
@@ -48,6 +48,9 @@ Keep this in sync with `_HEADER` in `custom_components/vtherm_mpc_fan/data_colle
 | `defrost_active` | `True` when defrost protection is active — from the underlying's own `hvac_action == "defrosting"`, or the optional defrost entity |
 | `hvac_idle` | `True` when the underlying reports it is not producing (its own `hvac_action`, not VTherm's simulated one — see `CLAUDE.md`) |
 | `outdoor_temp` | Outdoor temperature reported by VTherm, if available |
+| `user_target_temp` | The user's own setpoint (`target_temperature`); `target_temp` above is VTherm's *regulated* setpoint |
+| `regulation_offset` | `target_temp − user_target_temp`: how far VTherm's auto-regulation moved the setpoint sent to the unit (raw °C) |
+| `comfort_error` | Signed error against `user_target_temp` (positive = needs action) — the error the MPC regulates on |
 
 ## Analysis Procedure
 

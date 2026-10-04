@@ -956,3 +956,19 @@ async def test_is_detected_is_false_in_a_pinned_mode() -> None:
 
     assert manager.last_decision["mpc_status"] == "Fixed"
     assert manager.is_detected is False
+
+
+@pytest.mark.asyncio
+async def test_the_csv_row_carries_the_user_setpoint_and_the_regulation_offset() -> None:
+    """VTherm regulates the user's setpoint: both, their offset and the comfort error are logged."""
+    runtime = _make_runtime(current_temperature=24.0, target_temperature=24.0, regulated_target_temperature=23.4)
+    manager = await _build_manager(runtime)
+    manager._collector = MagicMock(async_record=AsyncMock())  # noqa: SLF001
+
+    await manager.refresh_state()
+
+    kwargs = manager._collector.async_record.await_args.kwargs  # noqa: SLF001
+    assert kwargs["target_temp"] == pytest.approx(23.4)
+    assert kwargs["user_target_temp"] == pytest.approx(24.0)
+    assert kwargs["regulation_offset"] == pytest.approx(-0.6)
+    assert kwargs["comfort_error"] == pytest.approx(0.0)

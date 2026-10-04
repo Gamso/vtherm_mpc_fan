@@ -107,6 +107,9 @@ async def test_async_record_appends_row(tmp_path: Path) -> None:
         "0",
         "0",
         "",
+        "",
+        "",
+        "",
     ]
     assert hass.async_add_executor_job.await_count == 2
 
