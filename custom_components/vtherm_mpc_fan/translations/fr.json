@@ -18,6 +18,10 @@
                     "data_collection": "Enregistre une ligne CSV par cycle de contrôle dans le dossier de configuration Home Assistant, à côté de configuration.yaml : vtherm_mpc_fan_data_XXXXXXXX.csv (max 10 Mo, rotation automatique). Utile pour reproduire le comportement de l'algorithme et identifier des améliorations pendant la phase bêta.",
                     "defrost_entity": "Optionnel : binary sensor, sensor ou input_boolean indiquant quand la PAC est en dégivrage. VTherm ne remonte pas cette information, elle doit donc être fournie ici. L'activité du compresseur et la température extérieure sont lues directement depuis VTherm et ne demandent aucune configuration."
                 }
+            },
+            "native_auto_fan": {
+                "title": "L'auto-ventilation intégrée de Versatile Thermostat est active",
+                "description": "L'auto-ventilation intégrée est active sur ce VTherm (Auto fan mode : {auto_fan_mode}). Versatile Thermostat envoie alors sa propre commande de ventilation à chaque cycle : ce plugin se met en retrait et n'envoie rien tant qu'elle reste active. Ouvrez la configuration du VTherm et réglez Auto fan mode sur None ; le pilotage MPC démarre au cycle suivant. Validez pour créer l'entrée malgré tout."
             }
         },
         "error": {

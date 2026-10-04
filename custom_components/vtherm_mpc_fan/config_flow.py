@@ -27,7 +27,7 @@ from .const import (
     PROFILE_HVAC_MODES,
     VTHERM_DOMAIN,
 )
-from .registry import find_conflicting_plugin
+from .registry import find_conflicting_plugin, find_native_auto_fan
 
 FALLBACK_FIXED_FAN_HVAC_MODES = ("dry", "fan_only")
 
@@ -210,6 +210,10 @@ class VThermMpcFanConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-ar
 
     VERSION = 1
 
+    #: Entry waiting for the user to acknowledge the native auto-fan warning.
+    _pending_entry: tuple[str, dict[str, Any]] | None = None
+    _native_auto_fan_mode: str | None = None
+
     async def async_step_user(self, user_input: dict[str, Any] | None = None):
         """Pick the target VTherm and set the controller options.
 
@@ -239,7 +243,15 @@ class VThermMpcFanConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-ar
                 state = self.hass.states.get(entity_id)
                 data = {key: value for key, value in user_input.items() if key != CONF_TARGET_VTHERM}
                 data[CONF_TARGET_VTHERM] = registry_entry.unique_id
-                return self.async_create_entry(title=state.name if state is not None else entity_id, data=data)
+                title = state.name if state is not None else entity_id
+                native_mode = find_native_auto_fan(self.hass, registry_entry.unique_id)
+                if native_mode is not None:
+                    # A warning, not a refusal: the VTherm option can be fixed
+                    # after the fact, and the manager stands down until it is.
+                    self._pending_entry = (title, data)
+                    self._native_auto_fan_mode = native_mode
+                    return await self.async_step_native_auto_fan()
+                return self.async_create_entry(title=title, data=data)
 
         schema = {
             vol.Required(CONF_TARGET_VTHERM): selector.EntitySelector(selector.EntitySelectorConfig(domain=CLIMATE_DOMAIN, integration=VTHERM_DOMAIN)),
@@ -247,6 +259,23 @@ class VThermMpcFanConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[call-ar
         }
 
         return self.async_show_form(step_id="user", data_schema=vol.Schema(schema), errors=errors)
+
+    async def async_step_native_auto_fan(self, user_input: dict[str, Any] | None = None):
+        """Warn that VTherm's built-in auto-fan is enabled on the chosen VTherm.
+
+        The core sends its own fan command every cycle while ``auto_fan_mode``
+        is anything but ``auto_fan_none``, and the manager stands down for as
+        long as it is. The entry is still created on confirmation: the option
+        lives in the VTherm's configuration and can be changed afterwards.
+        """
+        if user_input is not None and self._pending_entry is not None:
+            title, data = self._pending_entry
+            return self.async_create_entry(title=title, data=data)
+        return self.async_show_form(
+            step_id="native_auto_fan",
+            data_schema=vol.Schema({}),
+            description_placeholders={"auto_fan_mode": self._native_auto_fan_mode or ""},
+        )
 
     @staticmethod
     @callback

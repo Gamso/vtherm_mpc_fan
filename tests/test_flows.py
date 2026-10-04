@@ -93,6 +93,26 @@ async def test_user_step_rejects_what_is_not_a_vtherm(integration, platform, exp
     _assert_translated(result, "config")
 
 
+async def test_user_step_warns_when_the_vtherm_runs_its_own_auto_fan(integration) -> None:
+    """VTherm's built-in auto-fan gets a warning step; confirming still creates the entry."""
+    hass = integration
+    entity_id = _register_vtherm(hass)
+    MockConfigEntry(domain=VTHERM_DOMAIN, entry_id=VTHERM_UID, data={"auto_fan_mode": "auto_fan_high"}).add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {CONF_TARGET_VTHERM: entity_id})
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "native_auto_fan"
+    assert result["description_placeholders"] == {"auto_fan_mode": "auto_fan_high"}
+    assert "native_auto_fan" in TRANSLATIONS["config"]["step"]
+
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_TARGET_VTHERM] == VTHERM_UID
+
+
 # --- Options flow -----------------------------------------------------------
 
 

@@ -44,6 +44,16 @@ CONFLICTING_FAN_PLUGINS = {
     "vtherm_auto_fan_extended": "target_vtherm_unique_id",
 }
 
+# Versatile Thermostat's own built-in auto-fan. It is configured per VTherm in
+# the VTherm's config entry, and any value but "auto_fan_none" makes the core
+# send a fan command on every cycle (``_send_auto_fan_mode``) with no check that
+# a plugin owns the fan -- the ownership check only guards the deprecated
+# service. It is therefore a competing controller like the plugins above, and
+# is reported under this name in ``conflicting_plugin``.
+VTHERM_CONF_AUTO_FAN_MODE = "auto_fan_mode"
+VTHERM_AUTO_FAN_NONE = "auto_fan_none"
+NATIVE_AUTO_FAN_CONFLICT = "versatile_thermostat/auto_fan_mode"
+
 # Default values
 DEFAULT_DEADBAND = 0.2
 DEFAULT_MIN_INTERVAL = 10

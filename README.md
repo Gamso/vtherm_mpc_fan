@@ -112,7 +112,7 @@ Alternatively, click the button below to open this repository directly in HACS:
 
 - **Versatile Thermostat ≥ 10.2.0**, which provides `vtherm_api` (the plugin API this project registers with)
 - An **`over_climate` VTherm already configured** in VTherm, on top of a climate entity that exposes **two or more manual fan speeds** (e.g. `low`, `medium`, `high`)
-- VTherm's own auto-fan left **off** on that VTherm — see [Coexisting with other fan plugins](#coexisting-with-other-fan-plugins)
+- VTherm's own auto-fan left **off** (*Auto fan mode* = `None`) on that VTherm — the plugin stands down while it is on, see [Coexisting with other fan plugins](#coexisting-with-other-fan-plugins)
 
 ---
 
@@ -361,7 +361,7 @@ Point-in-time values with no history or automation use are not separate entities
 | `sent_fan_mode`         | Last fan mode this plugin sent                                                                    |
 | `learning_ready`        | Whether global learning readiness has been reached                                                |
 | `forced_until`          | Epoch time at which an active `force_fan` override ends                                           |
-| `conflicting_plugin`    | Domain of another fan plugin on this VTherm, when one is found — see [Coexisting with other fan plugins](#coexisting-with-other-fan-plugins) |
+| `conflicting_plugin`    | Another fan controller on this VTherm, when one is found: a plugin's domain, or `versatile_thermostat/auto_fan_mode` for VTherm's built-in auto-fan — see [Coexisting with other fan plugins](#coexisting-with-other-fan-plugins) |
 
 ### Learning Sensors
 
@@ -463,10 +463,11 @@ While a force is active, `mpc_status` (in the VTherm's [`mpc_fan` attribute](#th
 Only one controller can own a fan mode. Two plugins driving the same underlying (this one and, for instance, [`vtherm_auto_fan_extended`](https://github.com/jmcollin78/vtherm_auto_fan_extended), or VTherm's own built-in auto-fan) would not merely duplicate effort: each would read the other's command as an external change, the speed would flap between two opinions, and both would learn from a trajectory neither produced.
 
 - The config flow **refuses** to attach this plugin to a VTherm another fan plugin already targets.
-- If a conflict appears later anyway (the other plugin installed afterwards), this plugin **stands down**: it keeps evaluating and learning, but withholds the fan command. The current conflict is visible as `conflicting_plugin` in the VTherm's `mpc_fan` attributes, and as an error-level log line.
-- Removing the other plugin lets control resume automatically, on the next cycle.
+- VTherm's own **built-in auto-fan** is detected too: whenever the VTherm's *Auto fan mode* is anything but `None` (`auto_fan_mode` ≠ `auto_fan_none` in its configuration), the core sends its own fan command on every cycle. The config flow shows a warning step when you pick such a VTherm (you can still create the entry), and at runtime the plugin treats it exactly like a competing plugin.
+- If a conflict appears later anyway (the other plugin installed afterwards, or the VTherm's auto-fan switched on), this plugin **stands down**: it keeps evaluating and learning, but withholds the fan command. The current conflict is visible as `conflicting_plugin` in the VTherm's `mpc_fan` attributes (the other plugin's domain, or `versatile_thermostat/auto_fan_mode` for the built-in auto-fan), and as an error-level log line.
+- Removing the other plugin, or setting the VTherm's *Auto fan mode* to `None`, lets control resume automatically, on the next cycle.
 
-Make sure VTherm's own **auto-fan** option is set to `none` on the VTherm you attach this plugin to.
+Versatile Thermostat's configuration form proposes an auto-fan mode by default, so check this option on the VTherm you attach this plugin to.
 
 ---
 

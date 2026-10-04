@@ -513,6 +513,50 @@ class TestFanConflict:
         runtime.async_set_underlying_fan_mode.assert_awaited()
 
 
+class TestNativeAutoFanConflict:
+    """VTherm's built-in auto-fan sends a fan command every cycle: it is a competing controller."""
+
+    @pytest.mark.asyncio
+    async def test_an_enabled_native_auto_fan_makes_the_manager_stand_down(self):
+        """With auto_fan_mode set, no command is sent and the conflict is exposed."""
+        runtime = _make_runtime(entry_infos={"thermostat_type": "thermostat_over_climate", "auto_fan_mode": "auto_fan_high"})
+        manager = await _build_manager(runtime)
+
+        changed = await manager.refresh_state()
+
+        assert changed is False
+        runtime.async_set_underlying_fan_mode.assert_not_awaited()
+        attributes: dict = {}
+        manager.add_custom_attributes(attributes)
+        assert attributes["mpc_fan"]["conflicting_plugin"] == "versatile_thermostat/auto_fan_mode"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["auto_fan_none", None])
+    async def test_a_disabled_native_auto_fan_is_not_a_conflict(self, mode):
+        """auto_fan_none (or no value) leaves the fan to this plugin."""
+        runtime = _make_runtime(entry_infos={"thermostat_type": "thermostat_over_climate", "auto_fan_mode": mode})
+        manager = await _build_manager(runtime)
+
+        await manager.refresh_state()
+
+        assert manager._conflict is None  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_control_resumes_once_the_native_auto_fan_is_disabled(self):
+        """Switching the VTherm option to None hands the fan back on the next cycle."""
+        infos = {"thermostat_type": "thermostat_over_climate", "auto_fan_mode": "auto_fan_turbo"}
+        runtime = _make_runtime(entry_infos=infos)
+        manager = await _build_manager(runtime)
+        await manager.refresh_state()
+        runtime.async_set_underlying_fan_mode.assert_not_awaited()
+
+        infos["auto_fan_mode"] = "auto_fan_none"
+        await manager.refresh_state()
+
+        assert manager._conflict is None  # noqa: SLF001
+        runtime.async_set_underlying_fan_mode.assert_awaited()
+
+
 @pytest.mark.asyncio
 async def test_manager_publishes_its_diagnostics_into_the_vtherm_state() -> None:
     """Diagnostics ride along in the VTherm's own attributes."""

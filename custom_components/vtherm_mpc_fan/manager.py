@@ -39,6 +39,7 @@ from .const import (
     FEATURE_MANAGER_MPC_FAN,
     HVAC_OFF_REASON_WINDOW,
     MIN_ESTABLISHED_RATIO,
+    NATIVE_AUTO_FAN_CONFLICT,
     PHASE_ESTABLISHED,
     PROFILE_HVAC_MODES,
     SETPOINT_DROP_LEARNING_COOLDOWN,
@@ -55,6 +56,7 @@ from .registry import (
     entity_bucket,
     find_conflicting_plugin,
     managers,
+    native_auto_fan_mode,
 )
 from .number import PLATFORM_NUMBER, build_entities as build_number_entities
 from .sensor import PLATFORM_SENSOR, build_entities as build_sensor_entities
@@ -204,7 +206,8 @@ class MpcFanFeatureManager:
 
         self._last_decision: dict[str, Any] = {}
         self._active_listener: list = []
-        #: Domain of another fan-driving plugin on this VTherm, when one is found.
+        #: Another fan controller on this VTherm, when one is found: a plugin's
+        #: domain, or NATIVE_AUTO_FAN_CONFLICT for VTherm's built-in auto-fan.
         self._conflict: str | None = None
         self._conflict_logged = False
 
@@ -276,8 +279,9 @@ class MpcFanFeatureManager:
             "sent_fan_mode": self._last_sent_fan_mode,
             "learning_ready": self._learning.is_ready(),
             "forced_until": self.force.until if self.force else None,
-            # Non-null means another plugin owns the fan and this one is standing
-            # down; surfaced here so a silent yield is still visible.
+            # Non-null means another controller (a plugin, or VTherm's own
+            # auto-fan) owns the fan and this one is standing down; surfaced
+            # here so a silent yield is still visible.
             "conflicting_plugin": self._conflict,
             **{key: value for key, value in self._last_decision.items() if key.startswith("mpc_")},
         }
@@ -585,26 +589,54 @@ class MpcFanFeatureManager:
                 return False
         return True
 
+    def _native_auto_fan_mode(self) -> str | None:
+        """Return VTherm's built-in auto-fan mode when it is enabled on this VTherm."""
+        try:
+            entry_infos = self._vtherm.entry_infos
+        except Exception:  # pylint: disable=broad-except
+            return None
+        return native_auto_fan_mode(entry_infos)
+
     def _check_conflict(self) -> str | None:
-        """Return the domain of a competing fan controller on this VTherm, else None.
+        """Return the name of a competing fan controller on this VTherm, else None.
+
+        Two kinds of competitor exist: another plugin targeting this VTherm
+        (reported by its domain), and VTherm's own built-in auto-fan, which the
+        core runs on every cycle whenever its ``auto_fan_mode`` is not
+        ``auto_fan_none`` (reported as ``NATIVE_AUTO_FAN_CONFLICT``).
 
         Re-checked every cycle because the other plugin can be installed after
-        this one. When one is found this manager yields the actuator instead of
-        fighting for it: the competing plugin is the one the user just chose, and
-        a fan flapping between two opinions is worse than either opinion alone.
+        this one, and the VTherm option changed at any time. When one is found
+        this manager yields the actuator instead of fighting for it: a fan
+        flapping between two opinions is worse than either opinion alone, and
+        each controller would learn from a trajectory it did not produce.
         Learning and diagnostics keep running, so the yield is observable and
         reverses cleanly once the conflict is removed.
         """
         conflict = find_conflicting_plugin(self._hass, self._vtherm.unique_id)
+        native_mode = None
+        if conflict is None:
+            native_mode = self._native_auto_fan_mode()
+            if native_mode is not None:
+                conflict = NATIVE_AUTO_FAN_CONFLICT
 
         if conflict and not self._conflict_logged:
-            _LOGGER.error(
-                "%s - '%s' is also configured to drive the fan of this VTherm. "
-                "Standing down: no fan command will be sent while both are active. "
-                "Remove one of the two to restore MPC control",
-                self,
-                conflict,
-            )
+            if native_mode is not None:
+                _LOGGER.error(
+                    "%s - Versatile Thermostat's own auto-fan is enabled on this VTherm (auto_fan_mode=%s) "
+                    "and sends its own fan commands every cycle. Standing down: no fan command will be sent. "
+                    "Set the VTherm's 'Auto fan mode' to None to restore MPC control",
+                    self,
+                    native_mode,
+                )
+            else:
+                _LOGGER.error(
+                    "%s - '%s' is also configured to drive the fan of this VTherm. "
+                    "Standing down: no fan command will be sent while both are active. "
+                    "Remove one of the two to restore MPC control",
+                    self,
+                    conflict,
+                )
             self._conflict_logged = True
         elif not conflict and self._conflict_logged:
             _LOGGER.info("%s - fan conflict resolved; resuming MPC control", self)

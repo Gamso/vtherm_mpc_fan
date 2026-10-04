@@ -18,6 +18,10 @@
                     "data_collection": "Records one CSV row per control cycle in the Home Assistant config folder, alongside configuration.yaml: vtherm_mpc_fan_data_XXXXXXXX.csv (max 10 MB, auto-rotated). Useful for reproducing algorithm behaviour and identifying improvements during the beta phase.",
                     "defrost_entity": "Optional: binary sensor, sensor or input_boolean that indicates when the heat pump is in defrost mode. VTherm does not report this, so it has to be supplied here. Compressor activity and outdoor temperature are read from VTherm directly and need no configuration."
                 }
+            },
+            "native_auto_fan": {
+                "title": "Versatile Thermostat's own auto-fan is enabled",
+                "description": "This VTherm has its built-in auto-fan enabled (Auto fan mode: {auto_fan_mode}). Versatile Thermostat then sends its own fan command on every cycle, so this plugin will stand down and send nothing while it stays enabled. Open the VTherm's configuration and set Auto fan mode to None, then MPC control starts on the next cycle. Submit to create the entry anyway."
             }
         },
         "error": {
