@@ -10,6 +10,12 @@ thermal trajectory is fixed, results show "what would MPC have decided" rather
 than "what would have happened".  This is valid for comparing cost-weight
 sensitivity on the same trace.
 
+Prediction quality is always reported against the *persistence* baseline
+("the temperature in 10/30 minutes is the temperature now"). A room sensor that
+moves in 0.2 degC steps every ~18 minutes makes persistence a strong forecaster,
+so a model MAE is only informative next to it: on the 1 078 h production trace
+the model's T+30 MAE was 0.243 degC against 0.251 for persistence.
+
 Usage:
     python scripts/replay_bench.py data.csv
     python scripts/replay_bench.py data.csv --variant baseline --variant high_rank:MODE_RANK_COST=0.3
@@ -108,6 +114,9 @@ class Metrics:
     costs: list[float] = field(default_factory=list)
     agree_with_live: int = 0
     prediction_errors_10m: list[float] = field(default_factory=list)
+    prediction_errors_30m: list[float] = field(default_factory=list)
+    persistence_errors_10m: list[float] = field(default_factory=list)
+    persistence_errors_30m: list[float] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -418,6 +427,9 @@ def replay(
 ) -> list[tuple[dict, str]]:
     """Replay CSV through MPC, tracking simulated fan state.
 
+    The simulated time since the last change advances by the real gap between
+    rows; *cycle_minutes* only sets the controller's nominal cadence.
+
     Returns [(mpc_payload, simulated_fan), ...] for each row.
     """
     _apply(overrides)
@@ -427,13 +439,21 @@ def replay(
             deadband=deadband,
             min_interval=min_interval,
             fan_modes=fan_modes,
+            cycle_minutes=cycle_minutes,
         )
         results: list[tuple[dict, str]] = []
         sim_fan = rows[0].current_fan if rows else fan_modes[0]
         sim_minutes = rows[0].minutes_since_change if rows else 0.0
         snapshot_index = snapshot_start_index
+        previous_ts: float | None = None
 
         for row in rows:
+            # Advance the simulated clock by the real gap between rows: the CSV
+            # is written once per VTherm cycle, whatever its cycle_min.
+            row_ts = parse_timestamp(row.timestamp).timestamp()
+            if previous_ts is not None:
+                sim_minutes += max(0.0, (row_ts - previous_ts) / 60.0)
+            previous_ts = row_ts
             if snapshot_events:
                 snapshot_index = apply_snapshot_events_until(
                     learning,
@@ -458,8 +478,7 @@ def replay(
             if would_change == "yes" and rec_fan != sim_fan:
                 sim_fan = rec_fan
                 sim_minutes = 0.0
-            else:
-                sim_minutes += cycle_minutes
+                mpc.notify_fan_change()
 
             results.append((payload, sim_fan))
         return results
@@ -470,6 +489,31 @@ def replay(
 # ---------------------------------------------------------------------------
 # Metrics computation
 # ---------------------------------------------------------------------------
+#: A row counts as "the temperature N minutes later" when it lands within this
+#: many minutes after the horizon. Cycles are not perfectly regular (VTherm
+#: skips a cycle on missing data, restarts leave gaps), so the lookahead is
+#: resolved on timestamps rather than on a fixed number of rows.
+LOOKAHEAD_TOLERANCE_MINUTES = 5.0
+
+
+def lookahead_index(times: list[float], index: int, minutes: float, tolerance: float = LOOKAHEAD_TOLERANCE_MINUTES) -> int | None:
+    """Return the first row at least *minutes* after row *index*, or None.
+
+    *times* are the rows' epoch seconds, sorted. None when no row falls within
+    *tolerance* minutes after the horizon (a gap in the trace).
+    """
+    target = times[index] + minutes * 60.0
+    found = bisect.bisect_left(times, target)
+    if found >= len(times) or times[found] - target > tolerance * 60.0:
+        return None
+    return found
+
+
+def mean_abs(values: list[float]) -> float | None:
+    """Return the mean of *values*, or None when there are none."""
+    return sum(values) / len(values) if values else None
+
+
 def compute_metrics(
     name: str,
     overrides: dict[str, float],
@@ -478,8 +522,10 @@ def compute_metrics(
     cycle_minutes: int = 2,
 ) -> Metrics:
     """Compute aggregate metrics from a replay run."""
+    del cycle_minutes  # lookaheads are resolved on timestamps
     m = Metrics(name=name, overrides=overrides, total_rows=len(rows))
     prev_fan: str | None = None
+    times = [parse_timestamp(row.timestamp).timestamp() for row in rows]
 
     for i, (row, (payload, sim_fan)) in enumerate(zip(rows, results)):
         status = payload.get("mpc_status", "")
@@ -505,12 +551,19 @@ def compute_metrics(
         if cost is not None:
             m.costs.append(cost)
 
-        # Prediction error at T+10 (lookahead rows)
-        pred_10 = payload.get("mpc_predicted_temperature_10m")
-        lookahead = 10 // cycle_minutes
-        if pred_10 is not None and (i + lookahead) < len(rows):
-            actual = rows[i + lookahead].current_temp
-            m.prediction_errors_10m.append(abs(pred_10 - actual))
+        # Prediction error at T+10 / T+30, next to the persistence baseline
+        # (same rows, forecast = current temperature).
+        for minutes, key, model_errors, persistence_errors in (
+            (10, "mpc_predicted_temperature_10m", m.prediction_errors_10m, m.persistence_errors_10m),
+            (30, "mpc_predicted_temperature_30m", m.prediction_errors_30m, m.persistence_errors_30m),
+        ):
+            predicted = payload.get(key)
+            future = lookahead_index(times, i, minutes)
+            if predicted is None or future is None:
+                continue
+            actual = rows[future].current_temp
+            model_errors.append(abs(predicted - actual))
+            persistence_errors.append(abs(row.current_temp - actual))
 
         prev_fan = sim_fan
 
@@ -528,7 +581,8 @@ def print_report(
     cycle_minutes: int = 2,
 ) -> None:
     """Print a formatted comparison report."""
-    total_hours = len(rows) * cycle_minutes / 60.0
+    del cycle_minutes
+    total_hours = (parse_timestamp(rows[-1].timestamp) - parse_timestamp(rows[0].timestamp)).total_seconds() / 3600.0 if rows else 0.0
 
     # --- Learning profiles ---
     print("\n=== Learning Profiles ===")
@@ -577,15 +631,14 @@ def print_report(
         "Avg MPC cost",
         [f"{sum(m.costs) / max(len(m.costs), 1):.2f}" for m in metrics_list],
     )
-    _row(
-        "Prediction MAE T+10 (C)",
-        [
-            f"{sum(m.prediction_errors_10m) / len(m.prediction_errors_10m):.3f}"
-            if m.prediction_errors_10m
-            else "n/a"
-            for m in metrics_list
-        ],
-    )
+    def _mae(values: list[float]) -> str:
+        mae = mean_abs(values)
+        return f"{mae:.3f}" if mae is not None else "n/a"
+
+    _row("Prediction MAE T+10 (C)", [_mae(m.prediction_errors_10m) for m in metrics_list])
+    _row("  persistence T+10 (C)", [_mae(m.persistence_errors_10m) for m in metrics_list])
+    _row("Prediction MAE T+30 (C)", [_mae(m.prediction_errors_30m) for m in metrics_list])
+    _row("  persistence T+30 (C)", [_mae(m.persistence_errors_30m) for m in metrics_list])
     _row("Active rows", [str(m.active_rows) for m in metrics_list])
     _row("Disturbed/idle rows", [str(m.total_rows - m.active_rows) for m in metrics_list])
 
@@ -692,6 +745,7 @@ def main() -> None:
     )
     parser.add_argument("--deadband", type=float, default=0.2, help="Deadband in degrees (default: 0.2)")
     parser.add_argument("--min-interval", type=int, default=10, help="Min interval in minutes (default: 10)")
+    parser.add_argument("--cycle-minutes", type=int, default=5, help="VTherm cycle_min the trace was recorded at (default: 5)")
     parser.add_argument(
         "--fan-order",
         help="Comma-separated fan modes, weakest to strongest (auto-detected if omitted)",
@@ -790,6 +844,7 @@ def main() -> None:
             args.min_interval,
             snapshot_events=snapshot_events,
             snapshot_start_index=snapshot_start_index,
+            cycle_minutes=args.cycle_minutes,
         )
         m = compute_metrics(name, overrides, rows, results)
         all_metrics.append(m)
