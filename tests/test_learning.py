@@ -19,25 +19,25 @@ def _build_mpc(learning: ThermalLearning) -> MPCController:
 
 
 class TestThermalLearning:
-    """Test auto-calibration and optimal parameter computation."""
+    """Test the learned thermal model."""
 
-    def test_optimal_parameters_reports_response_samples(self):
-        """compute_optimal_parameters exposes the response-sample count once ready."""
-        learning = ThermalLearning()
+    def test_an_injected_clock_drives_timestamps_and_the_window(self):
+        """Samples are stamped with the injected clock and expire on it, not on time.time."""
+        now = [1_000_000.0]
+        learning = ThermalLearning(clock=lambda: now[0])
 
-        for _ in range(250):
-            learning.add_slope_sample("medium", 0.3, 0.1)
-        assert learning.is_ready()
+        learning.add_slope_sample("medium", 0.3, 0.1, hvac_mode="heat")
+        learning.add_response_event(12.0, "heat")
+        assert learning.slope_samples[0][0] == 1_000_000.0
+        assert learning.response_events[0][0] == 1_000_000.0
 
-        for response_time in [10, 11, 12, 13]:
-            learning.add_response_event(response_time)
-
-        optimal = learning.compute_optimal_parameters()
-
-        # limit_timeout is no longer computed; deadband and diagnostics remain.
-        assert "limit_timeout" not in optimal
-        assert optimal["response_samples"] == 4
-        assert optimal["deadband"] > 0
+        # Eight days later the old sample is out of the window -- but kept by the
+        # per-profile retention; a sample of another profile pushes the cleanup.
+        now[0] += 8 * 24 * 3600
+        learning.add_slope_sample("high", 0.9, 0.1, hvac_mode="heat")
+        learning.add_response_event(10.0, "heat")
+        assert learning.get_mode_sample_count("medium", "heat") == 1
+        assert [event[1] for event in learning.response_events] == [10.0]
 
     def test_learned_dead_time_sensor_reports_median_response(self):
         """The diagnostic dead-time sensor should expose the median response delay."""

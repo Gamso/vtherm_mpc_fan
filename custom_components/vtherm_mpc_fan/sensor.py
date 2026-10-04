@@ -167,7 +167,6 @@ def build_entities(manager) -> list[SensorEntity]:
             ("learning_response", SmartFanLearningResponseSensor(entry_id, climate_entity, mpc)),
             ("learned_dead_time", SmartFanLearnedDeadTimeSensor(entry_id, climate_entity, mpc)),
             ("effective_timeout", SmartFanEffectiveTimeoutSensor(entry_id, climate_entity, mpc)),
-            ("learned_deadband", SmartFanLearnedDeadbandSensor(entry_id, climate_entity, mpc)),
         ):
             bucket["sensors"][key] = entity
             new_entities.append(entity)
@@ -206,7 +205,7 @@ class SmartFanSensor(_SmartFanEntity):
 
 
 class SmartFanLearningSensor(_SmartFanEntity):
-    """Sensor showing learning progress and optimal parameters."""
+    """Sensor showing learning progress."""
 
     def __init__(self, entry_id: str, climate_entity: str, controller) -> None:
         super().__init__(entry_id, climate_entity, "learning_progress")
@@ -223,22 +222,15 @@ class SmartFanLearningSensor(_SmartFanEntity):
 
     @property
     def extra_state_attributes(self) -> dict:
-        """Return optimal parameters continuously, even before ready."""
-        attrs = {
+        """Return the learning counters."""
+        return {
             "samples_collected": self._controller.learning.slope_sample_count(),
             "response_events": self._controller.learning.response_event_count(),
             "is_ready": self._controller.learning.is_ready(),
             "learned_dead_time": round(self._controller.learning.get_dead_time(), 2),
             "effective_timeout": round(self._controller.get_effective_timeout(), 2),
+            "exploration_probes": self._controller.learning.probe_count,
         }
-
-        optimal = self._controller.learning.compute_optimal_parameters()
-        if optimal:
-            attrs["learned_deadband"] = optimal.get("deadband")
-            attrs["learned_samples_count"] = optimal.get("samples_count")
-            attrs["learned_response_samples"] = optimal.get("response_samples")
-
-        return attrs
 
 
 class SmartFanLearningSamplesSensor(_SmartFanEntity):
@@ -261,14 +253,13 @@ class SmartFanLearningSamplesSensor(_SmartFanEntity):
     def extra_state_attributes(self) -> dict:
         """Return sample statistics."""
         learning = self._controller.learning
-        optimal = learning.compute_optimal_parameters()
 
         return {
             "min_samples_required": learning.min_samples,
             "slope_mean": round(learning.slope_mean, 3),
             "slope_stdev": round(((learning.slope_m2 / (learning.slope_count - 1)) ** 0.5) if learning.slope_count > 1 else 0, 3),
             "slope_max": round(learning.slope_max, 3),
-            "samples_count": optimal.get("samples_count", 0),
+            "samples_count": learning.slope_count,
         }
 
 
@@ -292,12 +283,11 @@ class SmartFanLearningResponseSensor(_SmartFanEntity):
     def extra_state_attributes(self) -> dict:
         """Return response time statistics."""
         learning = self._controller.learning
-        optimal = learning.compute_optimal_parameters()
         response_times = [item[1] for item in learning.response_events if item[1] > 0]
         avg_response = sum(response_times) / len(response_times) if response_times else 0
 
         return {
-            "response_samples": optimal.get("response_samples", 0),
+            "response_samples": len(response_times),
             "avg_response_time_min": round(avg_response, 1),
             "median_response_time_min": round(learning.get_dead_time(), 2),
             "effective_timeout_min": round(self._controller.get_effective_timeout(), 2),
@@ -354,74 +344,3 @@ class SmartFanEffectiveTimeoutSensor(_SmartFanEntity):
             "is_ready": self._controller.learning.is_ready(),
             "learned_dead_time": round(self._controller.learning.get_dead_time(), 2),
         }
-
-
-class _BaseLearnedParameterSensor(_SmartFanEntity):
-    """Base class for learned parameter sensors."""
-
-    def __init__(
-        self,
-        entry_id: str,
-        climate_entity: str,
-        controller,
-        *,
-        name: str,
-        object_key: str,
-        unit,
-        device_class,
-        learning_key: str,
-        icon: str = "mdi:brain",
-        current_attr: str | None = None,
-    ) -> None:
-        super().__init__(entry_id, climate_entity, object_key)
-        self._controller = controller
-        self._learning_key = learning_key
-        self._current_attr = current_attr
-        self._attr_name = name
-        self._attr_native_unit_of_measurement = unit
-        self._attr_device_class = device_class
-        self._attr_icon = icon
-        self._attr_native_value = None
-        self._attr_entity_category = EntityCategory.DIAGNOSTIC
-
-    @property
-    def native_value(self):
-        """Return the learned value, or current value if not ready yet."""
-        optimal = self._controller.learning.compute_optimal_parameters()
-        if optimal:
-            value = optimal.get(self._learning_key)
-            return round(value, 2) if value is not None else None
-
-        if self._current_attr:
-            value = getattr(self._controller, f"_{self._current_attr}", 0)
-            return round(value, 2) if value else 0
-
-        return 0
-
-    @property
-    def extra_state_attributes(self) -> dict:
-        """Expose readiness and sample counts for context."""
-        learning = self._controller.learning
-        return {
-            "is_ready": learning.is_ready(),
-            "samples_collected": learning.slope_sample_count(),
-            "response_events": learning.response_event_count(),
-        }
-
-
-class SmartFanLearnedDeadbandSensor(_BaseLearnedParameterSensor):
-    """Learned deadband parameter."""
-
-    def __init__(self, entry_id: str, climate_entity: str, controller) -> None:
-        super().__init__(
-            entry_id,
-            climate_entity,
-            controller,
-            name="Learned Deadband",
-            object_key="learned_deadband",
-            unit=UnitOfTemperature.CELSIUS,
-            device_class=SensorDeviceClass.TEMPERATURE,
-            learning_key="deadband",
-            icon="mdi:thermometer-lines",
-            current_attr="deadband",
-        )

@@ -1206,7 +1206,7 @@ def test_learning_response_sensor_with_mixed_tuple_lengths() -> None:
 
     assert sensor.native_value == 3
     attrs = sensor.extra_state_attributes
-    assert attrs["response_samples"] == 0  # because is_ready() is False, returns fallback 0
+    assert attrs["response_samples"] == 2  # positive response times only
     assert attrs["avg_response_time_min"] == pytest.approx(13.5)
 
 

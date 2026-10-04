@@ -41,7 +41,6 @@ A Model Predictive Control (MPC) fan-speed controller for [Versatile Thermostat]
     - [Learning Sensors](#learning-sensors)
     - [Learning Profile Numbers](#learning-profile-numbers)
   - [Services](#services)
-    - [`vtherm_mpc_fan.apply_learned_settings`](#vtherm_mpc_fanapply_learned_settings)
     - [`vtherm_mpc_fan.reset_learning`](#vtherm_mpc_fanreset_learning)
     - [`vtherm_mpc_fan.set_effective_slope`](#vtherm_mpc_fanset_effective_slope)
     - [`vtherm_mpc_fan.force_fan`](#vtherm_mpc_fanforce_fan)
@@ -292,24 +291,16 @@ If a speed is in the wrong position, the options flow (available once the underl
 
 ## Learning System
 
-The plugin includes an **automatic learning system** that collects data during normal operation and computes optimal parameters after enough samples accumulate (≥120 slope samples — sized to what the 7-day window can hold on a 0.2 °C room sensor).
+The plugin includes an **automatic learning system** that builds the thermal model during normal operation. `learning_progress` reaches 100 % at 120 slope samples (sized to what the 7-day window can hold); it is an overall progress indicator only — each speed's profile and the dead time become usable on their own, much earlier.
 
 **Data collected, once per control cycle**:
-- Temperature slope and active fan mode
-- Time from a fan speed change to the next significant slope change (thermal response time)
+- Temperature slope, comfort error, regulation offset and active fan mode
+- Time from a fan speed change to the room's first move in the expected direction (thermal response time)
 - HVAC mode (heat/cool), for per-mode profiling
-
-**Parameters computed from data**:
-
-| Parameter  | Formula                             |
-| ---------- | ------------------------------------ |
-| `deadband` | `0.15 + (volatility_factor × 0.2)` |
-
-Where `volatility_factor = min(slope_stdev / slope_mean, 3.0)`.
 
 > **Note**: the `effective_timeout` diagnostic (`max(min_interval, dead_time × 1.5)` once the dead time is trusted — see [Dead Time Calibration](#dead-time-calibration)) is exposed as a sensor for insight into the learned thermal lag, but it does not gate control decisions — the minimum interval between fan changes does.
 
-Once learning is ready (`learning_progress` at 100 %), the computed deadband is shown by the `learned_deadband` sensor. Nothing is applied automatically: `apply_learned_settings` only writes the computed parameters to the log, and you change the options yourself if you want them. `reset_learning` starts over.
+`reset_learning` starts over. The deadband and the minimum interval are options you set; nothing learned overrides them.
 
 ### Per-Mode Fan Profiles
 
@@ -401,7 +392,6 @@ Point-in-time values with no history or automation use are not separate entities
 | `sensor.vtherm_mpc_fan_living_room_learning_response_events`         | count | Number of thermal response time measurements           |
 | `sensor.vtherm_mpc_fan_living_room_learned_dead_time`                | min   | Median learned thermal response delay (`dead_time`)    |
 | `sensor.vtherm_mpc_fan_living_room_effective_timeout`                | min   | Advisory adaptive timeout (diagnostic only)             |
-| `sensor.vtherm_mpc_fan_living_room_learned_deadband`                 | °C    | Learned optimal deadband                                |
 
 ### Learning Profile Numbers
 
@@ -422,14 +412,6 @@ Click the value to edit it directly — this replaces the profile's samples with
 ---
 
 ## Services
-
-### `vtherm_mpc_fan.apply_learned_settings`
-
-Write the parameters computed by the learning system to the log. Nothing is applied: it is a way to inspect what learning suggests (the deadband is also shown by `sensor.vtherm_mpc_fan_living_room_learned_deadband`), to then change the options yourself.
-
-`target_vtherm` is required only when several VTherm MPC Fan controllers are running.
-
-**Requirement**: learning must be ready (`sensor.vtherm_mpc_fan_living_room_learning_progress` at 100 %); before that the service only logs the current progress.
 
 ### `vtherm_mpc_fan.reset_learning`
 
@@ -508,7 +490,7 @@ Versatile Thermostat's configuration form proposes an auto-fan mode by default, 
 | **MPC status: Low confidence**  | Few fan speeds have learned profiles yet. Check `mpc_known_profiles` in the `mpc_fan` attribute and `sensor.vtherm_mpc_fan_living_room_learning_progress`. |
 | **MPC status: Disturbed**       | Defrost, HVAC idle, or a window open is detected. Normal — the MPC holds the current fan until the disturbance clears.                        |
 | **Fan not changing at all, no error** | Another plugin may already be driving this fan — check the VTherm's `mpc_fan.conflicting_plugin` attribute. See [Coexisting with other fan plugins](#coexisting-with-other-fan-plugins). |
-| **Too many fan changes**        | Increase `deadband` or `min_interval`. Enable learning to auto-optimize.                                                                        |
+| **Too many fan changes**        | Increase `deadband` or `min_interval`.                                                                                                       |
 | **Temperature overshoots**      | Decrease `deadband`. Verify Versatile Thermostat is providing an accurate slope.                                                                |
 | **Learning not progressing**    | Verify the HVAC is running and no window is open. Check whether `cycle_min` on the VTherm is unusually long.                                   |
 | **A weak fan speed's learned slope looks wrong** | Check its `measured_minutes` and `effective_samples` before trusting the value — under 90 minutes of measured regime it isn't a measured profile. See [Per-Mode Fan Profiles](#per-mode-fan-profiles). |

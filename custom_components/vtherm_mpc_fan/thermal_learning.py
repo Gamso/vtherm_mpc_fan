@@ -263,8 +263,6 @@ class ThermalLearning:
         self._slope_m2 = 0.0  # Sum of squared differences for variance
         self._slope_max = 0.0  # Maximum absolute slope
 
-        # Cache for computed optimal parameters (invalidated on each new sample)
-        self._optimal_cache: dict | None = None
         # Per-profile regression results, keyed (fan_mode, hvac_mode). Every
         # entity and every MPC candidate reads the same few fits several times
         # per cycle; they only change when the sample list does.
@@ -313,7 +311,6 @@ class ThermalLearning:
         self._slope_m2 = 0.0
         self._slope_max = 0.0
         self._ready_once = False
-        self._optimal_cache = None
         self._invalidate_fits()
         self._profile_ready_logged.clear()
         self._probe_times.clear()
@@ -381,8 +378,6 @@ class ThermalLearning:
             profile_samples,
             MIN_MODE_PROFILE_SAMPLES,
         )
-
-        self._optimal_cache = None
 
         self._update_slope_stats(abs(slope))
 
@@ -474,9 +469,6 @@ class ThermalLearning:
             minutes_to_response,
             hvac_mode,
         )
-
-        # Invalidate cached optimal parameters
-        self._optimal_cache = None
 
         # Cleanup: keep only data within sliding window (7 days)
         cutoff_time = self.now() - (self._learning_window_hours * 3600)
@@ -575,7 +567,6 @@ class ThermalLearning:
     @slope_samples.setter
     def slope_samples(self, value: list) -> None:
         self._slope_samples = value
-        self._optimal_cache = None
         self._invalidate_fits()
 
     @property
@@ -586,12 +577,6 @@ class ThermalLearning:
     @response_events.setter
     def response_events(self, value: list) -> None:
         self._response_events = value
-        self._optimal_cache = None
-
-    @property
-    def optimal_cache(self) -> dict | None:
-        """Return the cached optimal parameters, or None if not yet computed."""
-        return self._optimal_cache
 
     def is_ready(self) -> bool:
         """Check if enough data has been collected."""
@@ -1066,55 +1051,6 @@ class ThermalLearning:
             }
         return profiles
 
-    def compute_optimal_parameters(self) -> dict:
-        """Calculate optimal parameters from learned data.
-
-        The result is cached and invalidated whenever a new sample or response
-        event is recorded, so repeated property accesses from sensors have
-        zero recomputation cost.
-        """
-        if not self.is_ready():
-            return {}
-
-        if self._optimal_cache is not None:
-            return self._optimal_cache
-
-        # Use incremental statistics (already computed on each sample)
-        if self._slope_count == 0:
-            return {}
-
-        # Variance from Welford's algorithm
-        slope_variance = self._slope_m2 / (self._slope_count - 1) if self._slope_count > 1 else 0.01
-        slope_stdev = slope_variance**0.5  # Standard deviation
-
-        # Analyze response times (surfaced as response_samples/avg for diagnostics)
-        response_times = [item[1] for item in self._response_events if item[1] > 0]
-        # Use median instead of mean to be robust against outliers
-        avg_response = statistics.median(response_times) if response_times else 10.0
-
-        # Adapt thresholds to slope characteristics
-        # High volatility → larger deadbands to avoid oscillations
-        volatility_factor = min(slope_stdev / max(self._slope_mean, 0.1), 3.0)
-
-        optimal_deadband = 0.15 + (volatility_factor * 0.2)
-
-        _LOGGER.info(
-            "Auto-calibration complete: avg_slope=%.2f std=%.2f max=%.2f | avg_response=%.1fmin | deadband=%.2f",
-            self._slope_mean,
-            slope_stdev,
-            self._slope_max,
-            avg_response,
-            optimal_deadband,
-        )
-
-        result = {
-            "deadband": round(optimal_deadband, 2),
-            "samples_count": self._slope_count,
-            "response_samples": len(response_times),
-        }
-        self._optimal_cache = result
-        return result
-
     def to_dict(self) -> dict:
         """Serialize for storage.
 
@@ -1147,7 +1083,6 @@ class ThermalLearning:
         self._slope_mean = 0.0
         self._slope_m2 = 0.0
         self._slope_max = 0.0
-        self._optimal_cache = None  # Invalidate cache when stats are rebuilt
         self._invalidate_fits()
         # One counting pass: asking get_mode_sample_count() for every sample
         # rescanned the whole list each time, O(n^2) on the event loop at load.
@@ -1222,7 +1157,6 @@ class ThermalLearning:
         if instance._slope_count >= instance._min_samples:
             instance._ready_once = True
 
-        instance._optimal_cache = None
         _LOGGER.debug(
             "Learning: restored %d slope samples and %d response events from storage",
             len(instance._slope_samples),

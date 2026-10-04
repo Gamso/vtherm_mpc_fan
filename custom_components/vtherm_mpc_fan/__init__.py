@@ -41,7 +41,6 @@ PLATFORMS = [Platform.SENSOR, Platform.NUMBER]
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)  # pylint: disable=invalid-name  # name required by HA
 
-SERVICE_APPLY_LEARNED_SETTINGS = "apply_learned_settings"
 SERVICE_RESET_LEARNING = "reset_learning"
 SERVICE_SET_EFFECTIVE_SLOPE = "set_effective_slope"
 SERVICE_FORCE_FAN = "force_fan"
@@ -151,25 +150,6 @@ def _resolve_manager(hass: HomeAssistant, target: str | None):
 def _register_services(hass: HomeAssistant) -> None:
     """Register the domain services once per Home Assistant instance."""
 
-    async def apply_learned_settings(call):
-        """Apply the parameters derived from the learned model."""
-        manager = _resolve_manager(hass, call.data.get(ATTR_TARGET_VTHERM))
-        learning = manager.learning
-        if not learning.is_ready():
-            _LOGGER.warning(
-                "Learning not complete yet for %s (%.1f%%), cannot apply settings",
-                manager.vtherm_name,
-                learning.get_progress(),
-            )
-            return
-
-        optimal = learning.compute_optimal_parameters()
-        if not optimal:
-            _LOGGER.error("Failed to compute optimal parameters for %s", manager.vtherm_name)
-            return
-
-        _LOGGER.info("Learned parameters for %s: %s", manager.vtherm_name, optimal)
-
     async def reset_learning(call):
         """Clear the learned model and start over."""
         manager = _resolve_manager(hass, call.data.get(ATTR_TARGET_VTHERM))
@@ -223,12 +203,6 @@ def _register_services(hass: HomeAssistant) -> None:
 
     optional_target = {vol.Optional(ATTR_TARGET_VTHERM): cv.string}
 
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_APPLY_LEARNED_SETTINGS,
-        apply_learned_settings,
-        schema=vol.Schema(optional_target),
-    )
     hass.services.async_register(DOMAIN, SERVICE_RESET_LEARNING, reset_learning, schema=vol.Schema(optional_target))
     hass.services.async_register(
         DOMAIN,
@@ -274,7 +248,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    if not hass.services.has_service(DOMAIN, SERVICE_APPLY_LEARNED_SETTINGS):
+    if not hass.services.has_service(DOMAIN, SERVICE_RESET_LEARNING):
         _register_services(hass)
 
     entry.async_on_unload(entry.add_update_listener(_async_update_options))
@@ -320,7 +294,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if not remaining:
         _unregister_factory(hass)
         for service in (
-            SERVICE_APPLY_LEARNED_SETTINGS,
             SERVICE_RESET_LEARNING,
             SERVICE_SET_EFFECTIVE_SLOPE,
             SERVICE_FORCE_FAN,
