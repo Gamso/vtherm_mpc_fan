@@ -1,16 +1,20 @@
 {
   "domain": "vtherm_mpc_fan",
   "name": "Versatile Thermostat MPC Fan",
-  "documentation": "https://github.com/Gamso/vtherm_mpc_fan",
-  "issue_tracker": "https://github.com/Gamso/vtherm_mpc_fan/issues",
-  "config_flow": true,
-  "dependencies": [],
-  "after_dependencies": ["versatile_thermostat"],
-  "integration_type": "service",
-  "iot_class": "calculated",
-  "loggers": ["custom_components.vtherm_mpc_fan"],
+  "after_dependencies": [
+    "versatile_thermostat"
+  ],
   "codeowners": [
     "@Gamso"
+  ],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/Gamso/vtherm_mpc_fan",
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/Gamso/vtherm_mpc_fan/issues",
+  "loggers": [
+    "custom_components.vtherm_mpc_fan"
   ],
   "version": "1.1.0"
 }

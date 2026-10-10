@@ -24,8 +24,9 @@ integration lives under `custom_components/vtherm_mpc_fan/`. Key modules:
 - **error**: always positive when the system needs more heating/cooling (`target - current` in heat, `current - target` in cool)
 - **effective_slope**: learned slope per fan mode, gap-dependent (`slope(error) = intercept + gain * error`, least-squares fit in `ThermalLearning`); raw slope comes from VTherm's own EMA
 - **dead_time**: thermal lag between a fan change and first observable slope response (learned via response events). Resolved **per hvac mode** — heating lag and cooling lag are different numbers, and `get_dead_time()` pools every mode when called without one. It gates the change interval, the phase split and each candidate's simulated `change_delay`.
-- **trusted dead time**: whether the learned dead time may raise the change interval above the configured floor. Gated on `response_event_count()` (see `MIN_RESPONSE_EVENTS_FOR_ADAPTIVE_INTERVAL`), **not** on `ThermalLearning.is_ready()` — that flag counts *slope* samples, which a coarse room sensor (0.2 °C steps are common) accumulates so slowly it can stay false indefinitely while the dead time is already well established.
+- **trusted dead time**: whether the learned dead time may raise the change interval above the configured floor. Gated per HVAC mode on `response_event_count(hvac_mode)` (see `MIN_RESPONSE_EVENTS_FOR_ADAPTIVE_INTERVAL`) — response events are only recorded in heat/cool, and events stored from other modes are ignored — **not** on `ThermalLearning.is_ready()` — that flag counts *slope* samples, which a coarse room sensor (0.2 °C steps are common) accumulates so slowly it can stay false indefinitely while the dead time is already well established.
 - **defrost_active**: heat-pump defrost cycle; detected from the underlying climate's own `hvac_action == "defrosting"` when it reports one, falling back to the optional `CONF_DEFROST_ENTITY` when it doesn't. Pauses MPC decisions and learning.
+- **fixed fan (pin)**: in the HVAC modes listed in `CONF_FIXED_FAN_HVAC_MODES` (never heat/cool), the manager sends `CONF_FIXED_FAN_SPEED` instead of the MPC decision (status `Fixed`; `force_fan` still wins). Applied on entering the mode, otherwise only after `min_interval` since the last change — counted from the manager's first cycle after a restart/reload — and held while a window is open, the underlying is off or defrosting. It never feeds learning.
 - **hvac_idle**: the underlying is not producing; read from the underlying climate's own `hvac_action` (`_underlying_hvac_action()` in `manager.py`), **not** VTherm's `is_device_active`. VTherm falls back to a bare target-vs-current sign check when the underlying reports no `hvac_action`, which reads IDLE across the whole "at or past setpoint" region — exactly the equilibrium-holding case this controller exists to manage, even while the unit is actually running. No `hvac_action` published means unknown, not idle.
 
 ## Control Flow
@@ -51,7 +52,7 @@ The MPC controller (`mpc_controller.py`) evaluates all candidate fan modes over 
 - **Hysteresis**: requires minimum cost improvement before switching (margin scales with proximity to target)
 - **Step-down guards**: blocks downward moves when under target and not established or predicted shortfall
 - **Disturbance bias**: EMA tracker for unmodeled effects (solar, occupancy); decays during paused periods
-- **Monotone constraint**: when all profiles learned, enforces slope(mode_i) ≤ slope(mode_i+1)
+- **Monotone constraint**: over the learned profiles (partial ladders included), enforces slope(mode_i) ≤ slope(mode_i+1), placing the best-sampled profiles first
 - **Pause conditions**: window open, defrost, hvac idle → returns "Disturbed" status (see vocabulary above for how idle/defrost are actually detected)
 
 Every `evaluate()` return path funnels through `_payload()`, which also logs the full decision at DEBUG on every cycle — several point-in-time sensors (status, reason, fan mode, would-change-now, cost, known-profile counts, per-mode profile map) were deliberately dropped as standalone entities in favour of this log line, since they had no history-graph or automation value and most duplicate VTherm's own `extra_state_attributes.mpc_fan`.
@@ -79,8 +80,14 @@ python -m pytest tests/ -q          # run all tests
 python -m pytest tests/test_X.py -q # run one file
 ./container coverage                 # coverage via Docker container
 ./container hassfest                 # validate manifest / translations
-bash validate.sh                     # syntax/JSON/required-file checks (mirrors CI)
+bash validate.sh                     # syntax/JSON/required-file checks
+black --check custom_components tests   # formatting, enforced by CI (pyproject.toml, 180 cols)
+pylint custom_components/vtherm_mpc_fan # enforced by CI (.pylintrc)
 ```
+
+CI (`.github/workflows/`) runs on every push and PR: pytest, black, pylint, `validate.sh`, hassfest and the HACS action.
+
+Tests that need a real Home Assistant core (setup/unload, services, flows) request the `integration` fixture from `tests/conftest.py`; everything else uses the lightweight stand-ins above.
 
 ## Dev Container Workflow
 
@@ -108,6 +115,6 @@ bash validate.sh                     # syntax/JSON/required-file checks (mirrors
 - **Learning data integrity**: exclude window-open, defrost, hvac-idle, setpoint-drop cooldown (30 min), and insufficiently-stable periods (< 1.5× dead_time, the same `detect_phase()` the MPC uses) from slope samples. Do **not** filter near-zero slopes: a speed holding the room produces them, and they measure its intercept
 - **Exploration is a control concern**: a speed that is never measured is never credible on cost and never chosen, so the controller must create the observations (learning hold, climb guard) — no estimator can synthesise them. A fan change made outside the plugin restarts the dead time like one of ours (`_register_fan_change`)
 - **The current unmeasured speed is modelled on its observed slope**, never floored: a speed observably losing ground must lose ground in the simulation, and a negative reference slope (learned, seeded or observed) passes through `_gap_slope`
-- **Monotone constraint**: when all fan-mode profiles are learned, MPC enforces slope(mode_i) ≤ slope(mode_i+1) via isotonic forward pass; partial profiles skip the constraint
+- **Monotone constraint**: `build_monotone_slopes` enforces slope(mode_i) ≤ slope(mode_i+1) over whatever profiles are learned (unlearned modes are simply absent): a single pass in best-sampled-first order, a rejected estimate re-synthesised one `LADDER_CAPACITY_RATIO` step from the neighbour that constrained it rather than pinned onto it
 - **Idle/defrost detection**: never fall back to VTherm's `is_device_active`/simulated `hvac_action` as the primary signal for pausing control — it is wrong precisely at equilibrium (see vocabulary above). Read the underlying's own `hvac_action` first.
 - **Never gate on `is_ready()` for anything but overall learning progress**: it counts slope samples against a global threshold and lags far behind per-mode profiles and the dead time, both of which mature much earlier. Confidence (`_compute_confidence`) and the adaptive interval (`_dead_time_is_trusted`) each had to be moved off it after it left them stuck at their fallback values indefinitely on real hardware.

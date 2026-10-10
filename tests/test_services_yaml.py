@@ -20,12 +20,7 @@ from custom_components.vtherm_mpc_fan import (
     ATTR_TARGET_VTHERM,
 )
 
-SERVICES_YAML = (
-    Path(__file__).parent.parent
-    / "custom_components"
-    / "vtherm_mpc_fan"
-    / "services.yaml"
-)
+SERVICES_YAML = Path(__file__).parent.parent / "custom_components" / "vtherm_mpc_fan" / "services.yaml"
 
 EXPECTED_FIELDS = {
     SERVICE_APPLY_LEARNED_SETTINGS: {ATTR_TARGET_VTHERM},
@@ -56,7 +51,4 @@ def test_services_yaml_field_names_match_the_voluptuous_schema() -> None:
     spec = yaml.safe_load(SERVICES_YAML.read_text(encoding="utf-8"))
     for service, expected_fields in EXPECTED_FIELDS.items():
         declared_fields = set(spec[service].get("fields", {}))
-        assert declared_fields == expected_fields, (
-            f"{service}: services.yaml declares {declared_fields}, "
-            f"but the schema expects {expected_fields}"
-        )
+        assert declared_fields == expected_fields, f"{service}: services.yaml declares {declared_fields}, but the schema expects {expected_fields}"

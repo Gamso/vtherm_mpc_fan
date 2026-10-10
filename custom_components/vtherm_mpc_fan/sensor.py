@@ -1,4 +1,5 @@
 """Sensor platform for VTherm MPC Fan."""
+
 from __future__ import annotations
 
 import logging

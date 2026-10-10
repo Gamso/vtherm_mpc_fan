@@ -28,6 +28,7 @@ from .const import (
     DATA_FACTORY_REGISTERED,
     DOMAIN,
     FEATURE_MANAGER_MPC_FAN,
+    PROFILE_HVAC_MODES,
     VTHERM_DOMAIN,
 )
 from .factory import MpcFanManagerFactory
@@ -38,7 +39,7 @@ _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.SENSOR, Platform.NUMBER]
 
-CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)  # pylint: disable=invalid-name  # name required by HA
 
 SERVICE_APPLY_LEARNED_SETTINGS = "apply_learned_settings"
 SERVICE_RESET_LEARNING = "reset_learning"
@@ -46,6 +47,14 @@ SERVICE_SET_EFFECTIVE_SLOPE = "set_effective_slope"
 SERVICE_FORCE_FAN = "force_fan"
 
 ATTR_TARGET_VTHERM = "target_vtherm"
+
+# Service bounds. services.yaml only feeds the UI form; Home Assistant validates
+# a call against the voluptuous schema alone, so a script or automation could
+# otherwise store an absurd slope (kept until reset_learning) or a 1e12-minute
+# override. Same limits as services.yaml and the effective-slope number entity.
+EFFECTIVE_SLOPE_MIN = -2.0
+EFFECTIVE_SLOPE_MAX = 5.0
+FORCE_FAN_MAX_MINUTES = 1440
 
 
 def _register_factory(hass: HomeAssistant) -> bool:
@@ -62,10 +71,7 @@ def _register_factory(hass: HomeAssistant) -> bool:
     try:
         from vtherm_api.vtherm_api import VThermAPI  # pylint: disable=import-outside-toplevel
     except ImportError:
-        _LOGGER.error(
-            "vtherm_api is not available. Install Versatile Thermostat >= 10.2.0, "
-            "which provides it"
-        )
+        _LOGGER.error("vtherm_api is not available. Install Versatile Thermostat >= 10.2.0, which provides it")
         return False
 
     api = VThermAPI.get_vtherm_api(hass)
@@ -95,17 +101,13 @@ def _unregister_factory(hass: HomeAssistant) -> None:
     domain_data(hass)[DATA_FACTORY_REGISTERED] = False
 
 
-async def _reload_target_vtherms(
-    hass: HomeAssistant, source_entry: ConfigEntry | None = None
-) -> None:
+async def _reload_target_vtherms(hass: HomeAssistant, source_entry: ConfigEntry | None = None) -> None:
     """Reload the over_climate VTherms so they pick the manager up.
 
     A VTherm builds its feature managers at setup, so a plugin registered or
     removed afterwards only takes effect once the thermostat is reloaded.
     """
-    target = (
-        source_entry.data.get(CONF_TARGET_VTHERM) if source_entry is not None else None
-    )
+    target = source_entry.data.get(CONF_TARGET_VTHERM) if source_entry is not None else None
 
     reload_tasks = []
     for entry in hass.config_entries.async_entries(VTHERM_DOMAIN):
@@ -130,10 +132,7 @@ def _resolve_manager(hass: HomeAssistant, target: str | None):
     """Return the manager for *target*, or the only one when target is omitted."""
     live = managers(hass)
     if not live:
-        raise HomeAssistantError(
-            "No VTherm MPC Fan manager is running. Check that the target VTherm is "
-            "an over_climate thermostat and has been reloaded."
-        )
+        raise HomeAssistantError("No VTherm MPC Fan manager is running. Check that the target VTherm is an over_climate thermostat and has been reloaded.")
 
     if target:
         manager = live.get(target)
@@ -142,16 +141,10 @@ def _resolve_manager(hass: HomeAssistant, target: str | None):
         for candidate in live.values():
             if target in (candidate.vtherm.entity_id, candidate.vtherm_name):
                 return candidate
-        raise HomeAssistantError(
-            f"No VTherm MPC Fan manager found for '{target}'. "
-            f"Known: {', '.join(m.vtherm.entity_id for m in live.values())}"
-        )
+        raise HomeAssistantError(f"No VTherm MPC Fan manager found for '{target}'. Known: {', '.join(m.vtherm.entity_id for m in live.values())}")
 
     if len(live) > 1:
-        raise HomeAssistantError(
-            f"Several VTherms are managed; pass '{ATTR_TARGET_VTHERM}' to pick one: "
-            f"{', '.join(m.vtherm.entity_id for m in live.values())}"
-        )
+        raise HomeAssistantError(f"Several VTherms are managed; pass '{ATTR_TARGET_VTHERM}' to pick one: {', '.join(m.vtherm.entity_id for m in live.values())}")
     return next(iter(live.values()))
 
 
@@ -213,10 +206,7 @@ def _register_services(hass: HomeAssistant) -> None:
         else:
             available = manager.fan_modes or []
             if available and fan_mode not in available:
-                raise HomeAssistantError(
-                    f"Fan mode '{fan_mode}' is not available for {manager.vtherm_name}. "
-                    f"Known fan modes: {', '.join(available) or 'none yet'}"
-                )
+                raise HomeAssistantError(f"Fan mode '{fan_mode}' is not available for {manager.vtherm_name}. Known fan modes: {', '.join(available) or 'none yet'}")
             manager.force = FanOverride(
                 fan_mode=fan_mode,
                 until=time.time() + duration_minutes * 60.0,
@@ -239,9 +229,7 @@ def _register_services(hass: HomeAssistant) -> None:
         apply_learned_settings,
         schema=vol.Schema(optional_target),
     )
-    hass.services.async_register(
-        DOMAIN, SERVICE_RESET_LEARNING, reset_learning, schema=vol.Schema(optional_target)
-    )
+    hass.services.async_register(DOMAIN, SERVICE_RESET_LEARNING, reset_learning, schema=vol.Schema(optional_target))
     hass.services.async_register(
         DOMAIN,
         SERVICE_SET_EFFECTIVE_SLOPE,
@@ -249,9 +237,12 @@ def _register_services(hass: HomeAssistant) -> None:
         schema=vol.Schema(
             {
                 **optional_target,
-                vol.Required("hvac_mode"): cv.string,
+                vol.Required("hvac_mode"): vol.In(PROFILE_HVAC_MODES),
                 vol.Required("fan_mode"): cv.string,
-                vol.Required("effective_slope"): vol.Coerce(float),
+                vol.Required("effective_slope"): vol.All(
+                    vol.Coerce(float),
+                    vol.Range(min=EFFECTIVE_SLOPE_MIN, max=EFFECTIVE_SLOPE_MAX),
+                ),
             }
         ),
     )
@@ -263,7 +254,7 @@ def _register_services(hass: HomeAssistant) -> None:
             {
                 **optional_target,
                 vol.Required("fan_mode"): cv.string,
-                vol.Required("duration_minutes"): vol.Coerce(float),
+                vol.Required("duration_minutes"): vol.All(vol.Coerce(float), vol.Range(min=0, max=FORCE_FAN_MAX_MINUTES)),
             }
         ),
     )
@@ -325,9 +316,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     data = domain_data(hass)
     data.pop(entry.entry_id, None)
 
-    remaining = [
-        key for key in data if not key.startswith(("factory_", "managers", "add_entities", "entities"))
-    ]
+    remaining = [key for key in data if not key.startswith(("factory_", "managers", "add_entities", "entities"))]
     if not remaining:
         _unregister_factory(hass)
         for service in (
@@ -337,7 +326,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             SERVICE_FORCE_FAN,
         ):
             hass.services.async_remove(DOMAIN, service)
-        await _reload_target_vtherms(hass)
+        # Only the VTherm this entry drove still holds a manager to drop; every
+        # other over_climate thermostat never had one and needs no reload.
+        await _reload_target_vtherms(hass, entry)
 
     return unloaded
 

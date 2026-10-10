@@ -39,6 +39,8 @@
                     "min_interval": "Min Interval (minutes)",
                     "data_collection": "Enable Data Collection (beta)",
                     "defrost_entity": "Defrost Entity (optional)",
+                    "fixed_fan_hvac_modes": "HVAC modes with a fixed fan speed",
+                    "fixed_fan_speed": "Fixed fan speed",
                     "fan_mode_order_0": "Fan speed — rank 1 (weakest)",
                     "fan_mode_order_1": "Fan speed — rank 2",
                     "fan_mode_order_2": "Fan speed — rank 3",
@@ -52,12 +54,15 @@
                     "deadband": "Range: 0.0-5.0 °C. Default: 0.2 °C.",
                     "min_interval": "Range: 1-60 min. Default: 10 min. Acts as both the floor and (x3) the cap on the adaptive interval derived from the learned dead time.",
                     "data_collection": "Records one CSV row per control cycle in the Home Assistant config folder, alongside configuration.yaml: vtherm_mpc_fan_data_XXXXXXXX.csv (max 10 MB, auto-rotated). Useful for reproducing algorithm behaviour and identifying improvements during the beta phase.",
-                    "defrost_entity": "Optional: binary sensor, sensor or input_boolean that indicates when the heat pump is in defrost mode."
-                },
-                "error": {
-                    "base": "Each fan speed must be picked at exactly one rank — the same speed was selected twice."
+                    "defrost_entity": "Optional: binary sensor, sensor or input_boolean that indicates when the heat pump is in defrost mode.",
+                    "fixed_fan_hvac_modes": "In these modes the fan is set to the fixed speed below, e.g. dry and fan_only. heat and cool are always regulated by the MPC and are not listed. The speed is applied as soon as the mode is entered; after a manual speed change, or after a restart or reload, it is (re-)applied only once the minimum interval has elapsed. Nothing is sent while a window is open, the unit is off or defrosting.",
+                    "fixed_fan_speed": "The speed used in the fixed-speed modes above (e.g. superhigh). Required when at least one fixed-speed mode is selected."
                 }
             }
+        },
+        "error": {
+            "fan_order_invalid": "Each fan speed must be picked at exactly one rank — the same speed was selected twice.",
+            "fixed_fan_speed_required": "Choose the fixed fan speed to use in the selected modes."
         }
     }
 }

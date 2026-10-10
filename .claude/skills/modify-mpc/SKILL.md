@@ -39,7 +39,7 @@ When MPC status is actionable (`Ready`, `Setpoint drop`, `Low confidence`), the 
 4. Update disturbance bias (EMA tracking)
 5. Pause conditions: window-open, defrost, HVAC idle → return "Disturbed"
 6. Setpoint drop → return lowest mode immediately
-7. Build monotone slope map (if all profiles learned)
+7. Build monotone slope map (over the learned profiles, partial ladders included)
 8. Simulate ALL fan modes over the horizon (30 min default)
 9. Select best by lowest cost
 10. Apply guards: min-interval hold, hysteresis, step-down hold
@@ -97,7 +97,7 @@ The MPC pauses (returns "Disturbed") during:
 
 All three conditions decay, not update, the disturbance bias.
 
-`is_window_open`/`is_defrost_active`/`is_hvac_idle` are computed in `manager.py`, not `mpc_controller.py` — `evaluate()` just receives them as booleans. Critically, idle/defrost detection reads the underlying climate's own `hvac_action` first (`_underlying_hvac_action()`), and only falls back to VTherm's `is_device_active` / the optional `CONF_DEFROST_ENTITY` when the underlying reports none. Do not "simplify" this back to `vtherm.is_device_active` alone — see the vocabulary section in `CLAUDE.md` for why that reads IDLE at equilibrium even while the unit is running.
+`is_window_open`/`is_defrost_active`/`is_hvac_idle` are computed in `manager.py`, not `mpc_controller.py` — `evaluate()` just receives them as booleans. Critically, idle/defrost detection reads the underlying climate's own `hvac_action` (`_underlying_hvac_action()`); no `hvac_action` means unknown (not idle), and VTherm's `is_device_active` is never used. Defrost falls back to the optional `CONF_DEFROST_ENTITY` when the underlying does not report `defrosting`. Do not "simplify" this back to `vtherm.is_device_active` alone — see the vocabulary section in `CLAUDE.md` for why that reads IDLE at equilibrium even while the unit is running.
 
 ## Control Cycle (`manager.py`)
 

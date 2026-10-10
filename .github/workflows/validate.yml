@@ -2,10 +2,8 @@ name: Validate
 
 on:
   push:
-    branches:
-      - main
-      - develop
   pull_request:
+  workflow_dispatch:
 
 jobs:
   validate:
@@ -18,27 +16,28 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
-
-      - name: Validate Python syntax
-        run: |
-          python -m py_compile custom_components/vtherm_mpc_fan/*.py
-
-      - name: Validate JSON files
-        run: |
-          python -m json.tool custom_components/vtherm_mpc_fan/manifest.json
-          python -m json.tool custom_components/vtherm_mpc_fan/translations/en.json
-          python -m json.tool custom_components/vtherm_mpc_fan/translations/fr.json
-
-      - name: Check required files
-        run: |
-          test -f custom_components/vtherm_mpc_fan/__init__.py
-          test -f custom_components/vtherm_mpc_fan/manifest.json
-          test -f custom_components/vtherm_mpc_fan/config_flow.py
-          test -f custom_components/vtherm_mpc_fan/const.py
-          test -f README.md
+          python-version: "3.14"
 
       - name: Run validation script
         run: |
           chmod +x validate.sh
           ./validate.sh
+
+  hassfest:
+    runs-on: ubuntu-latest
+    name: Hassfest (manifest, translations, services)
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run hassfest
+        uses: home-assistant/actions/hassfest@master
+
+  hacs:
+    runs-on: ubuntu-latest
+    name: HACS validation
+    steps:
+      - name: Run HACS action
+        uses: hacs/action@main
+        with:
+          category: integration

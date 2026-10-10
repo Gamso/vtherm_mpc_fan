@@ -1,4 +1,5 @@
 """Tests for ThermalLearning auto-calibration."""
+
 import pytest
 from custom_components.vtherm_mpc_fan.thermal_learning import ThermalLearning
 from custom_components.vtherm_mpc_fan.mpc_controller import MPCController
@@ -245,6 +246,8 @@ class TestThermalLearning:
         assert learning.get_dead_time("cool") == 8.0
         # Unknown fallback behavior (uses joint / all response times)
         assert learning.get_dead_time("unknown") == 11.0
+
+
 # --- Audit 2026-09: learning-data integrity --------------------------------
 def test_near_zero_slopes_are_learned_as_a_holding_profile() -> None:
     """A speed that holds the room shows |slope| ~ 0 and must still build a profile.

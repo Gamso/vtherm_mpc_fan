@@ -82,6 +82,29 @@ def test_mpc_idle_for_unsimulated_hvac_modes() -> None:
     assert result["mpc_would_change_now"] == "no"
 
 
+def test_mpc_idle_for_modes_without_a_comfort_direction() -> None:
+    """Only heat/cool are regulated; every other mode pauses the MPC."""
+    mpc = MPCController(
+        learning=ThermalLearning(),
+        deadband=0.3,
+        min_interval=10,
+        fan_modes=FAN_MODES,
+    )
+
+    for hvac_mode in ("dry", "fan_only", "heat_cool", "auto"):
+        result = mpc.evaluate(
+            current_temp=26.0,
+            target_temp=24.0,
+            vtherm_slope=0.0,
+            hvac_mode=hvac_mode,
+            current_fan="medium",
+        )
+
+        assert result["mpc_status"] == "Idle", hvac_mode
+        assert result["mpc_fan_mode"] == "medium"
+        assert "not regulated" in result["mpc_reason"]
+
+
 def test_mpc_prefers_stronger_fan_when_profiles_support_it() -> None:
     """MPC picks a stronger fan mode when learned profiles support it."""
     learning = ThermalLearning()
@@ -364,9 +387,7 @@ async def test_setting_the_number_persists_a_ready_synthetic_profile() -> None:
     # hass is deliberately left unset (None): this entity was never added to a
     # platform, and async_set_native_value must not crash trying to publish
     # state to Home Assistant that has never actually adopted it.
-    number = EffectiveSlopeNumber(
-        "entry-1", "climate.living_room", mpc, "cool", "low", on_change=on_change
-    )
+    number = EffectiveSlopeNumber("entry-1", "climate.living_room", mpc, "cool", "low", on_change=on_change)
 
     await number.async_set_native_value(0.42)
 
@@ -442,9 +463,7 @@ def test_number_surfaces_the_live_fallback_before_learning() -> None:
         minutes_since_change=20.0,
     )
 
-    number = EffectiveSlopeNumber(
-        "entry-1", "climate.living_room", mpc, "heat", "high"
-    )
+    number = EffectiveSlopeNumber("entry-1", "climate.living_room", mpc, "heat", "high")
 
     assert number.native_value is not None  # a live guess, not a blank field
     assert number.extra_state_attributes["ready"] is False
@@ -989,6 +1008,7 @@ def test_mpc_handles_long_dead_time_without_blindness() -> None:
 def _seed_gap_profile(learning: ThermalLearning, fan_mode: str, hvac_mode: str, a: float, b: float) -> None:
     """Seed a profile whose effective slope follows a + b·error."""
     import time
+
     now = time.time()
     sign = -1.0 if hvac_mode == "cool" else 1.0
     samples = []
@@ -1009,8 +1029,7 @@ def test_gap_model_projects_faster_cooling_when_far_from_target() -> None:
     const_learning.set_mode_effective_slope("superhigh", "cool", working)
     const_mpc = MPCController(learning=const_learning, deadband=0.3, min_interval=10, fan_modes=["superhigh"])
 
-    kwargs = dict(current_temp=26.0, target_temp=24.0, vtherm_slope=-1.0,
-                  hvac_mode="cool", current_fan="superhigh", minutes_since_change=20.0)
+    kwargs = dict(current_temp=26.0, target_temp=24.0, vtherm_slope=-1.0, hvac_mode="cool", current_fan="superhigh", minutes_since_change=20.0)
     gap = gap_mpc.evaluate(**kwargs)
     const = const_mpc.evaluate(**kwargs)
 
@@ -1025,8 +1044,12 @@ def test_gap_model_does_not_plunge_past_target() -> None:
     mpc = MPCController(learning=learning, deadband=0.3, min_interval=10, fan_modes=["superhigh"])
 
     result = mpc.evaluate(
-        current_temp=24.4, target_temp=24.0, vtherm_slope=-0.5,
-        hvac_mode="cool", current_fan="superhigh", minutes_since_change=20.0,
+        current_temp=24.4,
+        target_temp=24.0,
+        vtherm_slope=-0.5,
+        hvac_mode="cool",
+        current_fan="superhigh",
+        minutes_since_change=20.0,
     )
     # Starting only 0.4°C above target, a 30-min projection must asymptote toward 24.0,
     # not dive well below it the way a constant-slope model would.
@@ -1042,8 +1065,12 @@ def test_gap_aware_disturbance_bias_stays_small_without_disturbance() -> None:
     # Room 2°C above target -> model expects ~2.5 °C/h effective cooling (raw vtherm_slope ≈ -2.5).
     for _ in range(10):
         mpc.evaluate(
-            current_temp=26.0, target_temp=24.0, vtherm_slope=-2.5,
-            hvac_mode="cool", current_fan="superhigh", minutes_since_change=40.0,
+            current_temp=26.0,
+            target_temp=24.0,
+            vtherm_slope=-2.5,
+            hvac_mode="cool",
+            current_fan="superhigh",
+            minutes_since_change=40.0,
         )
     assert abs(mpc.disturbance_bias) < 0.2
 
@@ -1051,21 +1078,22 @@ def test_gap_aware_disturbance_bias_stays_small_without_disturbance() -> None:
 def test_learning_response_sensor_with_mixed_tuple_lengths() -> None:
     """SmartFanLearningResponseSensor extra_state_attributes handles mixed lengths in response_events."""
     import time
+
     learning = ThermalLearning()
     mpc = _build_mpc(learning)
 
     # Inject mixed length response events
     learning.response_events = [
-        (time.time() - 100, 12.0),                # 2-tuple (old format)
-        (time.time() - 200, 15.0, "heat"),        # 3-tuple (new format with hvac_mode)
-        (time.time() - 300, 0.0, "cool"),         # 3-tuple to be ignored (t <= 0)
+        (time.time() - 100, 12.0),  # 2-tuple (old format)
+        (time.time() - 200, 15.0, "heat"),  # 3-tuple (new format with hvac_mode)
+        (time.time() - 300, 0.0, "cool"),  # 3-tuple to be ignored (t <= 0)
     ]
 
     sensor = SmartFanLearningResponseSensor("entry-1", "climate.living_room", mpc)
 
     assert sensor.native_value == 3
     attrs = sensor.extra_state_attributes
-    assert attrs["response_samples"] == 0         # because is_ready() is False, returns fallback 0
+    assert attrs["response_samples"] == 0  # because is_ready() is False, returns fallback 0
     assert attrs["avg_response_time_min"] == pytest.approx(13.5)
 
 
@@ -1145,7 +1173,7 @@ def test_hold_equilibrium_holds_steady_instead_of_coasting_near_setpoint(
 def _ready_learning_with_dead_time(dead_time: float) -> ThermalLearning:
     """Build a ready ThermalLearning whose learned dead time is ``dead_time``."""
     learning = ThermalLearning()
-    for _ in range(90):  # 270 samples > MIN_SAMPLES_LEARNING (240) => is_ready()
+    for _ in range(90):  # 270 samples >= MIN_SAMPLES_LEARNING => is_ready()
         learning.add_slope_sample("low", 0.3, 0.8, "heat")
         learning.add_slope_sample("medium", 0.9, 0.8, "heat")
         learning.add_slope_sample("high", 1.5, 0.8, "heat")
@@ -1342,6 +1370,8 @@ def test_multi_rank_stepdown_blocked_when_candidate_cannot_sustain_progress() ->
         minutes_since_change=300.0,
     )
     assert "Blocked" not in decision2["mpc_reason"]
+
+
 # --- Audit 2026-09: exploration and unmeasured speeds ----------------------
 def test_current_unmeasured_speed_is_modelled_on_the_observed_slope() -> None:
     """A speed with no profile that is losing ground must not be modelled as gaining.
@@ -1445,9 +1475,7 @@ def test_learning_hold_yields_to_comfort() -> None:
     assert drifting["mpc_would_change_now"] == "yes"
     assert "Emergency escalation" in drifting["mpc_reason"]
 
-    far_off = _build_mpc(_learning_with_measured_medium_and_high()).evaluate(
-        current_temp=18.5, minutes_since_change=20.0, **kwargs
-    )
+    far_off = _build_mpc(_learning_with_measured_medium_and_high()).evaluate(current_temp=18.5, minutes_since_change=20.0, **kwargs)
     assert far_off["mpc_would_change_now"] == "yes"
     assert "Learning hold" not in far_off["mpc_reason"]
 
@@ -1497,3 +1525,40 @@ def test_notify_fan_change_resets_the_escalation_baseline() -> None:
     fresh = mpc.evaluate(current_temp=19.6, target_temp=20.0, vtherm_slope=0.25, hvac_mode="heat", current_fan="low", minutes_since_change=8.0)
     assert "Emergency escalation" not in fresh["mpc_reason"]
     assert fresh["mpc_would_change_now"] == "no"
+
+
+def test_dead_time_trust_is_counted_per_hvac_mode() -> None:
+    """Five heating events unlock the heating interval, not the cooling one.
+
+    The trust gate counted every stored event, so a dead time that cool only
+    reaches through the pooled fallback still raised cool's change interval.
+    """
+    learning = ThermalLearning()
+    for _ in range(mpc_module.MIN_RESPONSE_EVENTS_FOR_ADAPTIVE_INTERVAL):
+        learning.add_response_event(24.0, "heat")
+    mpc = _build_mpc(learning, min_interval=10)
+
+    assert mpc._dead_time_is_trusted("heat") is True  # noqa: SLF001
+    assert mpc._dead_time_is_trusted("cool") is False  # noqa: SLF001
+    assert mpc._effective_min_interval(24.0, "heat") == 24.0  # noqa: SLF001
+    assert mpc._effective_min_interval(24.0, "cool") == 10.0  # noqa: SLF001
+
+
+def test_events_from_unregulated_modes_never_build_a_dead_time() -> None:
+    """A month of dry operation must not hand cool a learned, trusted dead time.
+
+    Response events recorded in dry or fan_only (stores written before the
+    manager stopped recording them) are ignored by the dead time, its pooled
+    fallback and the trust gate alike.
+    """
+    learning = ThermalLearning()
+    for _ in range(20):
+        learning.add_response_event(45.0, "dry")
+    mpc = _build_mpc(learning, min_interval=10)
+
+    assert learning.get_dead_time("cool") == mpc_module.DEFAULT_DEAD_TIME
+    assert learning.get_dead_time() == mpc_module.DEFAULT_DEAD_TIME
+    assert mpc._dead_time_is_trusted("cool") is False  # noqa: SLF001
+    assert mpc._dead_time_is_trusted() is False  # noqa: SLF001
+    # The diagnostic total still reports what is stored.
+    assert learning.response_event_count() == 20

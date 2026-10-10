@@ -1,4 +1,5 @@
 """Tests for learning data persistence functionality."""
+
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,6 +14,7 @@ from custom_components.vtherm_mpc_fan.const import (
     CONF_DEADBAND,
     DEFAULT_DEADBAND,
     MIN_MODE_PROFILE_SAMPLES,
+    MIN_SAMPLES_LEARNING,
 )
 
 
@@ -98,22 +100,23 @@ class TestLearningPersistence:
         assert data["slope_max"] == 0.0
 
     def test_learning_persistence_above_min_samples(self):
-        """Test that all samples above 200 are persisted so 100% can be reached."""
+        """Test that a store holding exactly min_samples restores at 100% progress."""
         learning = ThermalLearning()
+        assert learning.min_samples == MIN_SAMPLES_LEARNING
 
-        # Add 240 samples (== _min_samples, needed for 100% progress)
-        for _ in range(240):
+        # Exactly _min_samples (MIN_SAMPLES_LEARNING): the threshold for 100% progress
+        for _ in range(MIN_SAMPLES_LEARNING):
             learning.add_slope_sample("medium", 0.5, 0.3)
 
-        assert learning.slope_sample_count() == 240
+        assert learning.slope_sample_count() == MIN_SAMPLES_LEARNING
 
         # Serialize and restore
         data = learning.to_dict()
         restored = ThermalLearning.from_dict(data)
 
-        # All 240 samples must survive the round-trip
-        assert len(data["slope_samples"]) == 240
-        assert restored.slope_sample_count() == 240
+        # Every sample must survive the round-trip
+        assert len(data["slope_samples"]) == MIN_SAMPLES_LEARNING
+        assert restored.slope_sample_count() == MIN_SAMPLES_LEARNING
         assert restored.get_progress() == 100.0
         assert restored.is_ready()
 

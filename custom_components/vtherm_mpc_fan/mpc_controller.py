@@ -1,4 +1,5 @@
 """MPC controller: learned thermal model with cost-based fan selection."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -301,15 +302,19 @@ class MPCController:
         """
         self._error_at_lock_start = None
 
-    def _dead_time_is_trusted(self) -> bool:
-        """True when the learned dead time rests on enough real response events.
+    def _dead_time_is_trusted(self, hvac_mode: str = "unknown") -> bool:
+        """True when *hvac_mode*'s learned dead time rests on enough real response events.
 
         See MIN_RESPONSE_EVENTS_FOR_ADAPTIVE_INTERVAL for why this is not
         ``ThermalLearning.is_ready()``: that flag counts slope samples, which
         answers a different question and lags so far behind that the adaptive
         interval could never engage on a coarse room sensor.
+
+        Counted per mode, like the dead time itself: five heating events say
+        nothing about the cooling lag, and a dead time that only exists through
+        the pooled fallback must not unlock the adaptive interval.
         """
-        return self._learning.response_event_count() >= MIN_RESPONSE_EVENTS_FOR_ADAPTIVE_INTERVAL
+        return self._learning.response_event_count(hvac_mode) >= MIN_RESPONSE_EVENTS_FOR_ADAPTIVE_INTERVAL
 
     def get_effective_timeout(self, hvac_mode: str = "unknown") -> float:
         """Return the adaptive advisory timeout (diagnostic only).
@@ -320,12 +325,12 @@ class MPCController:
         dead time is trusted it falls back to the default dead time scaled by the
         safety factor.
         """
-        if self._dead_time_is_trusted():
+        if self._dead_time_is_trusted(hvac_mode):
             learned_dead_time = self._learning.get_dead_time(hvac_mode)
             return max(self._min_interval, learned_dead_time * DEAD_TIME_SAFETY_FACTOR)
         return DEFAULT_DEAD_TIME * DEAD_TIME_SAFETY_FACTOR
 
-    def _effective_min_interval(self, dead_time: float) -> float:
+    def _effective_min_interval(self, dead_time: float, hvac_mode: str = "unknown") -> float:
         """Return the minimum dwell (minutes) before a fan change is allowed.
 
         The configured ``min_interval`` is a floor. Once the dead time is trusted
@@ -337,7 +342,7 @@ class MPCController:
         overrides (setpoint drop, window/defrost/idle) are handled before this
         gate, so they are never blocked by a long adaptive interval.
         """
-        if not self._dead_time_is_trusted():
+        if not self._dead_time_is_trusted(hvac_mode):
             return float(self._min_interval)
         capped = min(dead_time, self._min_interval * MAX_ADAPTIVE_INTERVAL_FACTOR)
         return max(float(self._min_interval), capped)
@@ -372,11 +377,12 @@ class MPCController:
             is_window_open,
         )
 
-        if hvac_mode in ("off", "dry", "fan_only"):
+        # Only heat/cool have a defined comfort-error direction and learned profiles.
+        if hvac_mode not in PROFILE_HVAC_MODES:
             return self._payload(
                 status="Idle",
                 fan_mode=current_fan,
-                reason=f"HVAC mode '{hvac_mode}' is not simulated",
+                reason=f"HVAC mode '{hvac_mode}' is not regulated",
                 would_change_now="no",
             )
 
@@ -406,7 +412,7 @@ class MPCController:
         if minutes_since_change < self._cycle_minutes or self._error_at_lock_start is None:
             self._error_at_lock_start = current_error
         error_growth_since_change = current_error - self._error_at_lock_start
-        effective_min_interval = self._effective_min_interval(dead_time)
+        effective_min_interval = self._effective_min_interval(dead_time, hvac_mode)
         learning_hold_minutes = dead_time * MIN_ESTABLISHED_RATIO + LEARNING_HOLD_EXTRA_MINUTES
         learning_hold = self._learning_hold_active(
             active_fan=active_fan,
@@ -434,9 +440,7 @@ class MPCController:
         # disturbance bias clean: it only captures genuine external disturbances
         # (solar gain, occupancy) instead of the systematic variation of cooling
         # power with the distance to setpoint.
-        current_mode_gain = (
-            self._learning.get_mode_slope_gain(active_fan, hvac_mode) if current_known_profile else 0.0
-        )
+        current_mode_gain = self._learning.get_mode_slope_gain(active_fan, hvac_mode) if current_known_profile else 0.0
         expected_slope_now = self._gap_slope(current_mode_slope, current_mode_gain, current_error)
         self._update_disturbance_bias(
             observed_effective_slope=current_effective_slope,
@@ -576,25 +580,16 @@ class MPCController:
             if blocked_index > current_index:
                 ranks = blocked_index - current_index
                 rung = _skipped_unmeasured_rung(blocked_index)
-                blocked_note = (
-                    f"Blocked {ranks}-rank jump to {unfiltered_best.fan_mode}: "
-                    f"{rung} has no measured profile yet and must be tried first"
-                )
+                blocked_note = f"Blocked {ranks}-rank jump to {unfiltered_best.fan_mode}: {rung} has no measured profile yet and must be tried first"
             else:
                 ranks = current_index - blocked_index
                 blocked_slope = self._learning.get_mode_effective_slope(unfiltered_best.fan_mode, hvac_mode)
-                blocked_note = (
-                    f"Blocked {ranks}-rank drop to {unfiltered_best.fan_mode}: "
-                    f"its own profile ({blocked_slope:.2f}C/h) can't sustain progress"
-                )
+                blocked_note = f"Blocked {ranks}-rank drop to {unfiltered_best.fan_mode}: its own profile ({blocked_slope:.2f}C/h) can't sustain progress"
 
         if not change_allowed and best.fan_mode != active_fan:
             best_index = fan_modes.index(best.fan_mode)
             if best_index > current_index and error_growth_since_change > DEAD_TIME_ESCALATION_GROWTH:
-                selection_note = (
-                    f"Emergency escalation to {best.fan_mode}: comfort error worsened by "
-                    f"{error_growth_since_change:.2f}C since the change bypasses the min interval"
-                )
+                selection_note = f"Emergency escalation to {best.fan_mode}: comfort error worsened by {error_growth_since_change:.2f}C since the change bypasses the min interval"
                 change_allowed = True
             else:
                 selection_note = f"Min interval holds {active_fan} until a change is allowed"
@@ -609,10 +604,7 @@ class MPCController:
             )
             actual_gain = current_simulation.total_cost - best.total_cost
             if actual_gain < required_gain:
-                selection_note = (
-                    f"Hysteresis holds {active_fan}: {best.fan_mode} only improves by "
-                    f"{actual_gain:.2f} < {required_gain:.2f}"
-                )
+                selection_note = f"Hysteresis holds {active_fan}: {best.fan_mode} only improves by {actual_gain:.2f} < {required_gain:.2f}"
                 best = current_simulation
             else:
                 hold_note = self._step_down_hold_note(
@@ -645,10 +637,7 @@ class MPCController:
                 for sim in simulations
             ],
         )
-        reason = (
-            f"MPC recommends {best.fan_mode}: cost={best.total_cost:.2f}, "
-            f"T+10={best.predicted_temp_10m:.2f}C, T+30={best.predicted_temp_30m:.2f}C"
-        )
+        reason = f"MPC recommends {best.fan_mode}: cost={best.total_cost:.2f}, T+10={best.predicted_temp_10m:.2f}C, T+30={best.predicted_temp_30m:.2f}C"
         if blocked_note:
             reason += f" | {blocked_note}"
         if selection_note:
@@ -660,10 +649,7 @@ class MPCController:
         if abs(self._disturbance_bias) >= 0.05:
             reason += f" | Bias={self._disturbance_bias:+.2f}C/h"
         if not change_allowed:
-            reason += (
-                f" | Min interval active ({minutes_since_change:.1f}/"
-                f"{effective_min_interval:.1f} min)"
-            )
+            reason += f" | Min interval active ({minutes_since_change:.1f}/{effective_min_interval:.1f} min)"
             if learning_hold:
                 reason += f" | Learning hold: {active_fan} has no measured profile yet"
 
@@ -708,9 +694,7 @@ class MPCController:
             return False
         if current_error > MULTI_RANK_JUMP_ERROR:
             return False
-        overshooting_and_worsening = (
-            current_error < -self._deadband and error_growth_since_change < -DEAD_TIME_ESCALATION_GROWTH
-        )
+        overshooting_and_worsening = current_error < -self._deadband and error_growth_since_change < -DEAD_TIME_ESCALATION_GROWTH
         return not overshooting_and_worsening
 
     def _count_known_profiles(self, fan_modes: list[str], hvac_mode: str) -> int:
@@ -722,11 +706,7 @@ class MPCController:
         VTherm's own attributes, when nothing was lost and only the optimisation
         was skipped.
         """
-        return sum(
-            1
-            for fan_mode in fan_modes
-            if self._learning.get_mode_effective_slope(fan_mode, hvac_mode) is not None
-        )
+        return sum(1 for fan_mode in fan_modes if self._learning.get_mode_effective_slope(fan_mode, hvac_mode) is not None)
 
     def _get_mode_slope(
         self,
@@ -883,11 +863,7 @@ class MPCController:
         only ever synthesises a replacement, it is never imposed as a minimum
         gap between measured values.
         """
-        measured = {
-            fm: slope
-            for fm in fan_modes
-            if (slope := self._learning.get_mode_effective_slope(fm, hvac_mode)) is not None
-        }
+        measured = {fm: slope for fm in fan_modes if (slope := self._learning.get_mode_effective_slope(fm, hvac_mode)) is not None}
         if not measured:
             return {}
 
@@ -1024,10 +1000,7 @@ class MPCController:
         # Hold zone: within one deadband of the setpoint we optimise for holding
         # equilibrium (match the compressor's steady output) rather than for the
         # lowest fan rank. See the HOLD_EQUILIBRIUM constant block for rationale.
-        hold_active = (
-            HOLD_EQUILIBRIUM
-            and abs(self._temperature_error(current_temp, target_temp, hvac_mode)) <= self._deadband
-        )
+        hold_active = HOLD_EQUILIBRIUM and abs(self._temperature_error(current_temp, target_temp, hvac_mode)) <= self._deadband
         undershoot_tolerance = HOLD_UNDERSHOOT_TOLERANCE if hold_active else 0.0
 
         for step in range(1, steps + 1):
@@ -1036,10 +1009,7 @@ class MPCController:
                 target_effective_slope = current_effective_slope
             else:
                 step_error = self._temperature_error(sim_temp, target_temp, hvac_mode)
-                target_effective_slope = (
-                    self._gap_slope(candidate_mode_slope, candidate_mode_gain, step_error)
-                    + self._disturbance_bias
-                )
+                target_effective_slope = self._gap_slope(candidate_mode_slope, candidate_mode_gain, step_error) + self._disturbance_bias
 
             thermal_power += THERMAL_POWER_BLEND * (target_effective_slope - thermal_power)
             raw_slope = -thermal_power if hvac_mode == "cool" else thermal_power
@@ -1067,7 +1037,7 @@ class MPCController:
         # scaling. Relative power grows geometrically with the mode rank so every
         # mode is differentiated regardless of how many the climate entity exposes
         # (a 4-mode system reproduces the previous 1.0 / 1.8 / 3.3 / 6.0 ramp).
-        relative_power = MODE_POWER_RATIO ** candidate_index
+        relative_power = MODE_POWER_RATIO**candidate_index
         rank_scale = HOLD_RANK_SCALE if hold_active else 1.0
         cost += MODE_RANK_COST * relative_power * rank_scale
         if candidate_fan != current_fan and not change_allowed:
@@ -1132,10 +1102,7 @@ class MPCController:
         predicted_error_10m = self._temperature_error(candidate.predicted_temp_10m, target_temp, hvac_mode)
         reserve = max(self._deadband * 0.5, UNDER_TARGET_SHORTFALL_RESERVE)
         if predicted_error_10m > reserve:
-            return (
-                f"Below target: holding {active_fan} because {candidate.fan_mode} still leaves "
-                f"{predicted_error_10m:.2f}C shortfall at 10 min"
-            )
+            return f"Below target: holding {active_fan} because {candidate.fan_mode} still leaves {predicted_error_10m:.2f}C shortfall at 10 min"
 
         return None
 
@@ -1204,8 +1171,7 @@ class MPCController:
             "mpc_disturbance_bias": round(disturbance_bias, 3) if disturbance_bias is not None else None,
         }
         _LOGGER.debug(
-            "MPC decision: status=%s fan_mode=%s would_change_now=%s cost=%s "
-            "confidence=%s known_profiles=%d dead_time=%s bias=%s reason=%s",
+            "MPC decision: status=%s fan_mode=%s would_change_now=%s cost=%s confidence=%s known_profiles=%d dead_time=%s bias=%s reason=%s",
             status,
             fan_mode,
             would_change_now,

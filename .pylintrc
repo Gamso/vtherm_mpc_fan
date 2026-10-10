@@ -1,2 +1,19 @@
 [FORMAT]
 max-line-length=180
+
+[MESSAGES CONTROL]
+# Design-size checks (argument/local/branch counts, similar lines) are not
+# enforced: the MPC and the learner are deliberately written as long, heavily
+# commented functions. abstract-method misfires on Home Assistant base classes
+# whose sync/async method pairs only need one side implemented.
+disable=
+    too-many-arguments,
+    too-many-positional-arguments,
+    too-many-locals,
+    too-many-instance-attributes,
+    too-many-statements,
+    too-many-branches,
+    too-many-public-methods,
+    too-many-lines,
+    duplicate-code,
+    abstract-method

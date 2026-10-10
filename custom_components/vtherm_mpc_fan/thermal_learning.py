@@ -1,11 +1,15 @@
+"""Learned thermal model: slope samples, response events, per-profile slope fits."""
+
 import logging
 import time
 import statistics
+from collections import Counter
 
 from .const import (
     MIN_SAMPLES_LEARNING,
     MIN_MODE_PROFILE_SAMPLES,
     DEFAULT_DEAD_TIME,
+    PROFILE_HVAC_MODES,
     PROFILE_RETENTION_SAMPLES,
     REFERENCE_SLOPE_ERROR,
 )
@@ -36,6 +40,10 @@ class ThermalLearning:
 
         # Cache for computed optimal parameters (invalidated on each new sample)
         self._optimal_cache: dict | None = None
+        # Per-profile regression results, keyed (fan_mode, hvac_mode). Every
+        # entity and every MPC candidate reads the same few fits several times
+        # per cycle; they only change when the sample list does.
+        self._fit_cache: dict[tuple[str, str], tuple[float, float, float | None] | None] = {}
 
     def reset(self) -> None:
         """Reset all learning data and statistics."""
@@ -47,6 +55,7 @@ class ThermalLearning:
         self._slope_max = 0.0
         self._ready_once = False
         self._optimal_cache = None
+        self._fit_cache.clear()
         self._profile_ready_logged.clear()
         _LOGGER.info("Learning: reset requested; data cleared")
 
@@ -82,6 +91,7 @@ class ThermalLearning:
             return
 
         self._slope_samples.append((time.time(), fan_mode, slope, hvac_mode, temperature_error))
+        self._fit_cache.clear()
         profile_samples = self.get_mode_sample_count(fan_mode, hvac_mode)
         _LOGGER.debug(
             "Learning: Collected slope sample #%d (fan=%s, slope=%.2f, err=%.2f, hvac=%s, profile=%d/%d)",
@@ -99,11 +109,7 @@ class ThermalLearning:
         self._update_slope_stats(abs(slope))
 
         profile_key = (hvac_mode, fan_mode)
-        if (
-            hvac_mode != "unknown"
-            and profile_samples >= MIN_MODE_PROFILE_SAMPLES
-            and profile_key not in self._profile_ready_logged
-        ):
+        if hvac_mode != "unknown" and profile_samples >= MIN_MODE_PROFILE_SAMPLES and profile_key not in self._profile_ready_logged:
             self._profile_ready_logged.add(profile_key)
             effective_slope = self.get_mode_effective_slope(fan_mode, hvac_mode)
             _LOGGER.info(
@@ -120,6 +126,9 @@ class ThermalLearning:
         cutoff_time = time.time() - (self._learning_window_hours * 3600)
         before = len(self._slope_samples)
         self._slope_samples = self.trim_with_min_retention(self._slope_samples, cutoff_time, PROFILE_RETENTION_SAMPLES)
+        # The trim may reorder samples even when it drops none, and the
+        # regression sums in list order: never serve a fit from the old order.
+        self._fit_cache.clear()
 
         if len(self._slope_samples) < before:
             self.recompute_slope_stats()
@@ -209,9 +218,39 @@ class ThermalLearning:
         """Return number of collected slope samples."""
         return len(self._slope_samples)
 
-    def response_event_count(self) -> int:
-        """Return number of recorded response events."""
-        return len(self._response_events)
+    def response_event_count(self, hvac_mode: str | None = None) -> int:
+        """Return the number of recorded response events.
+
+        Without *hvac_mode* every stored event is counted (diagnostics). With
+        one, only the events that :meth:`get_dead_time` would use for that mode
+        are counted -- so "is the dead time of cool trusted?" is answered by
+        cool's own events, never by heating's or by a non-regulated mode's.
+        """
+        if hvac_mode is None:
+            return len(self._response_events)
+        return len(self._mode_response_times(hvac_mode))
+
+    @staticmethod
+    def _event_mode(item) -> str:
+        """Return the HVAC mode a response event was recorded in (legacy: unknown)."""
+        return item[2] if len(item) == 3 else "unknown"
+
+    def _mode_response_times(self, hvac_mode: str) -> list[float]:
+        """Return the response times that describe *hvac_mode*'s dead time.
+
+        Events recorded in a non-regulated mode (dry, fan_only...) are never
+        used: the slope there is not driven by heating or cooling, so its
+        "response" says nothing about the lag the MPC works with. ``unknown``
+        pools the regulated modes; legacy events without a mode count for any.
+        """
+        times = []
+        for item in self._response_events:
+            event_mode = self._event_mode(item)
+            if item[1] <= 0 or (event_mode != "unknown" and event_mode not in PROFILE_HVAC_MODES):
+                continue
+            if hvac_mode == "unknown" or event_mode in (hvac_mode, "unknown"):
+                times.append(item[1])
+        return times
 
     def get_progress(self) -> float:
         """Return learning progress as percentage (0-100).
@@ -259,6 +298,7 @@ class ThermalLearning:
     def slope_samples(self, value: list) -> None:
         self._slope_samples = value
         self._optimal_cache = None
+        self._fit_cache.clear()
 
     @property
     def response_events(self) -> list:
@@ -285,25 +325,33 @@ class ThermalLearning:
     def get_dead_time(self, hvac_mode: str = "unknown") -> float:
         """Return the learned dead time (median response time) in minutes for specified HVAC mode.
 
-        Falls back to DEFAULT_DEAD_TIME when no response events have been recorded yet.
+        Falls back to the regulated modes pooled together when the requested
+        mode has no event yet, then to DEFAULT_DEAD_TIME when there is none at
+        all. Events from non-regulated modes are ignored (see
+        :meth:`_mode_response_times`).
         """
-        response_times = []
-        for item in self._response_events:
-            t = item[1]
-            hm = item[2] if len(item) == 3 else "unknown"
-            if t > 0:
-                if hvac_mode == "unknown" or hm == hvac_mode or hm == "unknown":
-                    response_times.append(t)
+        response_times = self._mode_response_times(hvac_mode)
 
         if not response_times:
-            # Try any if specific not found
-            response_times = [item[1] for item in self._response_events if item[1] > 0]
+            # Try any regulated mode if the specific one has none yet
+            response_times = self._mode_response_times("unknown")
 
         if not response_times:
             return DEFAULT_DEAD_TIME
         return statistics.median(response_times)
 
     def _fit_mode_slope(self, fan_mode: str, hvac_mode: str) -> tuple[float, float, float | None] | None:
+        """Return the profile's fit, computed once per change of the sample list.
+
+        See :meth:`_compute_mode_fit` for the model. The result is a tuple (or
+        None) and is never mutated by callers, so it is safe to share.
+        """
+        key = (fan_mode, hvac_mode)
+        if key not in self._fit_cache:
+            self._fit_cache[key] = self._compute_mode_fit(fan_mode, hvac_mode)
+        return self._fit_cache[key]
+
+    def _compute_mode_fit(self, fan_mode: str, hvac_mode: str) -> tuple[float, float, float | None] | None:
         """Fit the gap-dependent slope model and return (intercept_a, gain_b, r_squared).
 
         The effective cooling/heating rate is not constant: it scales with the
@@ -485,6 +533,7 @@ class ThermalLearning:
         # Remove existing samples for this profile
         before = len(self._slope_samples)
         self._slope_samples = [s for s in self._slope_samples if not (s[1] == fan_mode and s[3] == hvac_mode)]
+        self._fit_cache.clear()
         removed = before - len(self._slope_samples)
 
         # Insert MIN_MODE_PROFILE_SAMPLES synthetic samples at current time.
@@ -497,7 +546,11 @@ class ThermalLearning:
 
         _LOGGER.info(
             "Learning: set_mode_effective_slope %s/%s = %.3f (removed %d, inserted %d synthetic samples)",
-            hvac_mode, fan_mode, target_slope, removed, MIN_MODE_PROFILE_SAMPLES,
+            hvac_mode,
+            fan_mode,
+            target_slope,
+            removed,
+            MIN_MODE_PROFILE_SAMPLES,
         )
 
     def get_mode_sample_count(self, fan_mode: str, hvac_mode: str) -> int:
@@ -513,11 +566,7 @@ class ThermalLearning:
         merely *seeded* -- the distinction the exploration guards in the MPC and
         the ``value_source`` attribute of the number entities rely on.
         """
-        return sum(
-            1
-            for s in self._slope_samples
-            if s[1] == fan_mode and s[3] == hvac_mode and len(s) > 4 and s[4] is not None
-        )
+        return sum(1 for s in self._slope_samples if s[1] == fan_mode and s[3] == hvac_mode and len(s) > 4 and s[4] is not None)
 
     def has_measured_profile(self, fan_mode: str, hvac_mode: str) -> bool:
         """True once a profile rests on MIN_MODE_PROFILE_SAMPLES real measurements."""
@@ -637,11 +686,11 @@ class ThermalLearning:
         self._slope_m2 = 0.0
         self._slope_max = 0.0
         self._optimal_cache = None  # Invalidate cache when stats are rebuilt
-        self._profile_ready_logged = {
-            (s[3], s[1])
-            for s in self._slope_samples
-            if s[3] != "unknown" and self.get_mode_sample_count(s[1], s[3]) >= MIN_MODE_PROFILE_SAMPLES
-        }
+        self._fit_cache.clear()
+        # One counting pass: asking get_mode_sample_count() for every sample
+        # rescanned the whole list each time, O(n^2) on the event loop at load.
+        profile_counts = Counter((s[3], s[1]) for s in self._slope_samples)
+        self._profile_ready_logged = {profile for profile, count in profile_counts.items() if profile[0] != "unknown" and count >= MIN_MODE_PROFILE_SAMPLES}
 
         for sample in self._slope_samples:
             self._update_slope_stats(abs(sample[2]))
