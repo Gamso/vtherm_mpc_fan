@@ -18,7 +18,9 @@ from custom_components.vtherm_mpc_fan.registry import (
     add_entities_registry,
     clear_registry,
     entities_registry,
+    find_native_auto_fan,
     managers,
+    native_auto_fan_mode,
 )
 from custom_components.vtherm_mpc_fan.sensor import PLATFORM_SENSOR
 
@@ -146,3 +148,37 @@ async def test_without_clearing_the_registry_reload_would_stay_unavailable() -> 
 
     second_add_sensor.assert_not_called()
     second_add_number.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({"auto_fan_mode": "auto_fan_high"}, "auto_fan_high"),
+        ({"auto_fan_mode": "auto_fan_none"}, None),
+        ({"auto_fan_mode": None}, None),
+        ({}, None),
+        (None, None),
+        ("not a mapping", None),
+    ],
+)
+def test_native_auto_fan_mode_reads_the_vtherm_option(config, expected) -> None:
+    """Only a set auto_fan_mode other than auto_fan_none is an active built-in auto-fan."""
+    assert native_auto_fan_mode(config) == expected
+
+
+def test_native_auto_fan_mode_accepts_a_read_only_mapping() -> None:
+    """The Protocol types entry_infos as MappingProxyType, which is not a dict."""
+    from types import MappingProxyType  # pylint: disable=import-outside-toplevel
+
+    assert native_auto_fan_mode(MappingProxyType({"auto_fan_mode": "auto_fan_turbo"})) == "auto_fan_turbo"
+
+
+def test_find_native_auto_fan_matches_the_vtherm_entry_by_entry_id() -> None:
+    """A VTherm's unique_id is its config entry's entry_id; options override data."""
+    hass = MagicMock()
+    target = MagicMock(entry_id="vtherm-a", data={"auto_fan_mode": "auto_fan_none"}, options={"auto_fan_mode": "auto_fan_medium"})
+    other = MagicMock(entry_id="vtherm-b", data={"auto_fan_mode": "auto_fan_high"}, options={})
+    hass.config_entries.async_entries = MagicMock(return_value=[other, target])
+
+    assert find_native_auto_fan(hass, "vtherm-a") == "auto_fan_medium"
+    assert find_native_auto_fan(hass, "vtherm-c") is None

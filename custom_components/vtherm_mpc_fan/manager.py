@@ -13,7 +13,6 @@ Assistant objects.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import logging
 import time
 from typing import Any, TYPE_CHECKING
 
@@ -22,11 +21,16 @@ from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
+from .log import get_logger, write_event_log
 from .const import (
     CONF_DATA_COLLECTION,
     CONF_DEADBAND,
     CONF_DEFROST_ENTITY,
+    CONF_EXPLORATION_PROBE,
+    CONF_EXPLORATION_UCB,
+    CONF_EXPLORATION_UNDER_LOAD,
     CONF_FAN_MODE_ORDER,
+    CONF_THOMPSON_SAMPLING,
     CONF_FIXED_FAN_HVAC_MODES,
     CONF_FIXED_FAN_SPEED,
     CONF_MIN_INTERVAL,
@@ -34,19 +38,23 @@ from .const import (
     DEFAULT_CYCLE_MINUTES,
     DEFAULT_DATA_COLLECTION,
     DEFAULT_DEADBAND,
+    DEFAULT_EXPLORATION_PROBE,
+    DEFAULT_EXPLORATION_UCB,
+    DEFAULT_EXPLORATION_UNDER_LOAD,
     DEFAULT_MIN_INTERVAL,
+    DEFAULT_THOMPSON_SAMPLING,
     DOMAIN,
     FEATURE_MANAGER_MPC_FAN,
     HVAC_OFF_REASON_WINDOW,
     MIN_ESTABLISHED_RATIO,
+    NATIVE_AUTO_FAN_CONFLICT,
     PHASE_ESTABLISHED,
     PROFILE_HVAC_MODES,
+    SAMPLE_INTERVAL_MINUTES,
     SETPOINT_DROP_LEARNING_COOLDOWN,
     SLOPE_SAMPLE_MIN_DELTA,
     STORAGE_KEY,
     STORAGE_VERSION,
-    THRESHOLD_SLOPE,
-    THRESHOLD_TARGET_DROP,
 )
 from .data_collection import DataCollector
 from .mpc_controller import MPCController
@@ -55,6 +63,7 @@ from .registry import (
     entity_bucket,
     find_conflicting_plugin,
     managers,
+    native_auto_fan_mode,
 )
 from .number import PLATFORM_NUMBER, build_entities as build_number_entities
 from .sensor import PLATFORM_SENSOR, build_entities as build_sensor_entities
@@ -63,7 +72,7 @@ from .thermal_learning import ThermalLearning
 if TYPE_CHECKING:
     from vtherm_api.interfaces import InterfaceThermostatRuntime
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_logger(__name__)
 
 ATTR_MPC_FAN_SECTION = "mpc_fan"
 
@@ -102,6 +111,25 @@ def apply_configured_fan_order(detected: list[str], configured: list[str] | None
     ordered = [mode for mode in configured if mode in detected]
     ordered += [mode for mode in detected if mode not in ordered]
     return ordered
+
+
+@dataclass(slots=True, frozen=True)
+class CycleInputs:
+    """The runtime readings one control cycle works from.
+
+    ``target_temp`` is the regulated setpoint (what VTherm sends to the
+    underlying), ``user_target_temp`` the user's own setpoint, and
+    ``regulation_offset`` regulated minus user (raw degC, None when either is
+    unknown).
+    """
+
+    vtherm_slope: float
+    current_temp: float
+    target_temp: float
+    user_target_temp: float | None
+    regulation_offset: float | None
+    hvac_mode: str
+    current_fan: str | None
 
 
 @dataclass(slots=True)
@@ -147,6 +175,17 @@ def build_data_collection_decision(
     }
 
 
+def comfort_error(current_temp: float, user_target_temp: float | None, hvac_mode: str) -> float | None:
+    """Return the signed error against the user's setpoint, None when it is unknown.
+
+    Positive means the room needs more heating (heat) or cooling (cool). Only a
+    regulated mode has a direction, so any other mode yields None.
+    """
+    if user_target_temp is None or hvac_mode not in PROFILE_HVAC_MODES:
+        return None
+    return (current_temp - user_target_temp) if hvac_mode == "cool" else (user_target_temp - current_temp)
+
+
 def filter_supported_fan_modes(raw_modes: list[str] | None) -> list[str]:
     """Keep only manual fan modes; ``auto``/``off`` are not strength levels."""
     if not raw_modes:
@@ -174,7 +213,6 @@ class MpcFanFeatureManager:
 
         # Control-cycle memory (previously the module-level ctrl_state dict).
         self._last_change_time: float = 0.0
-        self._previous_slope: float | None = None
         self._last_hvac_mode: str | None = None
         # When this manager ran its first cycle. A fresh manager (restart, VTherm
         # reload, options change) has no fan-change history, so the fixed-speed
@@ -190,21 +228,27 @@ class MpcFanFeatureManager:
         # event and the learning gate all restart from it.
         self._last_observed_fan: str | None = None
         # One response event per fan change: armed by a change, consumed by the
-        # first significant slope move after it. Without this every slope jump
-        # inside the 60-minute window counted as another response to the same
-        # change, and the median dead time drifted toward the middle of the window.
+        # first sensor step in the direction the change should move the room.
+        # Without this every move inside the 60-minute window counted as another
+        # response to the same change, and the median dead time drifted toward
+        # the middle of the window. The reference is the temperature at the
+        # change and the expected direction (+1 a stronger speed, -1 a weaker).
         self._response_armed = False
-        # Last slope actually handed to the model per (hvac_mode, fan_mode).
-        # Not persisted: after a restart the first sample of each mode is
-        # accepted, which costs at most one duplicate and avoids stale state.
-        self._last_sampled_slope: dict[tuple[str, str], float] = {}
+        self._response_start_temp: float | None = None
+        self._response_direction = 0
+        # Last sample actually handed to the model per (hvac_mode, fan_mode):
+        # (slope, epoch seconds). Not persisted: after a restart the first sample
+        # of each mode is accepted, which costs at most one duplicate and avoids
+        # stale state.
+        self._last_sample: dict[tuple[str, str], tuple[float, float]] = {}
 
         #: Manual override set by the force_fan service: {"fan_mode": str, "until": float}
         self.force: FanOverride | None = None
 
         self._last_decision: dict[str, Any] = {}
         self._active_listener: list = []
-        #: Domain of another fan-driving plugin on this VTherm, when one is found.
+        #: Another fan controller on this VTherm, when one is found: a plugin's
+        #: domain, or NATIVE_AUTO_FAN_CONFLICT for VTherm's built-in auto-fan.
         self._conflict: str | None = None
         self._conflict_logged = False
 
@@ -276,8 +320,9 @@ class MpcFanFeatureManager:
             "sent_fan_mode": self._last_sent_fan_mode,
             "learning_ready": self._learning.is_ready(),
             "forced_until": self.force.until if self.force else None,
-            # Non-null means another plugin owns the fan and this one is standing
-            # down; surfaced here so a silent yield is still visible.
+            # Non-null means another controller (a plugin, or VTherm's own
+            # auto-fan) owns the fan and this one is standing down; surfaced
+            # here so a silent yield is still visible.
             "conflicting_plugin": self._conflict,
             **{key: value for key, value in self._last_decision.items() if key.startswith("mpc_")},
         }
@@ -407,6 +452,10 @@ class MpcFanFeatureManager:
             # The MPC simulates in control-cycle steps, so it must use the cadence
             # it is actually driven at -- which VTherm owns, not this plugin.
             cycle_minutes=self._vtherm.cycle_min or DEFAULT_CYCLE_MINUTES,
+            exploration_probe=conf.get(CONF_EXPLORATION_PROBE, DEFAULT_EXPLORATION_PROBE),
+            exploration_ucb=conf.get(CONF_EXPLORATION_UCB, DEFAULT_EXPLORATION_UCB),
+            exploration_under_load=conf.get(CONF_EXPLORATION_UNDER_LOAD, DEFAULT_EXPLORATION_UNDER_LOAD),
+            thompson_sampling=conf.get(CONF_THOMPSON_SAMPLING, DEFAULT_THOMPSON_SAMPLING),
         )
 
         if conf.get(CONF_DATA_COLLECTION, DEFAULT_DATA_COLLECTION):
@@ -538,17 +587,14 @@ class MpcFanFeatureManager:
 
         if now >= force.until:
             self.force = None
-            _LOGGER.info("Force fan expired for %s; resuming MPC control", self._name)
+            write_event_log(_LOGGER, self, "force_fan override expired, resuming MPC control")
             return None
 
         fan_modes = self.fan_modes
         if fan_modes and force.fan_mode not in fan_modes:
             self.force = None
-            _LOGGER.warning(
-                "Forced fan '%s' is no longer valid for %s; cancelling override",
-                force.fan_mode,
-                self._name,
-            )
+            _LOGGER.warning("%s - forced fan '%s' is no longer offered; cancelling override", self, force.fan_mode)
+            write_event_log(_LOGGER, self, f"force_fan override on '{force.fan_mode}' cancelled: speed no longer offered")
             return None
 
         return force.fan_mode, force.until
@@ -585,26 +631,54 @@ class MpcFanFeatureManager:
                 return False
         return True
 
+    def _native_auto_fan_mode(self) -> str | None:
+        """Return VTherm's built-in auto-fan mode when it is enabled on this VTherm."""
+        try:
+            entry_infos = self._vtherm.entry_infos
+        except Exception:  # pylint: disable=broad-except
+            return None
+        return native_auto_fan_mode(entry_infos)
+
     def _check_conflict(self) -> str | None:
-        """Return the domain of a competing fan controller on this VTherm, else None.
+        """Return the name of a competing fan controller on this VTherm, else None.
+
+        Two kinds of competitor exist: another plugin targeting this VTherm
+        (reported by its domain), and VTherm's own built-in auto-fan, which the
+        core runs on every cycle whenever its ``auto_fan_mode`` is not
+        ``auto_fan_none`` (reported as ``NATIVE_AUTO_FAN_CONFLICT``).
 
         Re-checked every cycle because the other plugin can be installed after
-        this one. When one is found this manager yields the actuator instead of
-        fighting for it: the competing plugin is the one the user just chose, and
-        a fan flapping between two opinions is worse than either opinion alone.
+        this one, and the VTherm option changed at any time. When one is found
+        this manager yields the actuator instead of fighting for it: a fan
+        flapping between two opinions is worse than either opinion alone, and
+        each controller would learn from a trajectory it did not produce.
         Learning and diagnostics keep running, so the yield is observable and
         reverses cleanly once the conflict is removed.
         """
         conflict = find_conflicting_plugin(self._hass, self._vtherm.unique_id)
+        native_mode = None
+        if conflict is None:
+            native_mode = self._native_auto_fan_mode()
+            if native_mode is not None:
+                conflict = NATIVE_AUTO_FAN_CONFLICT
 
         if conflict and not self._conflict_logged:
-            _LOGGER.error(
-                "%s - '%s' is also configured to drive the fan of this VTherm. "
-                "Standing down: no fan command will be sent while both are active. "
-                "Remove one of the two to restore MPC control",
-                self,
-                conflict,
-            )
+            if native_mode is not None:
+                _LOGGER.error(
+                    "%s - Versatile Thermostat's own auto-fan is enabled on this VTherm (auto_fan_mode=%s) "
+                    "and sends its own fan commands every cycle. Standing down: no fan command will be sent. "
+                    "Set the VTherm's 'Auto fan mode' to None to restore MPC control",
+                    self,
+                    native_mode,
+                )
+            else:
+                _LOGGER.error(
+                    "%s - '%s' is also configured to drive the fan of this VTherm. "
+                    "Standing down: no fan command will be sent while both are active. "
+                    "Remove one of the two to restore MPC control",
+                    self,
+                    conflict,
+                )
             self._conflict_logged = True
         elif not conflict and self._conflict_logged:
             _LOGGER.info("%s - fan conflict resolved; resuming MPC control", self)
@@ -613,39 +687,61 @@ class MpcFanFeatureManager:
         self._conflict = conflict
         return conflict
 
-    def _is_duplicate_slope(self, fan_mode: str, hvac_mode: str, slope: float) -> bool:
+    def _is_duplicate_slope(self, fan_mode: str, hvac_mode: str, slope: float, now: float) -> bool:
         """True when this reading merely repeats the last one taken for that mode.
 
         VTherm recomputes its slope only when the room sensor publishes a new
         value, so several control cycles in a row can read the exact same
-        number. Feeding it to the model each time records one measurement as
-        many: MIN_MODE_PROFILE_SAMPLES counts rows, so duplicates let a
-        rarely-used speed clear the reliability gate on a handful of genuine
-        observations and then be trusted as if it had ten. Measured on a 15-day
-        production trace, 89% of consecutive 2-minute readings were repeats.
+        number. Measured on a 15-day production trace, 89% of consecutive
+        2-minute readings were repeats. Within SAMPLE_INTERVAL_MINUTES of the
+        last accepted sample such a repeat is dropped. Past it, the same reading
+        is a new sample: the regime held for another interval, and a speed that
+        holds the room still -- the sensor publishing nothing -- is precisely
+        the one whose measurement was missing (see SAMPLE_INTERVAL_MINUTES).
         """
         key = (hvac_mode, fan_mode)
-        last = self._last_sampled_slope.get(key)
-        if last is not None and abs(slope - last) < SLOPE_SAMPLE_MIN_DELTA:
+        last = self._last_sample.get(key)
+        if last is not None and abs(slope - last[0]) < SLOPE_SAMPLE_MIN_DELTA and (now - last[1]) / 60.0 < SAMPLE_INTERVAL_MINUTES:
             return True
-        self._last_sampled_slope[key] = slope
         return False
+
+    def _sample_dwell_minutes(self, fan_mode: str, hvac_mode: str, now: float, gate_minutes: float) -> float:
+        """Return the minutes of established regime a sample taken now stands for.
+
+        The time since the previous sample of that profile, counted from when
+        the established gate opened at the earliest, and capped at one sampling
+        period (an idle or disturbed gap inside a regime is not regime).
+        """
+        if self._last_change_time:
+            established_since = self._last_change_time + gate_minutes * 60.0
+        else:
+            established_since = self._first_cycle_time or now
+        last = self._last_sample.get((hvac_mode, fan_mode))
+        start = max(last[1], established_since) if last is not None else established_since
+        period = max(SAMPLE_INTERVAL_MINUTES, float(self._vtherm.cycle_min or 0))
+        return max(0.0, min(period, (now - start) / 60.0))
 
     # ------------------------------------------------------------------
     # Control cycle
     # ------------------------------------------------------------------
-    def _read_inputs(self) -> tuple[float, float, float, str, str | None] | None:
-        """Return (slope, current_temp, target_temp, hvac_mode, current_fan).
+    def _read_inputs(self) -> CycleInputs | None:
+        """Return this cycle's runtime readings, or None when they are unusable.
 
         Returns None when the runtime cannot supply usable numbers -- VTherm can
         briefly expose None during restarts, and a skipped cycle is preferable to
         feeding the model a guess.
+
+        Two setpoints are read. ``target_temperature`` is the user's; VTherm's
+        auto-regulation then shifts it into ``regulated_target_temperature``,
+        the value actually sent to the underlying. ``target_temp`` keeps its
+        historical meaning (the regulated one, falling back to the user's), and
+        the user's is carried alongside, ``None`` when the runtime has none.
         """
         vtherm = self._vtherm
         current_temp = vtherm.current_temperature
-        target_temp = vtherm.regulated_target_temperature
-        if target_temp is None:
-            target_temp = vtherm.target_temperature
+        regulated = vtherm.regulated_target_temperature
+        user_target = vtherm.target_temperature
+        target_temp = regulated if regulated is not None else user_target
         slope = vtherm.last_temperature_slope
         hvac_mode = vtherm.vtherm_hvac_mode
 
@@ -662,12 +758,21 @@ class MpcFanFeatureManager:
             slope_value = float(slope if slope is not None else 0.0)
             current_value = float(current_temp)
             target_value = float(target_temp)
+            user_value = float(user_target) if user_target is not None else None
+            regulated_value = float(regulated) if regulated is not None else None
         except (TypeError, ValueError):
             _LOGGER.debug("Skipping cycle for %s: non-numeric runtime data", self._name)
             return None
 
-        current_fan = self._current_fan_mode()
-        return slope_value, current_value, target_value, str(hvac_mode), current_fan
+        return CycleInputs(
+            vtherm_slope=slope_value,
+            current_temp=current_value,
+            target_temp=target_value,
+            user_target_temp=user_value,
+            regulation_offset=(regulated_value - user_value) if regulated_value is not None and user_value is not None else None,
+            hvac_mode=str(hvac_mode),
+            current_fan=self._current_fan_mode(),
+        )
 
     def _current_fan_mode(self) -> str | None:
         """Return the fan mode currently set on the underlying climate."""
@@ -688,7 +793,11 @@ class MpcFanFeatureManager:
         inputs = self._read_inputs()
         if inputs is None:
             return False
-        vtherm_slope, current_temp, target_temp, hvac_mode, current_fan = inputs
+        vtherm_slope = inputs.vtherm_slope
+        current_temp = inputs.current_temp
+        target_temp = inputs.target_temp
+        hvac_mode = inputs.hvac_mode
+        current_fan = inputs.current_fan
 
         is_window_open = self._is_window_open()
         is_defrost_active = self._is_defrost_active()
@@ -700,10 +809,10 @@ class MpcFanFeatureManager:
         if self._is_external_fan_change(current_fan):
             _LOGGER.info(
                 "%s - fan mode changed to '%s' outside this plugin; restarting the dead time",
-                self._name,
+                self,
                 current_fan,
             )
-            self._register_fan_change(now)
+            self._register_fan_change(now, current_temp, self._change_direction(self._last_observed_fan, current_fan))
         self._last_observed_fan = current_fan
         minutes_since_change = (now - self._last_change_time) / 60.0 if self._last_change_time else 1e6
 
@@ -717,23 +826,17 @@ class MpcFanFeatureManager:
                 self._last_hvac_mode,
                 hvac_mode,
             )
-            self._previous_slope = None
             # A pending response belongs to the mode its fan change was made in.
             self._response_armed = False
         self._last_hvac_mode = hvac_mode
 
-        if self._previous_slope is None:
-            self._previous_slope = vtherm_slope
-        slope_change = abs(vtherm_slope - self._previous_slope) > THRESHOLD_SLOPE
-
-        # Signed comfort error (positive = needs more heating/cooling).
+        # Signed error against the regulated setpoint (positive = needs more
+        # heating/cooling): the historical CSV column. Comfort -- and learning --
+        # use the error against the user's setpoint, the one the MPC regulates on.
         current_error = (current_temp - target_temp) if hvac_mode == "cool" else (target_temp - current_temp)
-        # Only a regulated mode has an error direction. Read in dry or fan_only
-        # with the heating convention, a warm summer room (27 C for a 24 C
-        # setpoint) looked like a large setpoint drop on every cycle and blocked
-        # learning for 30 min after switching to cool.
-        if hvac_mode in PROFILE_HVAC_MODES and current_error < THRESHOLD_TARGET_DROP:
-            self._last_setpoint_drop_time = now
+        learning_error = comfort_error(current_temp, inputs.user_target_temp, hvac_mode)
+        if learning_error is None:
+            learning_error = current_error
 
         decision = self._mpc.evaluate(
             current_temp=current_temp,
@@ -745,7 +848,13 @@ class MpcFanFeatureManager:
             is_defrost_active=is_defrost_active,
             is_hvac_idle=is_hvac_idle,
             minutes_since_change=minutes_since_change,
+            user_target_temp=inputs.user_target_temp,
         )
+        # The learning cooldown follows a genuine setpoint drop only -- the
+        # MPC's own status, which tracks the user's setpoint from cycle to cycle.
+        # A room merely past the setpoint (status Overshoot) is still learnable.
+        if decision.get("mpc_status") == "Setpoint drop":
+            self._last_setpoint_drop_time = now
 
         active_force = self._resolve_active_force(now)
         fixed_fan = self._resolve_fixed_fan(hvac_mode)
@@ -794,8 +903,9 @@ class MpcFanFeatureManager:
         # dead time and same classifier as the MPC: gating this on is_ready()
         # left the learner on the 10-minute default while the controller was
         # working with a measured 24-30 minutes, so samples were taken inside the
-        # real transient and labelled ESTABLISHED.
-        learned_dead_time = self._learning.get_dead_time(hvac_mode)
+        # real transient and labelled ESTABLISHED. Both use the learned dead time
+        # capped at DEAD_TIME_MAX_FOR_GATE (MPCController.gate_dead_time).
+        learned_dead_time = MPCController.gate_dead_time(self._learning.get_dead_time(hvac_mode))
         phase = MPCController.detect_phase(minutes_since_change, learned_dead_time)
 
         if self._should_collect_slope_sample(
@@ -808,26 +918,20 @@ class MpcFanFeatureManager:
             learned_dead_time=learned_dead_time,
             now=now,
         ) and not self._is_duplicate_slope(
-            current_fan, hvac_mode, vtherm_slope
-        ):  # type: ignore[arg-type]
-            self._learning.add_slope_sample(current_fan, vtherm_slope, current_error, hvac_mode, is_window_open)  # type: ignore[arg-type]
+            current_fan, hvac_mode, vtherm_slope, now  # type: ignore[arg-type]
+        ):
+            self._learning.add_slope_sample(
+                current_fan,  # type: ignore[arg-type]
+                vtherm_slope,
+                learning_error,
+                hvac_mode,
+                is_window_open,
+                regulation_offset=inputs.regulation_offset,
+                dwell_minutes=self._sample_dwell_minutes(current_fan, hvac_mode, now, learned_dead_time * MIN_ESTABLISHED_RATIO),  # type: ignore[arg-type]
+            )
+            self._last_sample[(hvac_mode, current_fan)] = (vtherm_slope, now)  # type: ignore[index]
 
-        if hvac_mode not in PROFILE_HVAC_MODES:
-            # Dead time is the heating/cooling lag. In dry or fan_only the slope
-            # moves for other reasons, and the pinned-speed commands would
-            # otherwise feed it events of their own.
-            self._response_armed = False
-        elif slope_change and self._response_armed:
-            response_time = minutes_since_change
-            if response_time > 60.0:
-                # Too late to be a response to the change: stop waiting for one.
-                self._response_armed = False
-            elif response_time >= 2.0 and not is_window_open and not is_defrost_active and not is_hvac_idle:
-                self._learning.add_response_event(response_time, hvac_mode)
-                self._response_armed = False
-
-        if slope_change:
-            self._previous_slope = vtherm_slope
+        self._detect_response(hvac_mode, current_temp, minutes_since_change, is_window_open or is_defrost_active or is_hvac_idle)
 
         self._last_decision = {
             **decision,
@@ -851,6 +955,7 @@ class MpcFanFeatureManager:
             current_error=current_error,
             minutes_since_change=minutes_since_change,
             forced=active_force is not None,
+            inputs=inputs,
         )
 
         self._push_to_entities()
@@ -862,15 +967,10 @@ class MpcFanFeatureManager:
             return False
 
         if effective_fan is not None and effective_fan != current_fan:
-            _LOGGER.info(
-                "%s - setting underlying fan mode to '%s' (%s)",
-                self._name,
-                effective_fan,
-                effective_reason,
-            )
+            write_event_log(_LOGGER, self, f"fan mode {current_fan} -> {effective_fan} ({effective_reason})")
             await self._vtherm.async_set_underlying_fan_mode(effective_fan)
             self._last_sent_fan_mode = effective_fan
-            self._register_fan_change(time.time())
+            self._register_fan_change(time.time(), current_temp, self._change_direction(current_fan, effective_fan))
             await self.async_save()
             return True
 
@@ -891,7 +991,7 @@ class MpcFanFeatureManager:
         if available and fixed_speed not in available:
             _LOGGER.debug(
                 "%s - fixed fan '%s' is not offered by the underlying; ignoring pin",
-                self._name,
+                self,
                 fixed_speed,
             )
             return None
@@ -921,13 +1021,51 @@ class MpcFanFeatureManager:
             return False
         return current_fan not in (self._last_observed_fan, self._last_sent_fan_mode)
 
-    def _register_fan_change(self, now: float) -> None:
+    def _change_direction(self, previous_fan: str | None, new_fan: str | None) -> int:
+        """Return +1 for a change to a stronger speed, -1 to a weaker one, 0 if unknown."""
+        ladder = self.fan_modes or []
+        if previous_fan not in ladder or new_fan not in ladder:
+            return 0
+        delta = ladder.index(new_fan) - ladder.index(previous_fan)
+        return (delta > 0) - (delta < 0)
+
+    def _register_fan_change(self, now: float, current_temp: float | None = None, direction: int = 0) -> None:
         """Restart everything that is measured from the last fan change."""
         self._last_change_time = now
-        self._previous_slope = None
-        self._response_armed = True
+        self._response_armed = direction != 0 and current_temp is not None
+        self._response_start_temp = current_temp
+        self._response_direction = direction
         if self._mpc is not None:
             self._mpc.notify_fan_change()
+
+    def _detect_response(self, hvac_mode: str, current_temp: float, minutes_since_change: float, disturbed: bool) -> None:
+        """Record the dead time of the last fan change, measured on the temperature.
+
+        The response is the first change of at least one sensor step, since the
+        change, in the direction the change should move the room: cooler after
+        a climb in cool, warmer after a climb in heat, the reverse after a step
+        down. Detecting it on VTherm's slope EMA instead fired on the very next
+        sensor reading, whatever its direction, so the "dead time" was the wait
+        for that reading (17.5-28.5 min on a 0.2 degC sensor). Only heat/cool
+        record events (in dry or fan_only the room moves for other reasons), only
+        between 2 and 60 minutes, and never while disturbed.
+        """
+        if hvac_mode not in PROFILE_HVAC_MODES:
+            self._response_armed = False
+            return
+        if not self._response_armed or self._response_start_temp is None or self._mpc is None:
+            return
+        if minutes_since_change > 60.0:
+            # Too late to be a response to the change: stop waiting for one.
+            self._response_armed = False
+            return
+        cooling_sign = -1.0 if hvac_mode == "cool" else 1.0
+        moved = (current_temp - self._response_start_temp) * cooling_sign * self._response_direction
+        if moved < self._mpc.sensor_resolution - 1e-6:
+            return
+        if minutes_since_change >= 2.0 and not disturbed:
+            self._learning.add_response_event(minutes_since_change, hvac_mode)
+        self._response_armed = False
 
     async def _async_record(self, **kwargs) -> None:
         """Append one row to the data-collection CSV, when enabled."""
@@ -936,6 +1074,7 @@ class MpcFanFeatureManager:
         decision = kwargs["decision"]
         hvac_mode = kwargs["hvac_mode"]
         vtherm_slope = kwargs["vtherm_slope"]
+        inputs: CycleInputs = kwargs["inputs"]
         collector_decision = build_data_collection_decision(
             effective_fan=kwargs["effective_fan"],
             effective_reason=kwargs["effective_reason"],
@@ -963,6 +1102,9 @@ class MpcFanFeatureManager:
             defrost_active=kwargs["is_defrost_active"],
             is_hvac_idle=kwargs["is_hvac_idle"],
             outdoor_temp=self._vtherm.current_outdoor_temperature,
+            user_target_temp=inputs.user_target_temp,
+            regulation_offset=inputs.regulation_offset,
+            comfort_error=comfort_error(inputs.current_temp, inputs.user_target_temp, hvac_mode),
         )
 
     def _push_to_entities(self) -> None:

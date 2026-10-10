@@ -82,3 +82,35 @@ async def test_factory_creates_a_manager_bound_to_the_thermostat(integration) ->
     assert isinstance(manager, MpcFanFeatureManager)
     assert manager.vtherm is thermostat
     assert manager.hass is integration
+
+
+async def test_factory_reads_a_read_only_config_mapping(integration) -> None:
+    """entry_infos may be a MappingProxyType (the Protocol's ConfigData), not only a dict."""
+    from types import MappingProxyType  # pylint: disable=import-outside-toplevel
+
+    _opt_in(integration)
+    thermostat = _thermostat(integration)
+    thermostat.entry_infos = MappingProxyType({CONF_THERMOSTAT_TYPE: CONF_THERMOSTAT_CLIMATE})
+    thermostat.underlying_fan_modes = None  # what a runtime reports at construction
+
+    assert MpcFanManagerFactory(integration).supports(thermostat) is True
+
+
+async def test_factory_and_manager_satisfy_the_vtherm_api_protocols(integration) -> None:
+    """Structural typing checked at runtime against the installed vtherm_api.
+
+    The contracts are @runtime_checkable Protocols; the plugin inherits from
+    none of them, so a member renamed or added on either side would otherwise
+    only surface inside VTherm. CI runs this against the declared floor
+    (0.4.0) and the latest release.
+    """
+    from vtherm_api.interfaces import (  # pylint: disable=import-outside-toplevel
+        InterfaceFeatureManager,
+        InterfaceFeatureManagerFactory,
+    )
+
+    factory = MpcFanManagerFactory(integration)
+    manager = MpcFanFeatureManager(_thermostat(integration), integration)
+
+    assert isinstance(factory, InterfaceFeatureManagerFactory)
+    assert isinstance(manager, InterfaceFeatureManager)

@@ -18,6 +18,13 @@ CONF_DEFROST_ENTITY = "defrost_entity"
 CONF_FAN_MODE_ORDER = "fan_mode_order"  # explicit weakest-to-strongest order, overrides the climate entity's
 CONF_FIXED_FAN_HVAC_MODES = "fixed_fan_hvac_modes"  # HVAC modes (other than heat/cool) in which the fan is pinned to a fixed speed
 CONF_FIXED_FAN_SPEED = "fixed_fan_speed"  # the speed pinned in CONF_FIXED_FAN_HVAC_MODES
+# Exploration strategies (see mpc_controller.py). The opportunistic downward
+# probe is on by default; the information bonus and the measurement under load
+# are opt-in.
+CONF_EXPLORATION_PROBE = "exploration_probe"
+CONF_EXPLORATION_UCB = "exploration_ucb"
+CONF_EXPLORATION_UNDER_LOAD = "exploration_under_load"
+CONF_THOMPSON_SAMPLING = "thompson_sampling"
 
 # Feature-manager identity registered with the VTherm API.
 FEATURE_MANAGER_MPC_FAN = "mpc_fan"
@@ -44,10 +51,24 @@ CONFLICTING_FAN_PLUGINS = {
     "vtherm_auto_fan_extended": "target_vtherm_unique_id",
 }
 
+# Versatile Thermostat's own built-in auto-fan. It is configured per VTherm in
+# the VTherm's config entry, and any value but "auto_fan_none" makes the core
+# send a fan command on every cycle (``_send_auto_fan_mode``) with no check that
+# a plugin owns the fan -- the ownership check only guards the deprecated
+# service. It is therefore a competing controller like the plugins above, and
+# is reported under this name in ``conflicting_plugin``.
+VTHERM_CONF_AUTO_FAN_MODE = "auto_fan_mode"
+VTHERM_AUTO_FAN_NONE = "auto_fan_none"
+NATIVE_AUTO_FAN_CONFLICT = "versatile_thermostat/auto_fan_mode"
+
 # Default values
 DEFAULT_DEADBAND = 0.2
 DEFAULT_MIN_INTERVAL = 10
 DEFAULT_DATA_COLLECTION = True
+DEFAULT_EXPLORATION_PROBE = True
+DEFAULT_EXPLORATION_UCB = False
+DEFAULT_EXPLORATION_UNDER_LOAD = False
+DEFAULT_THOMPSON_SAMPLING = False
 
 # Fallback control-cycle length, used only until the runtime reports its own
 # ``cycle_min``. It sets the MPC simulation step, so it should match the real
@@ -68,10 +89,17 @@ STORAGE_KEY = "vtherm_mpc_fan.learning_data"
 LEARNING_DATA_SAVE_INTERVAL = timedelta(minutes=5)
 
 # Controller thresholds
-THRESHOLD_SLOPE = 0.1  # °C/h – minimum slope delta to trigger re-evaluation
 THRESHOLD_TARGET_DROP = -1.0  # °C  – setpoint drop that triggers immediate speed cut
 DEFAULT_DEAD_TIME = 10.0  # minutes – fallback dead time before learning is ready
 DEAD_TIME_SAFETY_FACTOR = 1.5  # multiplier applied to learned dead time for effective timeout
+# The learned dead time is what a fan change takes to show on the sensor: with a
+# 0.2 degC sensor, mostly the wait for its next step (17.5-28.5 min measured),
+# not the air's transport delay (a few minutes on a wall split). It still sets
+# the prediction horizon and the adaptive change interval, but the learning gate,
+# the phase split and the learning hold use it capped at this many minutes, so a
+# long sensor wait cannot hold an unmeasured speed for ~50 minutes before the
+# first sample is even allowed.
+DEAD_TIME_MAX_FOR_GATE = 15.0
 
 # Phase detection
 PHASE_DEAD_TIME = "DEAD_TIME"
@@ -84,7 +112,24 @@ PHASE_ESTABLISHED = "ESTABLISHED"
 # 20-30 accepted samples per day, so a 7-day window tops out near 180 samples.
 # The previous 240 was unreachable on real hardware and is_ready() never flipped.
 MIN_SAMPLES_LEARNING = 120  # Minimum slope samples required for initial readiness
-MIN_MODE_PROFILE_SAMPLES = 10  # Minimum *measured* samples per fan mode to trust its profile
+MIN_MODE_PROFILE_SAMPLES = 10  # Synthetic samples written by a seed; min samples for the spread statistic
+
+# Time-based sampling. VTherm's slope only moves when the room sensor publishes,
+# and a coarse sensor (0.2 degC steps, one distinct reading every ~18 min in
+# median on the production trace) publishes least precisely when a speed *holds*
+# the room. Requiring a distinct reading per sample therefore starved exactly the
+# speeds that work: after the established gate only superhigh ever reached ten
+# distinct readings (20 holds out of 64; low 0/85, high 0/35, med 1/33, silent
+# 1/78). One sample is now taken per SAMPLE_INTERVAL_MINUTES of established
+# regime even when the slope has not moved; within that interval an unchanged
+# reading is still a duplicate. Samples so taken are strongly autocorrelated,
+# which the fits account for (effective sample size, see thermal_learning).
+SAMPLE_INTERVAL_MINUTES = 10.0
+# A profile is *measured* once its samples cover this much established regime
+# (each sample carries the minutes it stands for) and number at least
+# MIN_MEASURED_PROFILE_SAMPLES -- rather than ten distinct readings.
+MEASURED_PROFILE_MINUTES = 90.0
+MIN_MEASURED_PROFILE_SAMPLES = 6
 # Newest samples always kept per (fan_mode, hvac_mode) profile, however old they
 # are. The reliability gate above counts measured samples, and a rarely-used
 # speed collects a handful per week: expiring them by date alone (the 7-day

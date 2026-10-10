@@ -11,7 +11,6 @@ to the same underlying call the service makes.
 
 from __future__ import annotations
 
-import logging
 from typing import Any, Awaitable, Callable
 
 from homeassistant.components.number import NumberEntity, NumberMode
@@ -22,12 +21,14 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import slugify
 
+from .log import get_logger
 from .const import (
     CONF_TARGET_VTHERM,
     DEVICE_NAME,
     DOMAIN,
     EFFECTIVE_SLOPE_UNIT,
-    MIN_MODE_PROFILE_SAMPLES,
+    MEASURED_PROFILE_MINUTES,
+    MIN_MEASURED_PROFILE_SAMPLES,
     PROFILE_HVAC_MODES,
     REFERENCE_SLOPE_ERROR,
     build_scoped_entity_id,
@@ -37,7 +38,7 @@ from .registry import add_entities_registry, entity_bucket, get_manager
 
 PLATFORM_NUMBER = "number"
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_logger(__name__)
 
 # Matches the bounds the set_effective_slope service already exposes, so a
 # value set through either path means the same thing.
@@ -188,7 +189,7 @@ class EffectiveSlopeNumber(NumberEntity):
         this is stays visible via the ``value_source`` attribute below.
         """
         learning = self._controller.learning
-        if self._sample_count() >= MIN_MODE_PROFILE_SAMPLES:
+        if learning.is_profile_ready(self._fan_mode, self._hvac_mode):
             value = learning.get_mode_effective_slope(self._fan_mode, self._hvac_mode)
         else:
             live = self._controller.get_live_mode_slope(self._fan_mode, self._hvac_mode)
@@ -202,8 +203,8 @@ class EffectiveSlopeNumber(NumberEntity):
         `value` (the same call the ``set_effective_slope`` service makes), so
         the profile becomes immediately "ready" -- real samples collected from
         here on blend in and gradually refine it, they don't reset it. The MPC
-        still treats the profile as *unmeasured* until MIN_MODE_PROFILE_SAMPLES
-        real samples exist (see ``value_source``): a seeded value is what the
+        still treats the profile as *unmeasured* until real samples cover
+        MEASURED_PROFILE_MINUTES of regime (see ``value_source``): a seeded value is what the
         user believes, and the exploration guards exist to check it.
         """
         self._controller.learning.set_mode_effective_slope(self._fan_mode, self._hvac_mode, value)
@@ -221,10 +222,11 @@ class EffectiveSlopeNumber(NumberEntity):
         learning = self._controller.learning
         samples = self._sample_count()
         real_samples = learning.get_mode_real_sample_count(self._fan_mode, self._hvac_mode)
-        ready = samples >= MIN_MODE_PROFILE_SAMPLES
+        ready = learning.is_profile_ready(self._fan_mode, self._hvac_mode)
+        measured = learning.has_measured_profile(self._fan_mode, self._hvac_mode)
         if not ready:
             value_source = "live_fallback_estimate"
-        elif real_samples >= MIN_MODE_PROFILE_SAMPLES:
+        elif measured:
             value_source = "learned"
         elif real_samples > 0:
             value_source = "seeded_blended"
@@ -240,7 +242,7 @@ class EffectiveSlopeNumber(NumberEntity):
         else:
             quality = "poor"
         # Gap-dependent slope model: effective_slope(error) = intercept + gain·error.
-        # The displayed value is this model evaluated at REFERENCE_SLOPE_ERROR.
+        # The displayed value is this model evaluated at ``reference_error``.
         model = learning.get_mode_slope_model(self._fan_mode, self._hvac_mode)
         if model is None:
             slope_intercept = None
@@ -248,6 +250,7 @@ class EffectiveSlopeNumber(NumberEntity):
         else:
             slope_intercept = round(model[0], 3)
             slope_gain = round(model[1], 3)
+        fit = learning.get_mode_fit(self._fan_mode, self._hvac_mode)
         r_squared = learning.get_mode_slope_r2(self._fan_mode, self._hvac_mode)
         time_constant = learning.get_mode_time_constant(self._fan_mode, self._hvac_mode)
         return {
@@ -258,7 +261,11 @@ class EffectiveSlopeNumber(NumberEntity):
             # MPC's exploration guards read. ``samples`` also includes synthetic
             # ones written by set_effective_slope.
             "real_samples": real_samples,
-            "min_samples_required": MIN_MODE_PROFILE_SAMPLES,
+            # A profile is measured once its samples cover this much established
+            # regime (one sample per SAMPLE_INTERVAL_MINUTES at most).
+            "measured_minutes": round(learning.get_mode_measured_minutes(self._fan_mode, self._hvac_mode), 1),
+            "measured_minutes_required": MEASURED_PROFILE_MINUTES,
+            "min_samples_required": MIN_MEASURED_PROFILE_SAMPLES,
             "ready": ready,
             # Tells apart a real measurement ("learned"), a user-seeded value
             # ("seeded"), a seeded value already pulled by a few measurements
@@ -269,7 +276,12 @@ class EffectiveSlopeNumber(NumberEntity):
             "quality": quality,
             "slope_intercept": slope_intercept,
             "slope_gain": slope_gain,
-            "reference_error": REFERENCE_SLOPE_ERROR,
+            # The value is the model at this error: REFERENCE_SLOPE_ERROR, or the
+            # largest error the profile was measured at when smaller (partial).
+            "reference_error": round(fit.reference_error, 2) if fit is not None else REFERENCE_SLOPE_ERROR,
+            "partial": fit.partial if fit is not None else None,
+            "slope_sigma": round(fit.slope_sigma, 3) if fit is not None and fit.slope_sigma is not None else None,
+            "effective_samples": round(fit.effective_samples, 1) if fit is not None and fit.effective_samples is not None else None,
             "model_r_squared": round(r_squared, 3) if r_squared is not None else None,
             "thermal_time_constant_h": round(time_constant, 2) if time_constant is not None else None,
         }
