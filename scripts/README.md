@@ -54,6 +54,7 @@ python scripts/replay_bench.py data.csv \
 | `--variant NAME[:KEY=VAL,...]` | `baseline`    | Variant to replay (repeatable)                               |
 | `--deadband FLOAT`             | `0.2`         | Deadband in degrees                                          |
 | `--min-interval INT`           | `10`          | Minimum interval between fan changes (min)                   |
+| `--cycle-minutes INT`          | `5`           | VTherm `cycle_min` the trace was recorded at                 |
 | `--fan-order a,b,c`            | auto-detected | Fan modes ordered weakest to strongest                       |
 | `--seed-snapshots-dir DIR`     | CSV directory | Seed missing profiles from `*_effective_slope.csv` snapshots |
 | `--start ISO_TIMESTAMP`        | —             | Inclusive start of the replay window                         |
@@ -69,8 +70,7 @@ python scripts/replay_bench.py data.csv \
 | `FLOOR_VIOLATION_LINEAR_WEIGHT`    | `12.0`  | Linear penalty for floor violation                |
 | `FLOOR_VIOLATION_QUADRATIC_WEIGHT` | `30.0`  | Quadratic penalty for floor violation             |
 | `MODE_CHANGE_DISTANCE_COST`        | `0.15`  | Distance cost when switching fan mode             |
-| `MODE_RANK_COST`                   | `0.05`  | Rank cost (nudges towards lower fan modes)        |
-| `MIN_INTERVAL_CHANGE_PENALTY`      | `25.0`  | Penalty for switching before the minimum interval |
+| `MODE_RANK_COST`                   | `1.0`   | Rank cost (energy, × `MODE_POWER_RATIO`^rank)     |
 | `URGENCY_SENSITIVITY`              | `2.0`   | Urgency scaling when error exceeds deadband       |
 
 ### Report output
@@ -79,7 +79,11 @@ python scripts/replay_bench.py data.csv \
 - **Fan changes/hour**: stability comparison across variants
 - **Agreement with live (%)**: match with decisions recorded in the CSV
 - **Avg MPC cost**: mean weighted cost (relative comparison between variants)
-- **Prediction MAE T+10**: absolute prediction error for temperature at T+10 min
+- **Prediction MAE T+10 / T+30**: absolute prediction error for temperature at T+10 / T+30 min,
+  each followed by the **persistence** baseline on the same rows (forecast = current
+  temperature). A room sensor moving in 0.2 °C steps makes persistence hard to beat, so
+  a model MAE is only meaningful next to it. Lookaheads are resolved on timestamps (a
+  row within 5 min after the horizon), so gaps in the trace are skipped
 - **Fan distribution**: percentage of time spent in each fan mode
 
 If snapshot CSV files are present, the replay bench uses them in two ways:

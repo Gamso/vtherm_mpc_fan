@@ -9,15 +9,27 @@
                     "deadband": "Deadband (°C)",
                     "min_interval": "Min Interval (minutes)",
                     "data_collection": "Enable Data Collection (beta)",
-                    "defrost_entity": "Defrost Entity (optional)"
+                    "defrost_entity": "Defrost Entity (optional)",
+                    "exploration_probe": "Exploration probe (try an unmeasured weaker speed)",
+                    "exploration_ucb": "Exploration bonus (advanced)",
+                    "exploration_under_load": "Measure intermediate speeds under load (advanced)",
+                    "thompson_sampling": "Thompson sampling (advanced)"
                 },
                 "data_description": {
                     "target_vtherm": "The VTherm to attach to. Its control cycle drives this controller, and its underlying climate is the one whose fan speed gets set.",
                     "deadband": "Range: 0.0-5.0 °C. Default: 0.2 °C.",
                     "min_interval": "Range: 1-60 min. Default: 10 min. Acts as both the floor and (x3) the cap on the adaptive interval derived from the learned dead time.",
                     "data_collection": "Records one CSV row per control cycle in the Home Assistant config folder, alongside configuration.yaml: vtherm_mpc_fan_data_XXXXXXXX.csv (max 10 MB, auto-rotated). Useful for reproducing algorithm behaviour and identifying improvements during the beta phase.",
-                    "defrost_entity": "Optional: binary sensor, sensor or input_boolean that indicates when the heat pump is in defrost mode. VTherm does not report this, so it has to be supplied here. Compressor activity and outdoor temperature are read from VTherm directly and need no configuration."
+                    "defrost_entity": "Optional: binary sensor, sensor or input_boolean that indicates when the heat pump is in defrost mode. VTherm does not report this, so it has to be supplied here. Compressor activity and outdoor temperature are read from VTherm directly and need no configuration.",
+                    "exploration_probe": "While the room holds inside the deadband, now and then (at most every 6 h per speed) step one speed down to a speed that has never been measured, so it gets learned. Abandoned as soon as the room drifts past the deadband by one sensor step. Default: on.",
+                    "exploration_ucb": "Near the setpoint, favour poorly measured speeds in the cost when their predicted trajectories are close to the best one. Default: off.",
+                    "exploration_under_load": "When the controller climbs outside a recovery, stop first at the lowest unmeasured speed that is predicted to make progress. Lengthens the climb by about one dead time. Default: off.",
+                    "thompson_sampling": "Each cycle, draw every learned speed's slope from its uncertainty before deciding, so poorly known speeds get tried now and then. Default: off."
                 }
+            },
+            "native_auto_fan": {
+                "title": "Versatile Thermostat's own auto-fan is enabled",
+                "description": "This VTherm has its built-in auto-fan enabled (Auto fan mode: {auto_fan_mode}). Versatile Thermostat then sends its own fan command on every cycle, so this plugin will stand down and send nothing while it stays enabled. Open the VTherm's configuration and set Auto fan mode to None, then MPC control starts on the next cycle. Submit to create the entry anyway."
             }
         },
         "error": {
@@ -48,7 +60,11 @@
                     "fan_mode_order_4": "Fan speed — rank 5",
                     "fan_mode_order_5": "Fan speed — rank 6",
                     "fan_mode_order_6": "Fan speed — rank 7",
-                    "fan_mode_order_7": "Fan speed — rank 8 (strongest, if 8 speeds)"
+                    "fan_mode_order_7": "Fan speed — rank 8 (strongest, if 8 speeds)",
+                    "exploration_probe": "Exploration probe (try an unmeasured weaker speed)",
+                    "exploration_ucb": "Exploration bonus (advanced)",
+                    "exploration_under_load": "Measure intermediate speeds under load (advanced)",
+                    "thompson_sampling": "Thompson sampling (advanced)"
                 },
                 "data_description": {
                     "deadband": "Range: 0.0-5.0 °C. Default: 0.2 °C.",
@@ -56,7 +72,11 @@
                     "data_collection": "Records one CSV row per control cycle in the Home Assistant config folder, alongside configuration.yaml: vtherm_mpc_fan_data_XXXXXXXX.csv (max 10 MB, auto-rotated). Useful for reproducing algorithm behaviour and identifying improvements during the beta phase.",
                     "defrost_entity": "Optional: binary sensor, sensor or input_boolean that indicates when the heat pump is in defrost mode.",
                     "fixed_fan_hvac_modes": "In these modes the fan is set to the fixed speed below, e.g. dry and fan_only. heat and cool are always regulated by the MPC and are not listed. The speed is applied as soon as the mode is entered; after a manual speed change, or after a restart or reload, it is (re-)applied only once the minimum interval has elapsed. Nothing is sent while a window is open, the unit is off or defrosting.",
-                    "fixed_fan_speed": "The speed used in the fixed-speed modes above (e.g. superhigh). Required when at least one fixed-speed mode is selected."
+                    "fixed_fan_speed": "The speed used in the fixed-speed modes above (e.g. superhigh). Required when at least one fixed-speed mode is selected.",
+                    "exploration_probe": "While the room holds inside the deadband, now and then (at most every 6 h per speed) step one speed down to a speed that has never been measured, so it gets learned. Abandoned as soon as the room drifts past the deadband by one sensor step. Default: on.",
+                    "exploration_ucb": "Near the setpoint, favour poorly measured speeds in the cost when their predicted trajectories are close to the best one. Default: off.",
+                    "exploration_under_load": "When the controller climbs outside a recovery, stop first at the lowest unmeasured speed that is predicted to make progress. Lengthens the climb by about one dead time. Default: off.",
+                    "thompson_sampling": "Each cycle, draw every learned speed's slope from its uncertainty before deciding, so poorly known speeds get tried now and then. Default: off."
                 }
             }
         },

@@ -13,7 +13,6 @@ from pathlib import Path
 import yaml
 
 from custom_components.vtherm_mpc_fan import (
-    SERVICE_APPLY_LEARNED_SETTINGS,
     SERVICE_FORCE_FAN,
     SERVICE_RESET_LEARNING,
     SERVICE_SET_EFFECTIVE_SLOPE,
@@ -23,7 +22,6 @@ from custom_components.vtherm_mpc_fan import (
 SERVICES_YAML = Path(__file__).parent.parent / "custom_components" / "vtherm_mpc_fan" / "services.yaml"
 
 EXPECTED_FIELDS = {
-    SERVICE_APPLY_LEARNED_SETTINGS: {ATTR_TARGET_VTHERM},
     SERVICE_RESET_LEARNING: {ATTR_TARGET_VTHERM},
     SERVICE_SET_EFFECTIVE_SLOPE: {
         ATTR_TARGET_VTHERM,

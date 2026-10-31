@@ -274,23 +274,42 @@ async def test_prediction_grid_is_independent_of_the_control_cadence() -> None:
 
 @pytest.mark.asyncio
 async def test_repeated_slope_readings_are_not_learned_twice() -> None:
-    """A slope that has not moved is one measurement, not several.
+    """A slope that has not moved is one measurement -- within one sampling interval.
 
     VTherm recomputes its slope on sensor events, so consecutive cycles often
-    read the same number. Counting each as evidence would let a rarely-used
-    speed clear the reliability gate without the observations to back it.
+    read the same number. Past SAMPLE_INTERVAL_MINUTES the same reading is a
+    new sample: the regime held for another interval.
     """
     manager = await _build_manager()
+    t0 = 1_000_000.0
 
-    assert manager._is_duplicate_slope("low", "cool", -0.80) is False  # noqa: SLF001
-    assert manager._is_duplicate_slope("low", "cool", -0.80) is True  # noqa: SLF001
-    assert manager._is_duplicate_slope("low", "cool", -0.801) is True  # noqa: SLF001
+    assert manager._is_duplicate_slope("low", "cool", -0.80, t0) is False  # noqa: SLF001
+    manager._last_sample[("cool", "low")] = (-0.80, t0)  # noqa: SLF001
+    assert manager._is_duplicate_slope("low", "cool", -0.80, t0 + 60) is True  # noqa: SLF001
+    assert manager._is_duplicate_slope("low", "cool", -0.801, t0 + 300) is True  # noqa: SLF001
     # A real move is accepted...
-    assert manager._is_duplicate_slope("low", "cool", -0.95) is False  # noqa: SLF001
-    # ...and the ladder is tracked per fan mode, so switching speed re-arms it.
-    assert manager._is_duplicate_slope("high", "cool", -0.95) is False  # noqa: SLF001
-    # ...as does switching hvac mode with the same reading.
-    assert manager._is_duplicate_slope("high", "heat", -0.95) is False  # noqa: SLF001
+    assert manager._is_duplicate_slope("low", "cool", -0.95, t0 + 300) is False  # noqa: SLF001
+    # ...and the ladder is tracked per fan mode and per hvac mode.
+    assert manager._is_duplicate_slope("high", "cool", -0.80, t0 + 60) is False  # noqa: SLF001
+    assert manager._is_duplicate_slope("low", "heat", -0.80, t0 + 60) is False  # noqa: SLF001
+    # One sampling interval later the unchanged reading is a new sample.
+    assert manager._is_duplicate_slope("low", "cool", -0.80, t0 + 600) is False  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_a_held_regime_yields_one_sample_per_interval_with_its_dwell() -> None:
+    """An unchanged reading over 20 minutes of established regime gives samples at 0, 10, 20 min."""
+    runtime = _make_runtime(last_temperature_slope=-0.3)
+    manager = await _build_manager(runtime, hass=_hass_with_auto_fan("vtherm-uid"))
+    t0 = 2_000_000.0
+
+    for minute in range(0, 25, 5):
+        with patch("time.time", return_value=t0 + minute * 60):
+            await manager.refresh_state()
+
+    samples = manager.learning.slope_samples
+    assert len(samples) == 3
+    assert [s[6] for s in samples] == [0.0, 10.0, 10.0]
 
 
 @pytest.mark.asyncio
@@ -513,6 +532,50 @@ class TestFanConflict:
         runtime.async_set_underlying_fan_mode.assert_awaited()
 
 
+class TestNativeAutoFanConflict:
+    """VTherm's built-in auto-fan sends a fan command every cycle: it is a competing controller."""
+
+    @pytest.mark.asyncio
+    async def test_an_enabled_native_auto_fan_makes_the_manager_stand_down(self):
+        """With auto_fan_mode set, no command is sent and the conflict is exposed."""
+        runtime = _make_runtime(entry_infos={"thermostat_type": "thermostat_over_climate", "auto_fan_mode": "auto_fan_high"})
+        manager = await _build_manager(runtime)
+
+        changed = await manager.refresh_state()
+
+        assert changed is False
+        runtime.async_set_underlying_fan_mode.assert_not_awaited()
+        attributes: dict = {}
+        manager.add_custom_attributes(attributes)
+        assert attributes["mpc_fan"]["conflicting_plugin"] == "versatile_thermostat/auto_fan_mode"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["auto_fan_none", None])
+    async def test_a_disabled_native_auto_fan_is_not_a_conflict(self, mode):
+        """auto_fan_none (or no value) leaves the fan to this plugin."""
+        runtime = _make_runtime(entry_infos={"thermostat_type": "thermostat_over_climate", "auto_fan_mode": mode})
+        manager = await _build_manager(runtime)
+
+        await manager.refresh_state()
+
+        assert manager._conflict is None  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_control_resumes_once_the_native_auto_fan_is_disabled(self):
+        """Switching the VTherm option to None hands the fan back on the next cycle."""
+        infos = {"thermostat_type": "thermostat_over_climate", "auto_fan_mode": "auto_fan_turbo"}
+        runtime = _make_runtime(entry_infos=infos)
+        manager = await _build_manager(runtime)
+        await manager.refresh_state()
+        runtime.async_set_underlying_fan_mode.assert_not_awaited()
+
+        infos["auto_fan_mode"] = "auto_fan_none"
+        await manager.refresh_state()
+
+        assert manager._conflict is None  # noqa: SLF001
+        runtime.async_set_underlying_fan_mode.assert_awaited()
+
+
 @pytest.mark.asyncio
 async def test_manager_publishes_its_diagnostics_into_the_vtherm_state() -> None:
     """Diagnostics ride along in the VTherm's own attributes."""
@@ -557,29 +620,64 @@ async def test_an_external_fan_change_restarts_the_dead_time() -> None:
 
 
 @pytest.mark.asyncio
-async def test_only_the_first_slope_move_after_a_change_is_a_response_event() -> None:
-    """One fan change, one response event.
+async def test_the_dead_time_is_the_first_sensor_step_in_the_expected_direction() -> None:
+    """One fan change, one response event, measured on the temperature.
 
-    Every slope jump inside the 60-minute window used to be recorded as another
-    response to the same change, so the median dead time drifted toward the
-    middle of the window -- and everything gated on it (change interval,
-    learning gate, simulated delay) stretched with it.
+    A climb in cool must cool the room: a reading moving the wrong way is not
+    the response, the first step of one sensor resolution the right way is, and
+    nothing after it counts again. Detecting it on the slope EMA fired on the
+    next reading whatever its direction -- the "dead time" was the wait for it.
     """
     import time
 
-    runtime = _make_runtime(last_temperature_slope=-0.2)
+    runtime = _make_runtime(current_temperature=24.6)
     manager = await _build_manager(runtime, hass=_hass_with_auto_fan("vtherm-uid"))
     await manager.refresh_state()
-    manager._last_change_time = time.time() - 10 * 60  # noqa: SLF001
-    manager._response_armed = True  # noqa: SLF001
+    manager._register_fan_change(time.time() - 10 * 60, 24.6, +1)  # noqa: SLF001  (low -> stronger)
 
-    runtime.last_temperature_slope = -0.5
+    runtime.current_temperature = 24.8  # wrong way
+    await manager.refresh_state()
+    assert manager.learning.response_event_count() == 0
+
+    runtime.current_temperature = 24.4  # one 0.2 step cooler than at the change
+    await manager.refresh_state()
+    assert manager.learning.response_event_count() == 1
+    assert manager.learning.get_dead_time("cool") == pytest.approx(10.0, abs=0.5)
+
+    runtime.current_temperature = 24.0
     await manager.refresh_state()
     assert manager.learning.response_event_count() == 1
 
-    runtime.last_temperature_slope = -0.9
+
+@pytest.mark.asyncio
+async def test_a_step_down_expects_the_room_to_move_the_other_way() -> None:
+    """After a weaker speed in cool the response is the room warming."""
+    import time
+
+    runtime = _make_runtime(current_temperature=24.0)
+    manager = await _build_manager(runtime, hass=_hass_with_auto_fan("vtherm-uid"))
+    await manager.refresh_state()
+    manager._register_fan_change(time.time() - 12 * 60, 24.0, -1)  # noqa: SLF001
+
+    runtime.current_temperature = 23.8
+    await manager.refresh_state()
+    assert manager.learning.response_event_count() == 0
+    runtime.current_temperature = 24.2
     await manager.refresh_state()
     assert manager.learning.response_event_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_the_change_direction_follows_the_ladder() -> None:
+    """Stronger is +1, weaker -1, unknown speeds 0 (no event is armed)."""
+    manager = await _build_manager()
+    manager._sync_fan_modes()  # noqa: SLF001
+
+    assert manager._change_direction("low", "high") == 1  # noqa: SLF001
+    assert manager._change_direction("superhigh", "silent") == -1  # noqa: SLF001
+    assert manager._change_direction("low", "turbo") == 0  # noqa: SLF001
+    manager._register_fan_change(1.0, 24.0, 0)  # noqa: SLF001
+    assert manager._response_armed is False  # noqa: SLF001
 
 
 @pytest.mark.asyncio
@@ -748,8 +846,8 @@ async def test_fixed_fan_after_a_restart_waits_the_min_interval_from_the_first_c
 async def test_pinned_speed_commands_generate_no_response_events() -> None:
     """The pin's own commands must not teach the model a dead time.
 
-    Every command arms the response detector; in dry the slope still moves (a
-    dehumidifier changes the room), so each pinned command used to record a
+    Every command arms the response detector; in dry the room still moves (a
+    dehumidifier changes it), so each pinned command used to record a
     "dry" response event. Five of them made the adaptive interval trust a dead
     time learned outside heat/cool.
     """
@@ -764,10 +862,9 @@ async def test_pinned_speed_commands_generate_no_response_events() -> None:
     hass.states.get(runtime.entity_id).attributes["fan_mode"] = "superhigh"
     await manager.refresh_state()
 
-    for slope in (-0.6, -0.1, -0.7, 0.0, -0.8):
-        manager._last_change_time = time.time() - 10 * 60  # noqa: SLF001
-        manager._response_armed = True  # noqa: SLF001  (as after any command)
-        runtime.last_temperature_slope = slope
+    for temp in (23.4, 24.2, 23.0, 24.4, 22.8):
+        manager._register_fan_change(time.time() - 10 * 60, runtime.current_temperature, +1)  # noqa: SLF001  (as after any command)
+        runtime.current_temperature = temp
         await manager.refresh_state()
 
     assert manager.learning.response_event_count() == 0
@@ -775,18 +872,17 @@ async def test_pinned_speed_commands_generate_no_response_events() -> None:
 
 @pytest.mark.asyncio
 async def test_a_pending_response_does_not_cross_an_hvac_mode_change() -> None:
-    """A fan change made in dry is not the cause of a slope move seen in cool."""
+    """A fan change made in dry is not the cause of a temperature move seen in cool."""
     import time
 
-    runtime = _make_runtime(vtherm_hvac_mode="dry", last_temperature_slope=-0.2)
+    runtime = _make_runtime(vtherm_hvac_mode="dry", current_temperature=25.0)
     manager = await _build_manager(runtime, hass=_hass_with_auto_fan("vtherm-uid"))
     await manager.refresh_state()
-    manager._last_change_time = time.time() - 10 * 60  # noqa: SLF001
-    manager._response_armed = True  # noqa: SLF001
+    manager._register_fan_change(time.time() - 10 * 60, 25.0, +1)  # noqa: SLF001
 
     runtime.vtherm_hvac_mode = "cool"
     await manager.refresh_state()
-    runtime.last_temperature_slope = -0.9
+    runtime.current_temperature = 24.4
     await manager.refresh_state()
 
     assert manager.learning.response_event_count() == 0
@@ -870,13 +966,44 @@ async def test_unregulated_modes_never_start_the_setpoint_drop_cooldown(hvac_mod
 
 @pytest.mark.asyncio
 async def test_a_real_setpoint_drop_in_heat_still_starts_the_cooldown() -> None:
-    """The guard only narrows the trigger to regulated modes; heat keeps it."""
-    runtime = _make_runtime(vtherm_hvac_mode="heat", current_temperature=27.0, regulated_target_temperature=24.0)
+    """The user lowering the heating setpoint by 2 degC starts the learning cooldown."""
+    runtime = _make_runtime(vtherm_hvac_mode="heat", current_temperature=24.0, target_temperature=24.0, regulated_target_temperature=24.0)
+    manager = await _build_manager(runtime)
+    await manager.refresh_state()
+    assert manager._last_setpoint_drop_time == 0.0  # noqa: SLF001
+
+    runtime.target_temperature = 22.0
+    runtime.regulated_target_temperature = 22.0
+    await manager.refresh_state()
+
+    assert manager.last_decision["mpc_status"] == "Setpoint drop"
+    assert manager._last_setpoint_drop_time > 0.0  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_an_overshoot_without_a_setpoint_change_starts_no_cooldown() -> None:
+    """A room 1.5 degC past an unchanged setpoint is learnable: no 30-minute cooldown."""
+    runtime = _make_runtime(vtherm_hvac_mode="cool", current_temperature=22.5, target_temperature=24.0, regulated_target_temperature=23.2)
     manager = await _build_manager(runtime)
 
     await manager.refresh_state()
+    await manager.refresh_state()
 
-    assert manager._last_setpoint_drop_time > 0.0  # noqa: SLF001
+    assert manager.last_decision["mpc_status"] == "Overshoot"
+    assert manager._last_setpoint_drop_time == 0.0  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_learning_samples_carry_the_comfort_error_and_the_offset() -> None:
+    """Samples are taken against the user's setpoint and keep the regulation offset."""
+    runtime = _make_runtime(vtherm_hvac_mode="cool", current_temperature=24.3, target_temperature=24.0, regulated_target_temperature=23.4)
+    manager = await _build_manager(runtime, hass=_hass_with_auto_fan("vtherm-uid"))
+
+    await manager.refresh_state()
+
+    sample = manager.learning.slope_samples[-1]
+    assert sample[4] == pytest.approx(0.3)
+    assert sample[5] == pytest.approx(-0.6)
 
 
 @pytest.mark.asyncio
@@ -912,3 +1039,50 @@ async def test_is_detected_is_false_in_a_pinned_mode() -> None:
 
     assert manager.last_decision["mpc_status"] == "Fixed"
     assert manager.is_detected is False
+
+
+@pytest.mark.asyncio
+async def test_the_csv_row_carries_the_user_setpoint_and_the_regulation_offset() -> None:
+    """VTherm regulates the user's setpoint: both, their offset and the comfort error are logged."""
+    runtime = _make_runtime(current_temperature=24.0, target_temperature=24.0, regulated_target_temperature=23.4)
+    manager = await _build_manager(runtime)
+    manager._collector = MagicMock(async_record=AsyncMock())  # noqa: SLF001
+
+    await manager.refresh_state()
+
+    kwargs = manager._collector.async_record.await_args.kwargs  # noqa: SLF001
+    assert kwargs["target_temp"] == pytest.approx(23.4)
+    assert kwargs["user_target_temp"] == pytest.approx(24.0)
+    assert kwargs["regulation_offset"] == pytest.approx(-0.6)
+    assert kwargs["comfort_error"] == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_exploration_options_reach_the_controller() -> None:
+    """The probe is on by default; the other strategies only when opted in."""
+    default = await _build_manager()
+    assert default.mpc._exploration_probe is True  # noqa: SLF001
+    assert default.mpc._exploration_ucb is False  # noqa: SLF001
+    assert default.mpc._exploration_under_load is False  # noqa: SLF001
+    assert default.mpc._thompson_sampling is False  # noqa: SLF001
+
+    opted = await _build_manager(exploration_probe=False, exploration_ucb=True, exploration_under_load=True, thompson_sampling=True)
+    assert opted.mpc._exploration_probe is False  # noqa: SLF001
+    assert opted.mpc._exploration_ucb is True  # noqa: SLF001
+    assert opted.mpc._exploration_under_load is True  # noqa: SLF001
+    assert opted.mpc._thompson_sampling is True  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_every_fan_change_is_an_event_line_in_the_vtherm_log(caplog) -> None:
+    """A command is logged as a NEW EVENT line prefixed with the manager, like the core's events."""
+    import logging
+
+    runtime = _make_runtime()
+    manager = await _build_manager(runtime)
+
+    with caplog.at_level(logging.INFO, logger="custom_components.vtherm_mpc_fan"):
+        changed = await manager.refresh_state()
+
+    assert changed is True
+    assert "MpcFanManager-Living room - ---------------------> NEW EVENT: fan mode low -> " in caplog.text

@@ -9,7 +9,6 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from vtherm_api.vtherm_api import VThermAPI
 
 from custom_components.vtherm_mpc_fan import (
-    SERVICE_APPLY_LEARNED_SETTINGS,
     SERVICE_FORCE_FAN,
     SERVICE_RESET_LEARNING,
     SERVICE_SET_EFFECTIVE_SLOPE,
@@ -26,7 +25,7 @@ from custom_components.vtherm_mpc_fan.const import (
 from custom_components.vtherm_mpc_fan.registry import managers
 from custom_components.vtherm_mpc_fan.thermal_learning import ThermalLearning
 
-SERVICES = (SERVICE_APPLY_LEARNED_SETTINGS, SERVICE_RESET_LEARNING, SERVICE_SET_EFFECTIVE_SLOPE, SERVICE_FORCE_FAN)
+SERVICES = (SERVICE_RESET_LEARNING, SERVICE_SET_EFFECTIVE_SLOPE, SERVICE_FORCE_FAN)
 
 
 def _vtherm_entry(hass, entry_id: str, thermostat_type: str = CONF_THERMOSTAT_CLIMATE) -> MockConfigEntry:
@@ -266,14 +265,3 @@ async def test_reset_learning_clears_and_persists(integration, reload_spy) -> No
 
     assert manager.learning.slope_sample_count() == 0
     manager.async_save.assert_awaited_once()
-
-
-async def test_apply_learned_settings_only_logs_before_readiness(integration, reload_spy, caplog) -> None:
-    """Nothing is changed: the service reports progress until learning is ready."""
-    hass = integration
-    await _setup(hass)
-    managers(hass)["vtherm-a"] = _fake_manager("vtherm-a", "climate.a", "A")
-
-    await hass.services.async_call(DOMAIN, SERVICE_APPLY_LEARNED_SETTINGS, {}, blocking=True)
-
-    assert "Learning not complete yet" in caplog.text

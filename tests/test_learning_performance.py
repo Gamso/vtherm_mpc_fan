@@ -92,13 +92,13 @@ def test_every_sample_mutation_invalidates_the_fits() -> None:
     """No path that changes the samples may leave a stale fit behind."""
     learning = _full_store()
 
-    def _warm() -> tuple:
+    def _warm():
         """Fill the cache for one profile and return its fit."""
         return learning._fit_mode_slope("low", "heat")  # noqa: SLF001
 
     before = _warm()
     learning.set_mode_effective_slope("low", "heat", 0.9)
-    assert _warm() != before and _warm()[0] == 0.9
+    assert _warm() != before and _warm().intercept == 0.9
 
     learning.slope_samples = _full_store().slope_samples
     assert _warm() == learning._compute_mode_fit("low", "heat")  # noqa: SLF001

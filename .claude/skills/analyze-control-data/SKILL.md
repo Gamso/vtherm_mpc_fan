@@ -22,8 +22,8 @@ Keep this in sync with `_HEADER` in `custom_components/vtherm_mpc_fan/data_colle
 | `timestamp` | ISO datetime of each control cycle |
 | `hvac_mode` | `heat` or `cool` |
 | `current_temp` | Sensor temperature (°C) |
-| `target_temp` | Active setpoint (°C) |
-| `current_error` | Signed comfort error (positive = needs action) |
+| `target_temp` | Regulated setpoint VTherm sends to the unit (`regulated_target_temperature`, °C) |
+| `current_error` | Signed error against `target_temp` (positive = needs action) |
 | `vtherm_slope` | EMA-smoothed slope from VTherm (°C/h) |
 | `effective_slope` | Slope actually used for decisions (sign-aligned: positive = cooling/heating progress) |
 | `projected_temp` / `projected_error` | Simple linear projection from the current slope (not the MPC's own horizon simulation) |
@@ -37,17 +37,20 @@ Keep this in sync with `_HEADER` in `custom_components/vtherm_mpc_fan/data_colle
 | `learning_ready` | `True` when the model has enough samples overall |
 | `dead_time` | Learned thermal dead time (minutes) |
 | `is_window_open` | `True`/`False` |
-| `mpc_status` | `Ready` / `Not ready` / `Setpoint drop` / `Disturbed` / `Idle` / `Low confidence` |
+| `mpc_status` | `Ready` / `Low confidence` / `Setpoint boost` / `Setpoint drop` / `Overshoot` / `Disturbed` / `Idle` / `Unavailable` / `Fixed` / `Forced` |
 | `mpc_fan` | Fan mode the MPC itself would choose (before force/pause overrides) |
 | `mpc_would_change` | `yes` / `no` — whether the MPC would change the fan mode right now |
 | `mpc_cost` | MPC optimization cost of the chosen mode |
 | `mpc_confidence` | Profile coverage % |
 | `mpc_temp_10m` / `mpc_temp_30m` | MPC 10/30-minute temperature predictions |
-| `mpc_known_profiles` | Count of fan modes with a reliable learned profile (≥`MIN_MODE_PROFILE_SAMPLES`) |
+| `mpc_known_profiles` | Count of fan modes with a profile of their own (measured — 90 min of regime in ≥ 6 samples — or seeded) |
 | `mpc_disturbance` | Current disturbance-bias EMA (°C/h) |
 | `defrost_active` | `True` when defrost protection is active — from the underlying's own `hvac_action == "defrosting"`, or the optional defrost entity |
 | `hvac_idle` | `True` when the underlying reports it is not producing (its own `hvac_action`, not VTherm's simulated one — see `CLAUDE.md`) |
 | `outdoor_temp` | Outdoor temperature reported by VTherm, if available |
+| `user_target_temp` | The user's own setpoint (`target_temperature`); `target_temp` above is VTherm's *regulated* setpoint |
+| `regulation_offset` | `target_temp − user_target_temp`: how far VTherm's auto-regulation moved the setpoint sent to the unit (raw °C) |
+| `comfort_error` | Signed error against `user_target_temp` (positive = needs action) — the error the MPC regulates on |
 
 ## Analysis Procedure
 
@@ -59,7 +62,7 @@ Keep this in sync with `_HEADER` in `custom_components/vtherm_mpc_fan/data_colle
 ### 2. Key Diagnostic Checks
 
 **Setpoint drop events (`reason` contains "Setpoint drop")**
-- Check `target_temp` drop magnitude
+- Check the `user_target_temp` drop magnitude (a genuine user move is required; a room past an unchanged setpoint reports `Overshoot`)
 - Verify `fan_mode` went to lowest mode
 - Check MPC also reported "Setpoint drop"
 
@@ -71,7 +74,7 @@ Keep this in sync with `_HEADER` in `custom_components/vtherm_mpc_fan/data_colle
 **MPC disturbed periods (`mpc_status == "Disturbed"`)**
 - Identify what triggered the disturbance: defrost, window open, HVAC idle
 - Check `mpc_confidence` — low confidence = not enough learning data
-- Check `mpc_known_profiles` — MPC needs ≥10 samples per mode
+- Check `mpc_known_profiles` — a speed is measured once its samples cover 90 min of established regime
 
 **Slow temperature recovery**
 - Plot `current_temp` vs `target_temp` over time

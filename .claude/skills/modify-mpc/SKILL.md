@@ -18,7 +18,7 @@ This project uses a **discrete MPC-lite** adapted for residential heat-pump HVAC
 - **State**: room temperature (scalar)
 - **Control input**: fan speed mode (discrete: silent → low → med → high → superhigh)
 - **Model**: linear `T(t+Δ) = T(t) + slope × Δt + disturbance_bias × Δt`
-- **Horizon**: 30 min (configurable), step size = control loop cadence (~2 min)
+- **Horizon**: dead time + 60 min (`DEFAULT_HORIZON_MINUTES`), simulation step 2 min (independent of the control cadence)
 - **Optimizer**: exhaustive enumeration over discrete fan modes (small action space)
 - **Cost**: comfort error + overshoot penalty + mode-change cost (see table below)
 
@@ -28,22 +28,23 @@ Unlike classic MPC, the model parameters (slopes) are **learned online** by `The
 
 The MPC controller lives in `mpc_controller.py` as `MPCController`. This project is a **VTherm Feature Manager plugin**: it has no control loop of its own. `manager.py`'s `MpcFanFeatureManager.refresh_state()` is called by VTherm once per its own control cycle, and calls `mpc_controller.evaluate()` to get a decision dict that feeds sensors/numbers, CSV logs, and the fan command.
 
-When MPC status is actionable (`Ready`, `Setpoint drop`, `Low confidence`), the manager applies the fan recommendation. When paused (`Disturbed`, `Idle`, `Not ready`), the current fan is held.
+When MPC status is actionable (`Ready`, `Setpoint boost`, `Setpoint drop`, `Overshoot`, `Low confidence`), the manager applies the fan recommendation. When paused (`Disturbed`, `Idle`, `Unavailable`), the current fan is held.
 
 ### Key Flow in `evaluate()`
 
 ```
 1. Early exits: idle HVAC mode, no fan modes
 2. Resolve fan modes and active fan
-3. Compute effective slope, dead time, phase
+3. Compute effective slope, comfort error (user setpoint), dead time (gate-capped for the phase), sensor resolution, escalation state
 4. Update disturbance bias (EMA tracking)
 5. Pause conditions: window-open, defrost, HVAC idle → return "Disturbed"
-6. Setpoint drop → return lowest mode immediately
+6. Setpoint boost (user move asking ≥ 1 °C more) → strongest mode until back within the deadband; setpoint drop (genuine user setpoint move, `_track_setpoint`) → return lowest mode immediately; a comfort error < −1 °C without one is `Overshoot` (lowest mode the guards allow, after the simulation)
 7. Build monotone slope map (over the learned profiles, partial ladders included)
-8. Simulate ALL fan modes over the horizon (30 min default)
-9. Select best by lowest cost
-10. Apply guards: min-interval hold, hysteresis, step-down hold
-11. Build and return payload
+8. Simulate ALL fan modes over the horizon (dead time + 60 min); all of them follow the observed slope during the dead time
+9. Select best by lowest cost (eligibility: climb guard, multi-rank step-down guard; overshoot → lowest eligible)
+10. Apply guards: min-interval hold (confirmed escalation bypasses upward), hysteresis, step-down hold
+11. Exploration: measurement under load (option), downward probe (default on); cold start → step law
+12. Build and return payload
 ```
 
 ### Cost Function (`_simulate_mode`)
@@ -53,14 +54,14 @@ Each candidate fan mode is simulated step-by-step over the horizon:
 | Cost Component | Weight | Purpose |
 |---|---|---|
 | `comfort_error × urgency` | 1.0 × (1 + excess error × 2) | Penalizes being outside deadband |
-| `overshoot²` | 3.0 | Strongly penalizes going past target |
-| `floor_violation` (linear) | 12.0 × urgency | Penalizes being below target (heat) |
+| `overshoot²` | 3.0 | Penalizes going past target |
+| `floor_violation` (linear) | 12.0 × urgency | Penalizes any shortfall (below target in heat, above in cool) |
 | `floor_violation²` | 30.0 | Strongly penalizes large shortfalls |
+| tracking (`_tracking_cost`) | 160 × Huber(0.3), × 16 on the short side | Distance to a target 0.12 °C inside the band on the comfortable side |
 | `mode_change_cost` | 0.15 × distance | Penalizes switching fan modes |
-| `mode_rank_cost` | 0.05 × `1.82^rank`, scaled to 0.15× near equilibrium (`HOLD_RANK_SCALE`) | Geometric preference for lower fan speeds — reproduces the old 1.0/1.8/3.3/6.0 power ramp regardless of how many speeds the climate exposes; shrunk to a tie-breaker when already holding near target |
-| `min_interval_penalty` | 25.0 | Blocks changes before min_interval |
+| `mode_rank_cost` | 0.1 × `1.82^rank`, scaled to 0.15× near equilibrium (`HOLD_RANK_SCALE`) | Energy, a tie-breaker: one rank ≈ 0.01–0.03 °C of sustained error |
 
-Cost weights are module-level constants (e.g. `FLOOR_VIOLATION_LINEAR_WEIGHT = 12.0`).
+The thermal terms are averaged over the simulation steps (per-step units). Comfort comes first: the deadband is a decision hysteresis, not a zone the cost ignores. Cost weights are module-level constants (e.g. `FLOOR_VIOLATION_LINEAR_WEIGHT = 12.0`); calibrate them on the closed-loop plant (`tests/closed_loop.py`, `tests/test_closed_loop.py`), not on the open-loop replay alone.
 
 ### Hysteresis (`_required_switch_gain`)
 
@@ -68,15 +69,15 @@ The MPC requires a minimum cost improvement before switching:
 
 | Situation | Base Margin |
 |---|---|
-| Over-target or far under | 0.10 |
-| Approaching target | 0.15 |
-| Near target (within deadband) | 0.30 |
+| Over-target or far under | 0.05 |
+| Approaching target | 0.075 |
+| Near target (within deadband) | 0.125 |
 
-Plus bonuses for non-established phase (+0.10) and step distance (+0.05/step).
+Plus bonuses for non-established phase (+0.05), step distance (+0.025/step) and a step down while short of the tracking target (+0.4 + 1.0/°C). The margins only filter ties; stability comes from the guards.
 
 ### Step-Down Hold (`_step_down_hold_note`)
 
-Blocks downward fan moves when still under target and either not yet in ESTABLISHED phase or predicted shortfall at 10 min exceeds the reserve threshold.
+Blocks downward fan moves when still short of the tracking target and either not yet in ESTABLISHED phase or predicted shortfall at 10 min exceeds the reserve threshold; and, while the comfort error is above `-deadband`, any step down to a speed whose predicted error grows from 10 to 30 minutes (it would let the room drift back out of the band).
 
 ### Disturbance Bias (`_update_disturbance_bias`)
 
@@ -86,7 +87,7 @@ Access via the `disturbance_bias` property (read-only).
 
 ### Monotone Constraint (`build_monotone_slopes`)
 
-`build_monotone_slopes()` enforces `slope(mode_i) ≤ slope(mode_i+1)` across the learned profiles. It returns a dict containing **only the modes that have a learned profile** (`{}` when none do) — it never returns `None`, and unlearned modes are simply absent, so the caller falls back to rank-scaled estimation for those. Placement is a single pass in **best-sampled-first** order, each profile clipped into the window left by those already placed, so a thin noisy estimate cannot drag a well-sampled one; a rejected estimate is re-synthesised one `LADDER_CAPACITY_RATIO` step from the neighbour that constrained it rather than pinned onto it. This prevents a contaminated low-speed profile from ranking above a stronger mode in cost comparison.
+`build_monotone_slopes()` enforces `slope(mode_i) ≤ slope(mode_i+1)` across the learned profiles. It returns a dict containing **only the modes that have a learned profile** (`{}` when none do) — it never returns `None`, and unlearned modes are simply absent, so the caller falls back to rank-scaled estimation for those. The ladder is a weighted **isotonic regression** (pool-adjacent-violators, weights = each profile's effective sample size), so a thin noisy estimate barely moves a well-sampled one; inside a pooled or tied block the heaviest profile keeps the value and the others are separated one `LADDER_CAPACITY_RATIO` step per rank (never left equal: the energy term would then always pick the weaker). With `sample=True` (Thompson sampling) values are drawn from `N(value, slope_sigma²)` first. This prevents a contaminated low-speed profile from ranking above a stronger mode in cost comparison.
 
 ### Pause Conditions
 
@@ -110,7 +111,7 @@ All three conditions decay, not update, the disturbance bias.
 6. Records to CSV (`_async_record`) and pushes the decision onto entities + VTherm's `extra_state_attributes.mpc_fan` (`_push_to_entities`)
 7. Applies the fan change via `self._vtherm.async_set_underlying_fan_mode()` if needed
 
-State tracking is instance attributes on `MpcFanFeatureManager`, not a closure dict: `_last_change_time`, `_previous_slope`, `_defrost_active`/`_defrost_start_time`, `_last_setpoint_drop_time`, `_last_hvac_mode`.
+State tracking is instance attributes on `MpcFanFeatureManager`, not a closure dict: `_last_change_time`, `_response_armed`/`_response_start_temp`/`_response_direction` (temperature-based dead time), `_last_sample` (time-based sampling), `_defrost_active`/`_defrost_start_time`, `_last_setpoint_drop_time`, `_last_hvac_mode`.
 
 ## Public API Surface
 
@@ -119,10 +120,12 @@ State tracking is instance attributes on `MpcFanFeatureManager`, not a closure d
 | `fan_modes` | property (r/w) | Update available fan modes |
 | `learning` | property (read-only) | Access `ThermalLearning` instance |
 | `disturbance_bias` | property (read-only) | Current external disturbance estimate |
-| `evaluate(...)` | method | Run one MPC cycle; returns result dict |
+| `evaluate(..., user_target_temp=None)` | method | Run one MPC cycle; returns result dict. `target_temp` is the regulated setpoint, `user_target_temp` the user's (comfort reference; falls back to `target_temp`) |
+| `sensor_resolution`, `escalation_threshold` | properties | Auto-detected sensor step and the resulting escalation threshold |
+| `gate_dead_time(dead_time)` | static method | Dead time capped at `DEAD_TIME_MAX_FOR_GATE` for the learning gate, phase and hold |
 | `get_effective_timeout(hvac_mode)` | method | Runtime advisory timeout (learned or configured); diagnostic only, does not gate control |
 | `get_live_mode_slope(fan_mode, hvac_mode)` | method | Slope used for a mode in the last evaluated cycle, or None |
-| `build_monotone_slopes(fan_modes, hvac_mode)` | method | Isotonic slope map over the learned profiles only (`{}` if none) |
+| `build_monotone_slopes(fan_modes, hvac_mode, *, error, regulation_offset, sample)` | method | Weighted isotonic (PAV) slope map over the learned profiles only (`{}` if none) |
 
 ## Procedure
 
@@ -137,8 +140,11 @@ State tracking is instance attributes on `MpcFanFeatureManager`, not a closure d
 | Disturbance tracking | `_update_disturbance_bias()` |
 | Simulation model | `_simulate_mode()` inner loop |
 | Confidence | `_compute_confidence()` |
-| Monotone constraint | `build_monotone_slopes()` |
-| Learning collection | `manager.py` → `_async_run_cycle()` (slope samples, response events) |
+| Monotone constraint | `build_monotone_slopes()`, `_separate()` |
+| Exploration | `_probe_candidate()`, the S3 block in `evaluate()`, `INFO_BONUS` |
+| Cold start | `_step_law_fan()` |
+| Profile fit | `thermal_learning.py` → `_compute_mode_fit()`, `ProfileFit` |
+| Learning collection | `manager.py` → `_async_run_cycle()`, `_is_duplicate_slope()`, `_sample_dwell_minutes()`, `_detect_response()` |
 | Idle/defrost detection | `manager.py` → `_underlying_hvac_action()`, `_is_hvac_idle()`, `_is_defrost_active()` |
 
 ### 2. Make the Change

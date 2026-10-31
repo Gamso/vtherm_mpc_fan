@@ -9,6 +9,7 @@ both sides a single decoupled rendez-vous point, keyed by the VTherm
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.core import HomeAssistant
@@ -19,6 +20,9 @@ from .const import (
     DATA_ENTITIES,
     DATA_MANAGERS,
     DOMAIN,
+    VTHERM_AUTO_FAN_NONE,
+    VTHERM_CONF_AUTO_FAN_MODE,
+    VTHERM_DOMAIN,
 )
 
 if TYPE_CHECKING:
@@ -97,4 +101,39 @@ def find_conflicting_plugin(hass: HomeAssistant, vtherm_unique_id: str) -> str |
         for entry in entries:
             if entry.data.get(target_key) == vtherm_unique_id:
                 return domain
+    return None
+
+
+def native_auto_fan_mode(vtherm_config: Any) -> str | None:
+    """Return the VTherm built-in auto-fan mode when it is active, else None.
+
+    *vtherm_config* is the VTherm's own configuration: ``entry_infos`` on the
+    runtime, or the merged data/options of its config entry. A missing key,
+    ``None`` and ``auto_fan_none`` all mean the core leaves the fan alone.
+    """
+    if not isinstance(vtherm_config, Mapping):
+        return None
+    mode = vtherm_config.get(VTHERM_CONF_AUTO_FAN_MODE)
+    if not mode or mode == VTHERM_AUTO_FAN_NONE:
+        return None
+    return str(mode)
+
+
+def find_native_auto_fan(hass: HomeAssistant, vtherm_unique_id: str) -> str | None:
+    """Return the active built-in auto-fan mode of a VTherm, read from its config entry.
+
+    Used by the config flow, before any runtime exists. A VTherm's unique_id is
+    its config entry's ``entry_id`` (VTherm never sets an entry unique_id), so
+    that is what is matched.
+    """
+    config_entries = getattr(hass, "config_entries", None)
+    if config_entries is None:
+        return None
+    try:
+        entries = config_entries.async_entries(VTHERM_DOMAIN)
+    except Exception:  # pylint: disable=broad-except
+        return None
+    for entry in entries:
+        if entry.entry_id == vtherm_unique_id:
+            return native_auto_fan_mode({**entry.data, **entry.options})
     return None

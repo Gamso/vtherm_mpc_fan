@@ -1,17 +1,3 @@
-apply_learned_settings:
-  name: Apply learned settings
-  description: Apply optimal parameters computed from the learning algorithm. Specify the target VTherm when several are managed.
-  fields:
-    target_vtherm:
-      name: Versatile Thermostat
-      description: Optional when only one VTherm MPC Fan controller is running. Required when several VTherms are managed.
-      required: false
-      example: "climate.living_room"
-      selector:
-        entity:
-          domain: climate
-          integration: versatile_thermostat
-
 reset_learning:
   name: Reset learning
   description: Clear all learning data and restart the learning process from scratch. Specify the target VTherm when several are managed.
