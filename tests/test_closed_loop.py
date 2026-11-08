@@ -19,7 +19,7 @@ import pytest
 from custom_components.vtherm_mpc_fan.mpc_controller import MPCController
 from custom_components.vtherm_mpc_fan.thermal_learning import ThermalLearning
 
-from closed_loop import FAN_MODES, VARIANTS, Plant, PlantConfig, run_closed_loop, schedule, seed_true_profiles
+from closed_loop import FAN_MODES, MIRROR, SCENARIOS, VARIANTS, Plant, PlantConfig, run_closed_loop, schedule, seed_true_profiles
 from test_manager import _build_manager, _make_hass, _make_runtime
 
 HOURS = 72
@@ -94,14 +94,86 @@ def test_the_evening_setpoint_drop_runs_the_strongest_speed() -> None:
     assert result.descents[0] <= BASELINE_8D7BCCD["base"][0][3] + DESCENT_MARGIN
 
 
-async def _run_manager_loop(hours: float, *, seed: int, known: tuple[str, ...]):
+def _scenario_run(config: PlantConfig, seed: int):
+    """Run one robustness scenario: profiles seeded from *seed*, a fresh controller at each restart."""
+    learning = ThermalLearning()
+    seed_true_profiles(learning, config, seed=seed)
+
+    def build() -> MPCController:
+        """A controller on the shared learning, as Home Assistant rebuilds it on restart."""
+        return MPCController(learning=learning, deadband=0.2, min_interval=10, fan_modes=list(FAN_MODES))
+
+    return run_closed_loop(build(), HOURS, seed=seed, config=config, rebuild=build)
+
+
+#: Each heat scenario and the cool one it mirrors.
+MIRRORED = {"heat": "base", "modulating_heat": "modulating", "noisy_heat": "noisy", "restart_heat": "restart"}
+
+
+@pytest.mark.parametrize("heat_scenario", sorted(MIRRORED))
+def test_heat_reproduces_cool_on_the_mirrored_plant(heat_scenario: str) -> None:
+    """The same plant seen mirrored in heat gives the very same run as in cool.
+
+    The comfort error and every slope are sign-aligned, so nothing in the
+    controller may depend on the HVAC mode beyond that sign -- a heat-only
+    path (the 2026-11 incident happened in heat) shows up as a divergence.
+    """
+    cool_name = MIRRORED[heat_scenario]
+    cool = _scenario_run(SCENARIOS.get(cool_name) or VARIANTS[cool_name], seed=0)
+    heat = _scenario_run(SCENARIOS[heat_scenario], seed=0)
+
+    assert heat.changes == cool.changes
+    assert heat.errors == pytest.approx(cool.errors, abs=1e-9)
+    assert heat.fan_minutes == cool.fan_minutes
+
+
+#: Ceilings per robustness scenario, over seeds 0-2: (comfort MAE degC, % short
+#: of the setpoint, % past it), the measured worst plus a small margin. Past the
+#: setpoint is the side the 2026-11 incident drifted to; the controller before
+#: the ladder envelope scored up to 0.348 / 41 % past on "noisy" and 0.432 /
+#: 51 % past on "noisy_slowdelay".
+SCENARIO_CEILINGS = {
+    "heat_defrost": (0.27, 25.0, 11.0),
+    "modulating": (0.32, 25.0, 12.0),
+    "noisy": (0.29, 21.0, 15.0),
+    "noisy_slowdelay": (0.36, 23.0, 36.0),
+    "regime": (0.30, 21.0, 25.0),
+    "regime_modulating": (0.31, 24.0, 16.0),
+    "restart": (0.29, 22.0, 26.0),
+}
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("scenario", sorted(SCENARIO_CEILINGS))
+def test_comfort_holds_on_the_robustness_scenarios(scenario: str, seed: int) -> None:
+    """Defrosts, a self-regulating unit, noisy or regime-biased profiles and restarts keep comfort bounded."""
+    result = _scenario_run(SCENARIOS[scenario], seed)
+    mae, short, past = SCENARIO_CEILINGS[scenario]
+
+    summary = (
+        f"{scenario}/{seed}: MAE {result.comfort_mae:.3f} (<= {mae}), short {result.too_warm_pct:.1f} % (<= {short}), "
+        f"past {result.too_cold_pct:.1f} % (<= {past}), {result.changes_per_hour:.2f} changes/h, superhigh {result.superhigh_pct:.1f} %"
+    )
+    assert result.comfort_mae <= mae, summary
+    assert result.too_warm_pct <= short, summary
+    assert result.too_cold_pct <= past, summary
+
+
+async def _run_manager_loop(hours: float, *, seed: int, known: tuple[str, ...], hvac_mode: str = "cool"):
     """Drive the real feature manager (learning gates included) against the plant.
 
     Only the speeds in *known* start with a profile; the others must be learned
     by the manager's own sampling, from the visits the controller creates.
+    In heat the manager sees the plant mirrored about MIRROR (see closed_loop).
     Returns (manager, fan changes, comfort errors against the user setpoint).
     """
-    config = PlantConfig()
+    config = PlantConfig(hvac_mode=hvac_mode)
+    heat = hvac_mode == "heat"
+
+    def shown(temperature: float) -> float:
+        """The temperature as VTherm reports it: mirrored about MIRROR in heat."""
+        return 2.0 * MIRROR - temperature if heat else temperature
+
     plant = Plant(config, seed)
     runtime = _make_runtime(current_temperature=plant.published, target_temperature=24.0, regulated_target_temperature=24.0, last_temperature_slope=0.0)
     hass = _make_hass(fan_mode=config.start_fan)
@@ -113,11 +185,11 @@ async def _run_manager_loop(hours: float, *, seed: int, known: tuple[str, ...]):
     errors = []
     for _ in range(int(hours * 60 / config.cycle_minutes)):
         mode, user, regulated = plant.regulate()
-        runtime.vtherm_hvac_mode = mode
-        runtime.current_temperature = plant.published
-        runtime.target_temperature = user
-        runtime.regulated_target_temperature = regulated
-        runtime.last_temperature_slope = plant.slope
+        runtime.vtherm_hvac_mode = hvac_mode if mode == "cool" else mode
+        runtime.current_temperature = shown(plant.published)
+        runtime.target_temperature = shown(user)
+        runtime.regulated_target_temperature = shown(regulated)
+        runtime.last_temperature_slope = -plant.slope if heat else plant.slope
         with patch("time.time", return_value=start + plant.minute * 60.0):
             await manager.refresh_state()
         if runtime.async_set_underlying_fan_mode.await_count > commands:
@@ -133,19 +205,21 @@ async def _run_manager_loop(hours: float, *, seed: int, known: tuple[str, ...]):
     return manager, commands, errors
 
 
-async def test_exploration_measures_every_speed_with_the_manager_in_the_loop() -> None:
+@pytest.mark.parametrize("hvac_mode", ["cool", "heat"])
+async def test_exploration_measures_every_speed_with_the_manager_in_the_loop(hvac_mode: str) -> None:
     """Starting with only high and superhigh known, every speed is measured within 72 h.
 
     This is the loop the old controller could not leave: weak speeds were only
     visited in overshoot, a single sensor step aborted the learning hold, and a
     distinct reading was required per sample. Probes, time-based sampling and
     the resolution-aware escalation together close it, without giving up
-    comfort.
+    comfort. In heat the manager sees the same plant mirrored: its sampling,
+    response detection and dead time are sign-aligned and must do the same.
     """
-    manager, commands, errors = await _run_manager_loop(72, seed=0, known=("high", "superhigh"))
+    manager, commands, errors = await _run_manager_loop(72, seed=0, known=("high", "superhigh"), hvac_mode=hvac_mode)
 
     learning = manager.learning
-    assert all(learning.has_measured_profile(fan, "cool") for fan in FAN_MODES), {fan: learning.get_mode_measured_minutes(fan, "cool") for fan in FAN_MODES}
+    assert all(learning.has_measured_profile(fan, hvac_mode) for fan in FAN_MODES), {fan: learning.get_mode_measured_minutes(fan, hvac_mode) for fan in FAN_MODES}
     assert learning.probe_count >= 1
     assert commands > 0
     # The 8d7bccd controller, with every profile known from the start, scores
