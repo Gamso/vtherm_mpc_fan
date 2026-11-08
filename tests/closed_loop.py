@@ -24,6 +24,25 @@ Comfort is measured on the TRUE room temperature against the USER setpoint,
 over the minutes the unit cools. ``run_closed_loop`` also drives the 8d7bccd
 controller (no ``user_target_temp``: it regulated on the regulated setpoint),
 which is how the baseline references of tests/test_closed_loop.py were measured.
+
+Robustness scenarios (shaped on the Apr-Nov 2026 production logs of the same
+installation, heat and cool):
+
+- ``hvac_mode="heat"``: the plant runs unchanged and the controller sees it
+  mirrored about 22 degC (room 24.2 -> 19.8, setpoint 24 -> 20, the evening
+  setpoint 22 -> 22 becomes a raise). The error and the slopes are
+  sign-aligned, so a heat run must reproduce the cool run;
+- ``defrost_period``: every so many minutes the unit stops heating for
+  ``defrost_minutes`` and pulls the room back; the controller is told
+  (``is_defrost_active``), as the manager does;
+- ``unit="modulating"``: the unit holds its own setpoint with a compressor
+  capped by the fan speed, as the logs show -- every speed that can carry the
+  load holds the room at ~0 degC/h near the setpoint and the speeds only part
+  far from it. Linear profile fits are then misspecified;
+- ``slope_noise``: the seeded profile samples carry measurement noise, so the
+  learner's fits come out with gains as noisy as production's (R² ~0.05);
+- ``restarts``: Home Assistant restarts at these minutes -- a fresh controller
+  on the same learning, VTherm's regulation offset back to 0.
 """
 
 from __future__ import annotations
@@ -33,6 +52,7 @@ import inspect
 import math
 import random
 import statistics
+from typing import Any, Callable
 
 from custom_components.vtherm_mpc_fan.thermal_learning import ThermalLearning
 
@@ -64,7 +84,31 @@ class PlantConfig:
     start_temp: float = 25.0
     start_fan: str = "superhigh"
     known: tuple[str, ...] = FAN_MODES  # speeds with a profile at the start
+    hvac_mode: str = "cool"  # "heat": the controller sees the plant mirrored about MIRROR
+    unit: str = "capacity"  # "modulating": the unit holds its own setpoint, capped by the fan speed
+    modulation_gain: float = 1.5  # degC/h of power per degC of unit error ("modulating")
+    defrost_period: float = 0.0  # minutes between defrosts while running (0: none)
+    defrost_minutes: float = 8.0
+    defrost_power: float = -0.6  # degC/h the defrost pulls the room away from the setpoint
+    slope_noise: float = 0.0  # degC/h of noise on each seeded profile sample
+    regime_sampling: bool = False  # seed each speed only over the errors it is used at (REGIME_ERRORS)
+    restarts: tuple[float, ...] = ()  # simulation minutes at which Home Assistant restarts
 
+
+#: Heat runs show the controller the plant mirrored about this temperature.
+MIRROR = 22.0
+#: Compressor cap per speed of the "modulating" unit (degC/h): low and above carry the base load.
+MODULATING_CAPACITY = {fan: 1.6 * capacity for fan, capacity in CAPACITY.items()}
+#: Comfort errors each speed is measured at in production: the strong speeds far
+#: from the setpoint, the weak ones near or past it. Fitted over these ranges
+#: only, the lines extrapolate and cross (2026-11 incident).
+REGIME_ERRORS = {
+    "silent": (-0.4, -0.3, -0.2, -0.1, 0.0, 0.1),
+    "low": (-0.2, -0.1, 0.0, 0.1, 0.2, 0.3),
+    "med": (0.0, 0.1, 0.2, 0.3, 0.4, 0.6),
+    "high": (0.2, 0.3, 0.4, 0.6, 0.8, 1.0),
+    "superhigh": (0.6, 0.8, 1.0, 1.5, 2.0, 2.5),
+}
 
 VARIANTS = {
     "base": PlantConfig(),
@@ -74,6 +118,24 @@ VARIANTS = {
     "gain0.2": PlantConfig(inverter_gain=0.2),
     "slowdelay": PlantConfig(actuator_delay=15.0, power_tau=12.0),
     "partial": PlantConfig(known=("med", "high", "superhigh")),
+}
+
+#: Robustness scenarios, each a deviation the production logs showed (see the module docstring).
+SCENARIOS = {
+    "heat": PlantConfig(hvac_mode="heat"),
+    # Heat as logged: 5-20 min dead time, a defrost every ~1.5 h.
+    "heat_defrost": PlantConfig(hvac_mode="heat", actuator_delay=6.0, power_tau=4.0, defrost_period=90.0),
+    "modulating": PlantConfig(unit="modulating"),
+    "modulating_heat": PlantConfig(unit="modulating", hvac_mode="heat"),
+    "noisy": PlantConfig(slope_noise=0.4),
+    "noisy_heat": PlantConfig(slope_noise=0.4, hvac_mode="heat"),
+    "noisy_slowdelay": PlantConfig(slope_noise=0.4, actuator_delay=15.0, power_tau=12.0),
+    # Each speed measured only where it is used, with noise: the production ladder.
+    "regime": PlantConfig(regime_sampling=True, slope_noise=0.2),
+    "regime_modulating": PlantConfig(regime_sampling=True, slope_noise=0.2, unit="modulating"),
+    # Restarts at 14:00 on day 2 (room held) and 22:00 on day 3 (evening descent).
+    "restart": PlantConfig(restarts=(1680.0, 3600.0)),
+    "restart_heat": PlantConfig(restarts=(1680.0, 3600.0), hvac_mode="heat"),
 }
 
 
@@ -141,23 +203,42 @@ class LoopResult:
         return statistics.mean(self.persistence_errors_30m)
 
 
+def unit_power(fan_mode: str, unit_error: float, load: float, config: PlantConfig) -> float:
+    """Return the cooling power (degC/h) the unit delivers on *fan_mode* at a unit error."""
+    if config.unit == "modulating":
+        # The unit's own regulation: enough to carry the load and close its
+        # error, never more than the fan speed allows.
+        return max(0.0, min(MODULATING_CAPACITY[fan_mode], load + config.modulation_gain * unit_error))
+    return CAPACITY[fan_mode] * max(0.2, 1.0 + config.inverter_gain * unit_error)
+
+
 def unit_slope(fan_mode: str, unit_error: float, load: float, config: PlantConfig) -> float:
     """Return the effective slope (degC/h toward the setpoint) a speed holds at a unit error."""
-    return CAPACITY[fan_mode] * max(0.2, 1.0 + config.inverter_gain * unit_error) - load
+    return unit_power(fan_mode, unit_error, load, config) - load
 
 
-def seed_true_profiles(learning: ThermalLearning, config: PlantConfig, *, fans: tuple[str, ...] | None = None) -> None:
-    """Give the learner the true profiles of *fans*, as a mature installation would have them."""
+def seed_true_profiles(learning: ThermalLearning, config: PlantConfig, *, fans: tuple[str, ...] | None = None, seed: int = 0) -> None:
+    """Give the learner the true profiles of *fans*, as a mature installation would have them.
+
+    With ``config.slope_noise`` each sample carries that much Gaussian noise
+    (drawn from *seed*), so the fits are as uncertain as production's. In heat
+    the samples are the mirrored ones: raw slope and regulation offset change
+    sign, the comfort error does not.
+    """
     has_dwell = "dwell_minutes" in inspect.signature(learning.add_slope_sample).parameters
+    hvac_mode = config.hvac_mode
+    sign = 1.0 if hvac_mode == "heat" else -1.0  # raw slope of a positive effective slope
+    rng = random.Random(seed)
     for fan_mode in config.known if fans is None else fans:
-        for error in (0.0, 0.1, 0.2, 0.3, 0.4, 0.6, 0.8, 1.0) * 2:
-            effective = unit_slope(fan_mode, error - TYPICAL_OFFSET, config.load, config)
+        errors = REGIME_ERRORS[fan_mode] * 3 if config.regime_sampling else (0.0, 0.1, 0.2, 0.3, 0.4, 0.6, 0.8, 1.0) * 2
+        for error in errors:
+            effective = unit_slope(fan_mode, error - TYPICAL_OFFSET, config.load, config) + rng.gauss(0.0, config.slope_noise)
             if has_dwell:
-                learning.add_slope_sample(fan_mode, -effective, error, hvac_mode="cool", regulation_offset=TYPICAL_OFFSET, dwell_minutes=10.0)
+                learning.add_slope_sample(fan_mode, sign * effective, error, hvac_mode=hvac_mode, regulation_offset=-sign * TYPICAL_OFFSET, dwell_minutes=10.0)
             else:  # 8d7bccd: the error was taken against the regulated setpoint
-                learning.add_slope_sample(fan_mode, -effective, error - TYPICAL_OFFSET, hvac_mode="cool")
+                learning.add_slope_sample(fan_mode, sign * effective, error - TYPICAL_OFFSET, hvac_mode=hvac_mode)
     for _ in range(6):
-        learning.add_response_event(12.0, "cool")
+        learning.add_response_event(12.0, hvac_mode)
 
 
 def schedule(minute_of_day: float) -> tuple[str, float]:
@@ -189,6 +270,17 @@ class Plant:
         """Minute of the day of the current simulation minute."""
         return (DAY_START + self.minute) % 1440
 
+    def defrost_active(self) -> bool:
+        """Whether the unit is defrosting this minute (the last ``defrost_minutes`` of each period)."""
+        period = self.config.defrost_period
+        if period <= 0 or schedule(self.time_of_day())[0] != "cool":
+            return False
+        return self.minute % period >= period - self.config.defrost_minutes
+
+    def restart(self) -> None:
+        """Home Assistant restarts: VTherm's auto-regulation starts again from no offset."""
+        self.offset = 0.0
+
     def command(self, fan_mode: str) -> None:
         """Send a fan command; it reaches the room after the actuator delay."""
         self.pending.append((self.minute + self.config.actuator_delay, fan_mode))
@@ -202,7 +294,7 @@ class Plant:
         if mode == "cool":
             load = config.load + config.load_swing * math.sin(2 * math.pi * (self.minute - 300) / 1440.0) + self.rng.gauss(0.0, config.load_noise)
             unit_error = self.temp - (user + self.offset)
-            target_power = CAPACITY[self.fan] * max(0.2, 1.0 + config.inverter_gain * unit_error)
+            target_power = config.defrost_power if self.defrost_active() else unit_power(self.fan, unit_error, load, config)
         else:
             load = (26.0 - self.temp) / 6.0  # relaxation toward the night equilibrium
             target_power = 0.0
@@ -226,17 +318,37 @@ class Plant:
         return mode, user, user + self.offset
 
 
-def run_closed_loop(mpc, hours: float, *, seed: int = 0, config: PlantConfig | None = None) -> LoopResult:
-    """Drive *mpc* (an MPCController) against the plant for *hours* and return what happened."""
+def run_closed_loop(mpc, hours: float, *, seed: int = 0, config: PlantConfig | None = None, rebuild: Callable[[], Any] | None = None) -> LoopResult:
+    """Drive *mpc* (an MPCController) against the plant for *hours* and return what happened.
+
+    At each of ``config.restarts`` the controller is replaced by ``rebuild()``
+    (a fresh controller on the same learning) and the time since the last fan
+    change is forgotten, as the manager forgets it. In heat, the errors and
+    the speeds are recorded in the plant's own (cool) frame: ``too_warm_pct``
+    is then the time short of the setpoint, ``too_cold_pct`` the time past it.
+    """
     config = config or PlantConfig()
     plant = Plant(config, seed)
     new_api = "user_target_temp" in inspect.signature(mpc.evaluate).parameters
+    defrost_api = "is_defrost_active" in inspect.signature(mpc.evaluate).parameters
+    heat = config.hvac_mode == "heat"
+
+    def shown(temperature: float) -> float:
+        """The temperature as the controller sees it: mirrored about MIRROR in heat."""
+        return 2.0 * MIRROR - temperature if heat else temperature
+
+    restarts = list(config.restarts)
     fan_cmd = config.start_fan
     last_change = -1e6
     result = LoopResult(hours=hours)
     evening_start: float | None = None
     forecasts: list[tuple[float, float, float]] = []
     for _ in range(int(hours * 60 / config.cycle_minutes)):
+        if restarts and plant.minute >= restarts[0]:
+            restarts.pop(0)
+            plant.restart()
+            mpc = rebuild()
+            last_change = -1e6
         # VTherm runs its cycle first (regulation, then this plugin), then the
         # room evolves until the next cycle -- so a session's first cycle
         # happens the minute the unit is switched on.
@@ -246,19 +358,21 @@ def run_closed_loop(mpc, hours: float, *, seed: int = 0, config: PlantConfig | N
             result.persistence_errors_30m.append(abs(reading - plant.published))
         mode, user, regulated = plant.regulate()
         call = {
-            "current_temp": plant.published,
-            "target_temp": regulated,
-            "vtherm_slope": plant.slope,
-            "hvac_mode": mode,
+            "current_temp": shown(plant.published),
+            "target_temp": shown(regulated),
+            "vtherm_slope": -plant.slope if heat else plant.slope,
+            "hvac_mode": config.hvac_mode if mode == "cool" else mode,
             "current_fan": fan_cmd,
             "minutes_since_change": plant.minute - last_change,
         }
         if new_api:
-            call["user_target_temp"] = user
+            call["user_target_temp"] = shown(user)
+        if defrost_api and plant.defrost_active():
+            call["is_defrost_active"] = True
         decision = mpc.evaluate(**call)
         if mode == "cool":
             if decision.get("mpc_predicted_temperature_30m") is not None:
-                forecasts.append((plant.minute + 30.0, decision["mpc_predicted_temperature_30m"], plant.published))
+                forecasts.append((plant.minute + 30.0, shown(decision["mpc_predicted_temperature_30m"]), plant.published))
             if decision["mpc_would_change_now"] == "yes" and decision["mpc_fan_mode"] != fan_cmd:
                 fan_cmd = decision["mpc_fan_mode"]
                 plant.command(fan_cmd)

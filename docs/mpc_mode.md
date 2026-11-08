@@ -337,7 +337,12 @@ Current files involved:
   seed, with the 8d7bccd one replayed on the same plant (comfort MAE, time within ±0.2 °C, time too
   warm, evening descent, within documented margins), checks the evening setpoint boost, reports the T+30
   forecast error next to persistence, and drives the real feature manager from a cold-ish start to
-  check that every speed gets measured.
+  check that every speed gets measured, in cool and mirrored in heat. It also runs the robustness
+  scenarios (see [Robustness scenarios](#robustness-scenarios)).
+- `tests/test_robustness.py` checks decision invariants on 400 random learned ladders (noisy gains
+  whose lines cross, some weak speeds unlearned): heat and mirrored cool decide the same; past the
+  band and drifting away, never a stronger speed; further past, never a stronger speed; short of the
+  band and losing ground, never a weaker speed.
 - `scripts/replay_bench.py` replays recorded CSV traces in open loop: decisions are compared, the
   temperature does not react to them. It reports the forecast MAE next to the persistence baseline.
 
@@ -398,3 +403,36 @@ on all 18, time too warm at 24 °C lower or equal on 11 (at most +0.6 points), e
 shorter or equal on 15 (+1.5 to +3 min on the others: the room starts the descent a little warmer than
 under 8d7bccd, which overcooled the day). The mean comfort error on this bench is dominated by the
 22 °C slot, which the unit cannot reach before midnight on most evenings.
+
+### Robustness scenarios
+
+The variants above seed the true profiles, a perfect model. The production logs of the installation
+(Apr–Nov 2026, ~2 400 h cooling, ~220 h heating) show what that hides, and `SCENARIOS` in
+`tests/closed_loop.py` reproduces it:
+
+| Scenario | What the logs showed |
+|----------|----------------------|
+| `heat`, `*_heat` | Heating: the plant seen mirrored about 22 °C. A heat run must reproduce its cool run exactly (`test_heat_reproduces_cool_on_the_mirrored_plant`) |
+| `heat_defrost` | Heating dead time of 5–20 min (cooling ~22), a defrost pulling the room back every ~1.5 h |
+| `modulating` | Near the setpoint every speed holds at ~0 °C/h — the unit regulates its own setpoint, the fan speed caps it — and the speeds part only far from it: linear fits are misspecified |
+| `noisy`, `noisy_slowdelay` | Profile fits as uncertain as production's (R² ~0.05): seed 0 of `noisy` reproduces the incident ladder, high flat and superhigh steep |
+| `regime`, `regime_modulating` | Each speed measured only where it is used (strong speeds far from the setpoint, weak ones near it), so the fits extrapolate |
+| `restart` | Home Assistant restarts mid-afternoon and in the evening descent: a fresh controller, VTherm's offset back to 0 |
+
+Ranges over seeds 0–2 (72 h each), the ceilings of `SCENARIO_CEILINGS` sitting just above them:
+
+| Scenario | Comfort MAE (°C) | Short (%) | Past (%) |
+|----------|------------------|-----------|----------|
+| heat_defrost | 0.25–0.26 | 20–23 | 6–9 |
+| modulating | 0.30–0.31 | 22–23 | 8–10 |
+| noisy | 0.25–0.28 | 19 | 7–13 |
+| noisy_slowdelay | 0.32–0.35 | 20–21 | 25–33 |
+| regime | 0.28–0.29 | 19 | 14–22 |
+| regime_modulating | 0.29–0.30 | 21 | 13–14 |
+| restart | 0.26–0.28 | 19–20 | 11–23 |
+
+The controller before the ladder envelope scored 0.348 MAE / 41 % past the setpoint on `noisy` seed 2
+and 0.432 / 51 % on `noisy_slowdelay` seed 2, and climbed in 3 % of the random cases of
+`tests/test_robustness.py` past the band. Noise through the real fit is mostly absorbed by the gain
+shrinkage; the worst scenarios remain the slow plant with noisy fits and the restarts, whose
+time past the setpoint varies most with the seed.
