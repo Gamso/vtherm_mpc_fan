@@ -883,20 +883,18 @@ class MPCController:
                 return True
             # Short of the setpoint: one rank at a time. Otherwise only to a
             # speed whose own full profile shows it sustains progress (see
-            # MIN_VIABLE_MULTI_RANK_STEPDOWN_SLOPE) -- or, once the room is out
-            # of the band on the comfortable side, to any speed with a full
-            # profile: losing ground is then the point, and the floor terms of
-            # the cost stop the fall at the setpoint. Not in an Overshoot: it
-            # takes the lowest allowed speed without asking the cost, so the
-            # viability rule is what keeps it off a speed that would sink the
-            # room. A speed with no full profile still waits for an Overshoot.
+            # MIN_VIABLE_MULTI_RANK_STEPDOWN_SLOPE) -- or to any speed in an
+            # Overshoot, a full degree past the setpoint, where losing ground
+            # is the point. Deliberately no exception just past the band: a
+            # room a few tenths warm descends one rank per decision (see the
+            # blocked-drop step below), each rank observed before the next,
+            # rather than diving onto a speed that cannot hold it.
             if current_error > 0:
                 return False
             raw_slope = self._learning.get_mode_effective_slope(sim.fan_mode, hvac_mode)
             if raw_slope is None or self._learning.is_profile_partial(sim.fan_mode, hvac_mode):
                 return overshoot
-            past_band = current_error < -self.out_of_band_error and not overshoot
-            return raw_slope > MIN_VIABLE_MULTI_RANK_STEPDOWN_SLOPE or past_band
+            return raw_slope > MIN_VIABLE_MULTI_RANK_STEPDOWN_SLOPE
 
         eligible_simulations = [sim for sim in simulations if _rank_move_capable(sim)]
         best = min(eligible_simulations, key=lambda item: item.total_cost)

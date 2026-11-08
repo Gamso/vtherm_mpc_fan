@@ -1557,12 +1557,13 @@ def test_ladder_envelope_never_models_a_strong_speed_weaker_past_the_setpoint(mo
 
 
 @pytest.mark.parametrize("hvac_mode", ["heat", "cool"])
-def test_multi_rank_drop_allowed_once_past_the_band_on_the_comfortable_side(monkeypatch: pytest.MonkeyPatch, hvac_mode: str) -> None:
-    """Out of the band past the setpoint, a weak speed losing ground is what is wanted.
+def test_past_the_band_descends_one_rank_per_decision(monkeypatch: pytest.MonkeyPatch, hvac_mode: str) -> None:
+    """Out of the band past the setpoint, the descent goes one rank at a time, never a dive.
 
-    silent/low/med measure 0 degC/h: "can't sustain progress" blocked every
-    drop below high while the room was 0.6 degC too warm (heat) / too cold
-    (cool) and still moving away.
+    silent/low/med measure 0 degC/h and can't hold the room: diving there from
+    superhigh would only trade a too-warm (heat) / too-cold (cool) room for a
+    climb back later. The blocked drop still has to move one rank -- it used
+    to hold superhigh for an hour while the room drifted 0.6 degC away.
     """
     learning = ThermalLearning()
     _pin_fits(
@@ -1575,8 +1576,13 @@ def test_multi_rank_drop_allowed_once_past_the_band_on_the_comfortable_side(monk
 
     decision = _past_setpoint_cycle(mpc, hvac_mode, past=0.6, current_fan="superhigh", slope=0.9)
 
-    assert decision["mpc_fan_mode"] in ("silent", "low", "med"), decision["mpc_reason"]
-    assert "Blocked" not in decision["mpc_reason"]
+    assert decision["mpc_fan_mode"] == "high", decision["mpc_reason"]
+    assert "Blocked" in decision["mpc_reason"]
+    assert decision["mpc_would_change_now"] == "yes"
+
+    decision = _past_setpoint_cycle(mpc, hvac_mode, past=0.5, current_fan="high", slope=0.4)
+
+    assert decision["mpc_fan_mode"] == "med", decision["mpc_reason"]
 
 
 @pytest.mark.parametrize("hvac_mode", ["heat", "cool"])

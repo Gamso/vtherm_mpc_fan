@@ -264,13 +264,12 @@ Step-down guards, all reported in `mpc_reason`:
   drift and a stronger speed lands, the room is past the band.
 - **Multi-rank drop** — a drop of more than one rank goes only to a speed whose own full profile
   sustains progress (`MIN_VIABLE_MULTI_RANK_STEPDOWN_SLOPE`); a speed with no profile or a partial one
-  does not qualify, except in an Overshoot. Once the room is out of the band on the comfortable side
-  (`current_error < -out_of_band_error`) and not in an Overshoot, any full profile qualifies: losing
-  ground is then the point, and the cost's floor terms stop the fall at the setpoint (an Overshoot
-  skips the cost, so it keeps the viability rule). While the room is short of the setpoint, every step
+  does not qualify, except in an Overshoot. While the room is short of the setpoint, every step
   down is one rank at a time. The guard caps a drop, it never cancels it: when the optimum is blocked
   and the cheapest allowed speed is not below the current one, the controller steps one rank toward
-  the optimum, the hysteresis judging the optimum's gain.
+  the optimum, the hysteresis judging the optimum's gain. A room a few tenths past the setpoint thus
+  descends one rank per decision, each rank observed before the next, rather than diving onto a speed
+  that cannot hold it.
 
 An unlearned candidate is estimated from the nearest learned profile along the ladder, then bounded by
 the current speed (`_bound_by_current`): a weaker speed is never rated above the speed running now, a
