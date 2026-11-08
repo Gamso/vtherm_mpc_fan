@@ -169,6 +169,14 @@ block value and the others are separated one `LADDER_CAPACITY_RATIO` step per ra
 when that would pass halfway to the neighbouring block. With `sample=True` (option
 `thompson_sampling`), each value is first drawn from `N(value, slope_sigma²)`.
 
+The isotonic regression orders the ladder at the reference error only, and each profile has its own
+gain, so the lines can cross elsewhere: a steep superhigh fitted on cold starts (0.19 + 0.68·e) runs
+under a flat high (0.49) near the setpoint. In the simulation a learned candidate's gap slope is
+therefore floored at every weaker learned speed's gap slope at the same error (`_ladder_floor`,
+`_enveloped_gap_slope`), and so is the expected slope the disturbance bias is measured against. A
+stronger speed then never looks gentler than a weaker one past the setpoint; a tie goes to the weaker
+speed on the rank cost.
+
 ### Cold start
 
 While no profile of the HVAC mode exists at all (neither measured nor seeded), the decision is a step
@@ -256,8 +264,13 @@ Step-down guards, all reported in `mpc_reason`:
   drift and a stronger speed lands, the room is past the band.
 - **Multi-rank drop** — a drop of more than one rank goes only to a speed whose own full profile
   sustains progress (`MIN_VIABLE_MULTI_RANK_STEPDOWN_SLOPE`); a speed with no profile or a partial one
-  does not qualify, except in an Overshoot. While the room is short of the setpoint, every step down is
-  one rank at a time.
+  does not qualify, except in an Overshoot. Once the room is out of the band on the comfortable side
+  (`current_error < -out_of_band_error`) and not in an Overshoot, any full profile qualifies: losing
+  ground is then the point, and the cost's floor terms stop the fall at the setpoint (an Overshoot
+  skips the cost, so it keeps the viability rule). While the room is short of the setpoint, every step
+  down is one rank at a time. The guard caps a drop, it never cancels it: when the optimum is blocked
+  and the cheapest allowed speed is not below the current one, the controller steps one rank toward
+  the optimum, the hysteresis judging the optimum's gain.
 
 An unlearned candidate is estimated from the nearest learned profile along the ladder, then bounded by
 the current speed (`_bound_by_current`): a weaker speed is never rated above the speed running now, a
