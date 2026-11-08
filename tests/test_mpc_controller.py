@@ -15,7 +15,7 @@ from custom_components.vtherm_mpc_fan.sensor import (
     SmartFanLearningResponseSensor,
     SmartFanSensor,
 )
-from custom_components.vtherm_mpc_fan.thermal_learning import ThermalLearning
+from custom_components.vtherm_mpc_fan.thermal_learning import ProfileFit, ThermalLearning
 
 FAN_MODES = ["low", "medium", "high"]
 
@@ -1498,6 +1498,126 @@ def test_multi_rank_stepdown_blocked_when_candidate_cannot_sustain_progress() ->
         minutes_since_change=300.0,
     )
     assert "Blocked" not in decision2["mpc_reason"]
+
+
+# --- 2026-11 incident: superhigh held 0.6 degC past the setpoint -------------
+# Production fits in heat (number entity attributes): superhigh 0.19 + 0.68·e,
+# high 0.49 flat, silent/low/med 0 at the reference error. Every scenario runs
+# in heat and, mirrored, in cool: the comfort error and the effective slopes are
+# sign-aligned, so the fixes must behave the same in both modes.
+INCIDENT_FAN_MODES = ["silent", "low", "med", "high", "superhigh"]
+
+
+def _pin_fits(monkeypatch: pytest.MonkeyPatch, learning: ThermalLearning, hvac_mode: str, models: dict[str, tuple[float, float]]) -> None:
+    """Pin each profile of *hvac_mode* to the fit ``intercept + gain·error``, measured up to 2.5 degC."""
+    fits = {mode: ProfileFit(intercept, gain, 0.5, effective_samples=50.0, error_max=2.5, slope_sigma=0.1) for mode, (intercept, gain) in models.items()}
+    monkeypatch.setattr(learning, "_fit_mode_slope", lambda fan_mode, mode: fits.get(fan_mode) if mode == hvac_mode else None)
+    monkeypatch.setattr(learning, "has_measured_profile", lambda fan_mode, mode: mode == hvac_mode and fan_mode in fits)
+    learning.add_response_event(6.0, hvac_mode)
+
+
+def _past_setpoint_cycle(mpc: MPCController, hvac_mode: str, past: float, current_fan: str, slope: float) -> dict:
+    """Evaluate one established cycle with the room *past* degC beyond the setpoint on the comfortable side.
+
+    *slope* is the effective slope (positive: the current speed still pushes
+    the room further past, i.e. warming in heat, cooling in cool).
+    """
+    sign = 1.0 if hvac_mode == "heat" else -1.0
+    setpoint = 20.0 if hvac_mode == "heat" else 24.0
+    room = setpoint + sign * past
+    mpc._observe_reading(room - sign * 0.2)  # noqa: SLF001
+    return mpc.evaluate(
+        current_temp=room,
+        target_temp=room,
+        user_target_temp=setpoint,
+        vtherm_slope=sign * slope,
+        hvac_mode=hvac_mode,
+        current_fan=current_fan,
+        minutes_since_change=40.0,
+    )
+
+
+@pytest.mark.parametrize("hvac_mode", ["heat", "cool"])
+def test_ladder_envelope_never_models_a_strong_speed_weaker_past_the_setpoint(monkeypatch: pytest.MonkeyPatch, hvac_mode: str) -> None:
+    """Past the setpoint the strongest speed must not look gentler than the one below it.
+
+    The ladder is ordered at the reference error only. superhigh's steep line
+    (0.19 + 0.68·e) runs under high's flat 0.49 near the setpoint, so the
+    simulator rated superhigh as producing less than high: at 08:12, 0.2 degC
+    past the setpoint, it climbed from high to superhigh to "hold" the room.
+    Two speeds only: no step-down guard is involved.
+    """
+    learning = ThermalLearning()
+    _pin_fits(monkeypatch, learning, hvac_mode, {"high": (0.49, 0.0), "superhigh": (0.19, 0.68)})
+    mpc = MPCController(learning=learning, deadband=0.2, min_interval=10, fan_modes=["high", "superhigh"])
+
+    decision = _past_setpoint_cycle(mpc, hvac_mode, past=0.2, current_fan="high", slope=0.0)
+
+    assert decision["mpc_fan_mode"] == "high", decision["mpc_reason"]
+
+
+@pytest.mark.parametrize("hvac_mode", ["heat", "cool"])
+def test_past_the_band_descends_one_rank_per_decision(monkeypatch: pytest.MonkeyPatch, hvac_mode: str) -> None:
+    """Out of the band past the setpoint, the descent goes one rank at a time, never a dive.
+
+    silent/low/med measure 0 degC/h and can't hold the room: diving there from
+    superhigh would only trade a too-warm (heat) / too-cold (cool) room for a
+    climb back later. The blocked drop still has to move one rank -- it used
+    to hold superhigh for an hour while the room drifted 0.6 degC away.
+    """
+    learning = ThermalLearning()
+    _pin_fits(
+        monkeypatch,
+        learning,
+        hvac_mode,
+        {"silent": (0.0, 0.0), "low": (0.0, 0.0), "med": (0.0, 0.0), "high": (0.49, 0.0), "superhigh": (0.87, 0.0)},
+    )
+    mpc = MPCController(learning=learning, deadband=0.2, min_interval=10, fan_modes=INCIDENT_FAN_MODES)
+
+    decision = _past_setpoint_cycle(mpc, hvac_mode, past=0.6, current_fan="superhigh", slope=0.9)
+
+    assert decision["mpc_fan_mode"] == "high", decision["mpc_reason"]
+    assert "Blocked" in decision["mpc_reason"]
+    assert decision["mpc_would_change_now"] == "yes"
+
+    decision = _past_setpoint_cycle(mpc, hvac_mode, past=0.5, current_fan="high", slope=0.4)
+
+    assert decision["mpc_fan_mode"] == "med", decision["mpc_reason"]
+
+
+@pytest.mark.parametrize("hvac_mode", ["heat", "cool"])
+def test_blocked_multi_rank_drop_still_steps_one_rank(monkeypatch: pytest.MonkeyPatch, hvac_mode: str) -> None:
+    """A blocked multi-rank drop becomes a one-rank step, not a hold of the current speed.
+
+    Inside the band the viability guard still applies. When the cheapest
+    allowed speed is the current one (superhigh just under high), the guard
+    used to cancel the move instead of capping it. Costs are pinned so only
+    the selection logic is exercised.
+    """
+    learning = ThermalLearning()
+    _pin_fits(
+        monkeypatch,
+        learning,
+        hvac_mode,
+        {"silent": (0.0, 0.0), "low": (0.0, 0.0), "med": (0.0, 0.0), "high": (0.49, 0.0), "superhigh": (0.87, 0.0)},
+    )
+    mpc = MPCController(learning=learning, deadband=0.2, min_interval=10, fan_modes=INCIDENT_FAN_MODES)
+    costs = {"silent": 1.0, "low": 3.0, "med": 3.0, "high": 5.0, "superhigh": 4.0}
+    simulate = mpc._simulate_mode  # noqa: SLF001
+
+    def _pinned_cost(**kwargs) -> mpc_module.ModeSimulation:
+        """Run the real simulation, then pin its cost and keep the room flat."""
+        sim = simulate(**kwargs)
+        flat = kwargs["current_temp"]
+        return mpc_module.ModeSimulation(sim.fan_mode, costs[sim.fan_mode], flat, flat, sim.known_profile)
+
+    monkeypatch.setattr(mpc, "_simulate_mode", _pinned_cost)
+
+    decision = _past_setpoint_cycle(mpc, hvac_mode, past=0.15, current_fan="superhigh", slope=0.0)
+
+    assert decision["mpc_fan_mode"] == "high", decision["mpc_reason"]
+    assert "Blocked 4-rank drop to silent" in decision["mpc_reason"]
+    assert decision["mpc_would_change_now"] == "yes"
 
 
 # --- Audit 2026-09: exploration and unmeasured speeds ----------------------

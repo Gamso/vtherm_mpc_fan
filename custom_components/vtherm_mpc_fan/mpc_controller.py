@@ -722,7 +722,12 @@ class MPCController:
         # (solar gain, occupancy) instead of the systematic variation of cooling
         # power with the distance to setpoint.
         current_shape = self._gap_shape(active_fan, hvac_mode, current_known_profile)
-        expected_slope_now = self._gap_slope(current_mode_slope, *current_shape, current_error)
+        # Learned profiles as (reference slope, gap shape), for the ladder
+        # envelope: a learned speed is never modelled weaker than a weaker
+        # learned speed at the same comfort error (see _ladder_floor).
+        learned_models = {fm: (monotone_slopes[fm], self._gap_shape(fm, hvac_mode, True)) for fm in fan_modes if fm in monotone_slopes}
+        current_floor = self._ladder_floor(fan_modes, fan_modes.index(active_fan), learned_models) if current_known_profile else ()
+        expected_slope_now = self._enveloped_gap_slope(current_mode_slope, current_shape, current_floor, current_error)
         self._update_disturbance_bias(
             observed_effective_slope=current_effective_slope,
             expected_effective_slope=expected_slope_now,
@@ -824,6 +829,7 @@ class MPCController:
                 mode_slope = self._bound_by_current(mode_slope, fan_modes.index(fan_mode), current_index, current_mode_slope)
             mode_slopes_snapshot[fan_mode] = (mode_slope, known_profile)
             mode_shape = self._gap_shape(fan_mode, hvac_mode, known_profile)
+            mode_floor = self._ladder_floor(fan_modes, fan_modes.index(fan_mode), learned_models) if known_profile else ()
             sim = self._simulate_mode(
                 current_temp=current_temp,
                 target_temp=comfort_target,
@@ -832,6 +838,7 @@ class MPCController:
                 current_effective_slope=current_effective_slope,
                 candidate_mode_slope=mode_slope,
                 candidate_mode_shape=mode_shape,
+                candidate_floor=mode_floor,
                 dead_time=dead_time,
                 candidate_index=fan_modes.index(fan_mode),
                 current_index=current_index,
@@ -878,7 +885,10 @@ class MPCController:
             # speed whose own full profile shows it sustains progress (see
             # MIN_VIABLE_MULTI_RANK_STEPDOWN_SLOPE) -- or to any speed in an
             # Overshoot, a full degree past the setpoint, where losing ground
-            # is the point.
+            # is the point. Deliberately no exception just past the band: a
+            # room a few tenths warm descends one rank per decision (see the
+            # blocked-drop step below), each rank observed before the next,
+            # rather than diving onto a speed that cannot hold it.
             if current_error > 0:
                 return False
             raw_slope = self._learning.get_mode_effective_slope(sim.fan_mode, hvac_mode)
@@ -890,6 +900,9 @@ class MPCController:
         best = min(eligible_simulations, key=lambda item: item.total_cost)
         selection_note = ""
         blocked_note = ""
+        # The simulation whose cost justifies the move: the chosen speed's own,
+        # or the blocked optimum's when the guard reduced the move to one rank.
+        gain_reference = None
 
         if unfiltered_best.fan_mode != best.fan_mode:
             blocked_index = fan_modes.index(unfiltered_best.fan_mode)
@@ -905,7 +918,15 @@ class MPCController:
                 elif blocked_slope is None or self._learning.is_profile_partial(unfiltered_best.fan_mode, hvac_mode):
                     blocked_note = f"Blocked {ranks}-rank drop to {unfiltered_best.fan_mode}: it has no full profile yet, one rank at a time"
                 else:
-                    blocked_note = f"Blocked {ranks}-rank drop to {unfiltered_best.fan_mode}: its own profile ({blocked_slope:.2f}C/h) can't sustain progress"
+                    blocked_note = f"Blocked {ranks}-rank drop to {unfiltered_best.fan_mode}: its own profile ({blocked_slope:.2f}C/h) can't sustain progress, one rank at a time"
+                if fan_modes.index(best.fan_mode) >= current_index:
+                    # The guard caps the step, it does not cancel it: the
+                    # cheapest allowed speed can be the current one (two
+                    # strong speeds nearly tied), which held superhigh an hour
+                    # while every weaker speed was the optimum. Step one rank
+                    # toward the optimum, judged on the optimum's gain.
+                    best = simulations[current_index - 1]
+                    gain_reference = unfiltered_best
 
         if overshoot:
             # The lowest speed the step-down guard lets us reach, not the cost
@@ -934,7 +955,7 @@ class MPCController:
                 candidate_index=best_index,
                 current_index=current_index,
             )
-            actual_gain = current_simulation.total_cost - best.total_cost
+            actual_gain = current_simulation.total_cost - (gain_reference or best).total_cost
             if actual_gain < required_gain:
                 selection_note = f"Hysteresis holds {active_fan}: {best.fan_mode} only improves by {actual_gain:.2f} < {required_gain:.2f}"
                 best = current_simulation
@@ -1294,6 +1315,39 @@ class MPCController:
         return max(min(0.0, reference_slope), modelled)
 
     @staticmethod
+    def _ladder_floor(
+        fan_modes: list[str],
+        index: int,
+        learned_models: dict[str, tuple[float, tuple[float, float, float | None]]],
+    ) -> tuple[tuple[float, tuple[float, float, float | None]], ...]:
+        """Return the models of the learned speeds weaker than ``fan_modes[index]``.
+
+        build_monotone_slopes orders the ladder at the reference error only.
+        Each profile has its own gain, so away from it the lines can cross: a
+        steep strong speed fitted on cold starts (superhigh: 0.19 + 0.68·e)
+        under a flat weaker one (high: 0.49 at every error) was modelled at or
+        past the setpoint as heating *less* than high, and the controller held
+        superhigh while the room climbed 0.6 degC past the setpoint at
+        +0.9 degC/h. Flooring each speed at its weaker neighbours' slope at the
+        same error keeps the order everywhere; a tie then goes to the weaker
+        speed on the rank cost.
+        """
+        return tuple(learned_models[fm] for fm in fan_modes[:index] if fm in learned_models)
+
+    def _enveloped_gap_slope(
+        self,
+        reference_slope: float,
+        shape: tuple[float, float, float | None],
+        floor: tuple[tuple[float, tuple[float, float, float | None]], ...],
+        error: float,
+    ) -> float:
+        """Return the gap slope at *error*, floored at the weaker learned speeds' (see _ladder_floor)."""
+        slope = self._gap_slope(reference_slope, *shape, error)
+        for weaker_slope, weaker_shape in floor:
+            slope = max(slope, self._gap_slope(weaker_slope, *weaker_shape, error))
+        return slope
+
+    @staticmethod
     def detect_phase(minutes_since_change: float, dead_time: float) -> str:
         """Classify the response phase since the last fan change.
 
@@ -1500,6 +1554,7 @@ class MPCController:
         current_effective_slope: float,
         candidate_mode_slope: float,
         candidate_mode_shape: tuple[float, float, float | None] = (0.0, REFERENCE_SLOPE_ERROR, None),
+        candidate_floor: tuple[tuple[float, tuple[float, float, float | None]], ...] = (),
         dead_time: float,
         candidate_index: int,
         current_index: int,
@@ -1515,6 +1570,9 @@ class MPCController:
         decelerate realistically as the room approaches the setpoint instead of
         cooling/heating at a constant rate, eliminating the phantom overshoot that a
         constant-slope model produces past the target.
+
+        ``candidate_floor`` holds the weaker learned speeds' models: at every
+        step the candidate's slope is at least theirs (see _ladder_floor).
         """
         horizon = horizon_minutes if horizon_minutes is not None else self._horizon_minutes
         steps = max(1, int(horizon / SIMULATION_STEP_MINUTES))
@@ -1544,7 +1602,7 @@ class MPCController:
                 target_effective_slope = current_effective_slope
             else:
                 step_error = self._temperature_error(sim_temp, target_temp, hvac_mode)
-                target_effective_slope = self._gap_slope(candidate_mode_slope, *candidate_mode_shape, step_error) + self._disturbance_bias
+                target_effective_slope = self._enveloped_gap_slope(candidate_mode_slope, candidate_mode_shape, candidate_floor, step_error) + self._disturbance_bias
 
             thermal_power += THERMAL_POWER_BLEND * (target_effective_slope - thermal_power)
             raw_slope = -thermal_power if hvac_mode == "cool" else thermal_power
