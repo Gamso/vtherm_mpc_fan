@@ -11,20 +11,22 @@ jobs:
     tests:
         runs-on: ubuntu-latest
         name: Run tests (vtherm_api ${{ matrix.vtherm_api }})
-        # The plugin declares vtherm_api >= 0.4.0 (the version that added the
-        # feature-manager factory registry). requirements_test.txt resolves to
-        # the latest release, so the floor is pinned in a job of its own --
-        # otherwise it would never be exercised.
+        # The supported floor is vtherm_api 0.7.0 (what Versatile Thermostat
+        # 10.6.2 requires). requirements_test.txt resolves to the latest
+        # release, so the floor is pinned in a job of its own -- otherwise it
+        # would never be exercised.
         strategy:
             fail-fast: false
             matrix:
-                vtherm_api: ["latest", "0.4.0"]
+                vtherm_api: ["latest", "0.7.0"]
         steps:
             - name: Check out repository
               uses: actions/checkout@v4
 
-            # Home Assistant >= 2026.3 (the minimum in hacs.json) requires Python
-            # 3.14; on 3.13 the resolver silently falls back to an older core.
+            # Home Assistant 2026.11 (the minimum in hacs.json) requires Python
+            # >= 3.14.2, and so does pytest-homeassistant; "3.14" resolves to the
+            # latest 3.14.x. On 3.13 the resolver silently falls back to an
+            # older core.
             - name: Set up Python
               uses: actions/setup-python@v5
               with:
