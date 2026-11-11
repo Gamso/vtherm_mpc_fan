@@ -70,7 +70,7 @@ def _register_factory(hass: HomeAssistant) -> bool:
     try:
         from vtherm_api.vtherm_api import VThermAPI  # pylint: disable=import-outside-toplevel
     except ImportError:
-        _LOGGER.error("vtherm_api is not available. Install Versatile Thermostat >= 10.2.0, which provides it")
+        _LOGGER.error("vtherm_api is not available. Install Versatile Thermostat >= 10.6.2, which provides it")
         return False
 
     api = VThermAPI.get_vtherm_api(hass)

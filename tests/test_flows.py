@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import entity_registry as er
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant.common import MockConfigEntry
 
 from custom_components.vtherm_mpc_fan.const import (
     CONF_DEADBAND,

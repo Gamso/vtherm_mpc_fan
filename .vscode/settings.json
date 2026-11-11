@@ -15,6 +15,6 @@
     "python.analysis.extraPaths": [
         //    "/home/vscode/core",
         "/workspaces/vtherm_mpc_fan/custom_components/vtherm_mpc_fan",
-        "/home/vscode/.local/lib/python3.13/site-packages/homeassistant"
+        "/home/vscode/.local/lib/python3.14/site-packages/homeassistant"
     ]
 }

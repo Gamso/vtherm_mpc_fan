@@ -3,7 +3,7 @@
 from unittest.mock import MagicMock, PropertyMock
 
 import pytest
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant.common import MockConfigEntry
 
 from custom_components.vtherm_mpc_fan.const import (
     CONF_TARGET_VTHERM,
@@ -102,7 +102,7 @@ async def test_factory_and_manager_satisfy_the_vtherm_api_protocols(integration)
     The contracts are @runtime_checkable Protocols; the plugin inherits from
     none of them, so a member renamed or added on either side would otherwise
     only surface inside VTherm. CI runs this against the declared floor
-    (0.4.0) and the latest release.
+    (0.7.0) and the latest release.
     """
     from vtherm_api.interfaces import (  # pylint: disable=import-outside-toplevel
         InterfaceFeatureManager,
