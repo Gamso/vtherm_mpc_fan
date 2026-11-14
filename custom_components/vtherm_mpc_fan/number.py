@@ -162,6 +162,16 @@ class EffectiveSlopeNumber(NumberEntity):
         """Link the entity to the VTherm MPC Fan device."""
         return DeviceInfo(identifiers={(DOMAIN, self._entry_id)}, name=DEVICE_NAME)
 
+    def bind_manager(self, manager) -> None:
+        """Read from, and persist through, *manager* from now on.
+
+        VTherm builds a new manager on every reload of the thermostat, while
+        this entity outlives it. Without rebinding, an edited slope went into
+        the dropped manager's model, which no controller reads any more.
+        """
+        self._controller = manager.mpc
+        self._on_change = manager.async_save
+
     @property
     def hvac_mode(self) -> str:
         """The HVAC mode this profile belongs to."""

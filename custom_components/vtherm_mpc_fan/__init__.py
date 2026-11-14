@@ -257,8 +257,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def _async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload the entry so changed options reach the manager."""
-    await hass.config_entries.async_reload(entry.entry_id)
+    """Rebuild the manager so changed options reach it: one reload of its VTherm.
+
+    The manager reads the options when it is built, and VTherm builds it, so
+    reloading the target VTherm is all a change needs. Reloading this entry
+    instead reloaded the VTherm twice when it was the only entry -- once on
+    unload (factory gone, manager dropped), once on setup (factory back) --
+    re-sending the thermostat's commands to the unit each time, and took every
+    plugin entity through "unavailable" for nothing. The entities survive the
+    VTherm reload: the new manager rebinds them (see ensure_entities).
+    """
+    await _reload_target_vtherms(hass, entry)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

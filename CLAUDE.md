@@ -80,7 +80,7 @@ Every `evaluate()` return path funnels through `_payload()`, which also logs the
 - `async_write_ha_state()` is called after any state mutation in sensor/number entities (guarded by `if self.hass is not None` when the entity may not be attached to a platform yet, e.g. in unit tests)
 - Config flow uses `vol.Schema` with selectors from `homeassistant.helpers.selector`
 - Entity IDs are built with `build_entity_id()` / `build_scoped_entity_id()` / `build_unique_id()` from `const.py`
-- `hass.data[DOMAIN]` is a rendez-vous registry (`registry.py`), keyed by **VTherm `unique_id`**, not config-entry id: `DATA_MANAGERS` (live managers), `DATA_ADD_ENTITIES` (per-platform `async_add_entities` callbacks), `DATA_ENTITIES` (per-VTherm entity buckets). `clear_registry()` must only be called from `async_unload_entry`, never from `MpcFanFeatureManager.stop_listening()` — see the docstrings on both for why.
+- `hass.data[DOMAIN]` is a rendez-vous registry (`registry.py`), keyed by **VTherm `unique_id`**, not config-entry id: `DATA_MANAGERS` (live managers), `DATA_ADD_ENTITIES` (per-platform `async_add_entities` callbacks), `DATA_ENTITIES` (per-VTherm entity buckets). `clear_registry()` must only be called from `async_unload_entry`, never from `MpcFanFeatureManager.stop_listening()` — see the docstrings on both for why. Entities outlive managers (VTherm builds a new one on every reload of the thermostat): `ensure_entities()` rebinds every bucket entity to the current manager through `bind_manager()`, so an entity must never cache anything else from the manager. An options change reloads only the target VTherm (`_async_update_options`), not the plugin entry.
 
 ## Build & Test
 
