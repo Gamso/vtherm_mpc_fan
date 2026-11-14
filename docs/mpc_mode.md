@@ -27,11 +27,16 @@ control cycle, right after recomputing its regulated setpoint.
 
 1. Read temperature, target, slope, HVAC mode, and current fan mode from the VTherm runtime.
 2. Detect disturbances (defrost and HVAC idle from the underlying climate's own `hvac_action`,
-   window open from VTherm's `hvac_off_reason`).
+   window open from VTherm's `hvac_off_reason` or, for the eco and frost window actions that keep
+   the unit running, its window manager's `is_window_detected`).
 3. Run `MPCController.evaluate(...)` → `mpc_decision` dict.
 4. Resolve the effective fan: `force_fan` override > fixed speed of the HVAC mode > MPC.
-5. Compute phase (DEAD_TIME / TRANSIENT / ESTABLISHED) with the dead time of the current HVAC mode.
-6. Collect learning data (slope samples, response events) with gating — `heat`/`cool` only.
+5. Compute phase (DEAD_TIME / TRANSIENT / ESTABLISHED) with the dead time of the current HVAC mode,
+   counted from the start of the regime: the last fan change, the manager's first cycle (a restart
+   or reload) or the entry into the HVAC mode, whichever is latest.
+6. Collect learning data (slope samples, response events) with gating — `heat`/`cool` only, never
+   when VTherm has no slope yet. Each new sample or event schedules a save of the model within
+   5 minutes (flushed when Home Assistant stops).
 7. Append MPC information to the CSV log.
 8. Push the decision to the sensors (`update_from_mpc()`) and to the VTherm's `mpc_fan` attribute.
 9. Apply the effective fan when it differs from the current one; the MPC recommendation is
@@ -323,7 +328,11 @@ The CSV log also stores the MPC recommendation so we can replay and compare deci
 
 Current files involved:
 
-- `custom_components/vtherm_mpc_fan/mpc_controller.py`: MPC thermal model and cost-based scorer
+- `custom_components/vtherm_mpc_fan/mpc_controller.py`: MPC thermal model and cost-based scorer.
+  `evaluate()` runs the decision as named steps sharing two dataclasses (`_Cycle`, what the cycle
+  established; `_Selection`, the choice being refined): `_prepare_cycle`, the shortcut payloads
+  (disturbed, setpoint boost, setpoint drop), `_simulate_candidates`, `_apply_rank_guards`,
+  `_apply_change_gates`, `_apply_exploration`, `_apply_cold_start`, `_decision_payload`
 - `custom_components/vtherm_mpc_fan/thermal_learning.py`: slope samples, response events, profile calibration
 - `custom_components/vtherm_mpc_fan/manager.py`: the VTherm feature manager — control cycle, disturbance detection, learning collection, fixed-speed pin
 - `custom_components/vtherm_mpc_fan/__init__.py`: integration setup, factory registration, services

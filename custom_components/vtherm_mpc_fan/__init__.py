@@ -294,7 +294,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     data = domain_data(hass)
     data.pop(entry.entry_id, None)
 
-    remaining = [key for key in data if not key.startswith(("factory_", "managers", "add_entities", "entities"))]
+    remaining = [key for key in data if not key.startswith(("factory_", "managers", "add_entities", "entities", "stores"))]
     if not remaining:
         _unregister_factory(hass)
         for service in (

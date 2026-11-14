@@ -282,7 +282,7 @@ This is read from the underlying climate's own `hvac_action` (`idle` or `off`, o
 
 ### Window-Open Detection
 
-Also read straight from VTherm: when VTherm itself has stopped the underlying because a window is open (`hvac_off_reason == "hvac_off_window_detection"`), the MPC pauses (`Disturbed`) and learning is excluded — no separate configuration.
+Also read straight from VTherm: when VTherm reports an open window — it stopped the underlying (`hvac_off_reason == "hvac_off_window_detection"`), or, with the eco or frost-protection window action that keeps the unit running, its window manager detects one (sensor or auto-detection, not bypassed) — the MPC pauses (`Disturbed`) and learning is excluded — no separate configuration.
 
 ### HVAC Modes
 
@@ -308,6 +308,8 @@ The plugin includes an **automatic learning system** that builds the thermal mod
 - Temperature slope, comfort error, regulation offset and active fan mode
 - Time from a fan speed change to the room's first move in the expected direction (thermal response time)
 - HVAC mode (heat/cool), for per-mode profiling
+
+Learning waits for an established regime, counted from the last fan change — or from the plugin's first cycle after a restart or reload, or from the switch into heat/cool, whichever is later. The model is saved within 5 minutes of each new sample (and when Home Assistant stops), not only on fan changes.
 
 > **Note**: the `effective_timeout` diagnostic (`max(min_interval, dead_time × 1.5)` once the dead time is trusted — see [Dead Time Calibration](#dead-time-calibration)) is exposed as a sensor for insight into the learned thermal lag, but it does not gate control decisions — the minimum interval between fan changes does.
 
