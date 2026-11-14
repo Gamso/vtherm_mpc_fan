@@ -35,6 +35,18 @@ class _SmartFanEntity(SensorEntity):
     """
 
     _attr_has_entity_name = True
+    #: The controller a learning sensor reads; None for the payload-fed ones.
+    _controller = None
+
+    def bind_manager(self, manager) -> None:
+        """Read from *manager* from now on.
+
+        VTherm builds a new manager on every reload of the thermostat, while
+        these entities outlive it. Without rebinding, the learning sensors kept
+        reading the dropped manager's frozen model.
+        """
+        if self._controller is not None:
+            self._controller = manager.mpc
 
     def __init__(self, entry_id: str, climate_entity: str, object_key: str) -> None:
         super().__init__()

@@ -265,3 +265,21 @@ async def test_reset_learning_clears_and_persists(integration, reload_spy) -> No
 
     assert manager.learning.slope_sample_count() == 0
     manager.async_save.assert_awaited_once()
+
+
+async def test_changing_the_options_reloads_the_vtherm_once(integration, reload_spy) -> None:
+    """An options change rebuilds the manager through one VTherm reload, not an entry reload.
+
+    Reloading the entry reloaded the VTherm twice when it was the only entry
+    (once on unload, once on setup) and took every plugin entity through
+    "unavailable".
+    """
+    hass = integration
+    _vtherm_entry(hass, "vtherm-a")
+    entry = await _setup(hass)
+    reload_spy.reset_mock()
+
+    hass.config_entries.async_update_entry(entry, options={"deadband": 0.3})
+    await hass.async_block_till_done()
+
+    reload_spy.assert_awaited_once_with("vtherm-a")
