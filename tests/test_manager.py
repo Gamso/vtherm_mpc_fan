@@ -1086,3 +1086,31 @@ async def test_every_fan_change_is_an_event_line_in_the_vtherm_log(caplog) -> No
 
     assert changed is True
     assert "MpcFanManager-Living room - ---------------------> NEW EVENT: fan mode low -> " in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_manager_rebuilt_by_a_vtherm_reload_takes_over_the_existing_entities() -> None:
+    """VTherm builds a new manager on each reload; the plugin's entities outlive the old one.
+
+    They kept reading the dropped manager's model (frozen learning counters),
+    and an edited slope was written into it and saved through it.
+    """
+    from custom_components.vtherm_mpc_fan.registry import add_entities_registry, entity_bucket
+
+    hass = _make_hass()
+    callbacks = {"sensor": MagicMock(), "number": MagicMock(), "entry_id": "entry-1"}
+    add_entities_registry(hass)["vtherm-uid"] = callbacks
+    first = await _build_manager(hass=hass)
+    MpcFanFeatureManager.ensure_entities(first)
+
+    second = await _build_manager(hass=hass)
+    MpcFanFeatureManager.ensure_entities(second)
+
+    bucket = entity_bucket(hass, "vtherm-uid")
+    assert bucket["sensors"]["learning"]._controller is second.mpc  # noqa: SLF001
+    number = bucket["profiles"][("cool", "low")]
+    assert number._controller is second.mpc  # noqa: SLF001
+    assert number._on_change == second.async_save  # noqa: SLF001
+    # Taken over, not duplicated.
+    assert callbacks["sensor"].call_count == 1
+    assert callbacks["number"].call_count == 1

@@ -289,8 +289,16 @@ class MpcFanFeatureManager:
         one arriving before the other must not block the other from ever
         being built.
         """
+        if self._mpc is None:
+            return
+        # Entities built by a previous manager of this VTherm (before a VTherm
+        # reload) are still registered with Home Assistant: point them here.
+        bucket = entity_bucket(self._hass, self._vtherm.unique_id)
+        for entity in (*bucket["sensors"].values(), *bucket["profiles"].values()):
+            entity.bind_manager(self)
+
         registry = add_entities_registry(self._hass).get(self._vtherm.unique_id)
-        if not registry or self._mpc is None:
+        if not registry:
             return
 
         for platform, build in (
