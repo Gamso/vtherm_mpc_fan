@@ -328,7 +328,11 @@ The CSV log also stores the MPC recommendation so we can replay and compare deci
 
 Current files involved:
 
-- `custom_components/vtherm_mpc_fan/mpc_controller.py`: MPC thermal model and cost-based scorer
+- `custom_components/vtherm_mpc_fan/mpc_controller.py`: MPC thermal model and cost-based scorer.
+  `evaluate()` runs the decision as named steps sharing two dataclasses (`_Cycle`, what the cycle
+  established; `_Selection`, the choice being refined): `_prepare_cycle`, the shortcut payloads
+  (disturbed, setpoint boost, setpoint drop), `_simulate_candidates`, `_apply_rank_guards`,
+  `_apply_change_gates`, `_apply_exploration`, `_apply_cold_start`, `_decision_payload`
 - `custom_components/vtherm_mpc_fan/thermal_learning.py`: slope samples, response events, profile calibration
 - `custom_components/vtherm_mpc_fan/manager.py`: the VTherm feature manager — control cycle, disturbance detection, learning collection, fixed-speed pin
 - `custom_components/vtherm_mpc_fan/__init__.py`: integration setup, factory registration, services

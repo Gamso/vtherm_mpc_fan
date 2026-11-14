@@ -320,6 +320,63 @@ class ModeSimulation:
     known_profile: bool
 
 
+@dataclass(slots=True)
+class _Cycle:
+    """What one evaluate() call has established before any speed is compared.
+
+    Built once by ``MPCController._prepare_cycle`` and only read afterwards.
+    ``current_error`` is the comfort error against the user's setpoint
+    (positive = short), ``error_growth`` its growth since the last fan change,
+    and ``change_allowed`` whether the min interval (raised by the learning
+    hold) has elapsed, before the exceptions the change gates may grant.
+    """
+
+    current_temp: float
+    comfort_target: float
+    hvac_mode: str
+    fan_modes: list[str]
+    active_fan: str
+    current_index: int
+    current_effective_slope: float
+    current_mode_slope: float
+    current_error: float
+    minutes_since_change: float
+    dead_time: float
+    phase: str
+    monotone_slopes: dict[str, float]
+    learned_models: dict[str, tuple[float, tuple[float, float, float | None]]]
+    error_growth: float
+    escalation: bool
+    effective_min_interval: float
+    learning_hold: bool
+    probe_abandoned: bool
+    change_allowed: bool
+
+
+@dataclass(slots=True)
+class _Selection:
+    """The speed being chosen and why, refined by each selection step in turn.
+
+    ``slopes`` maps each speed to the ``(slope, known_profile)`` it was
+    simulated with; ``gain_reference`` is the simulation whose cost justifies a
+    move the rank guards reduced to one rank (the blocked optimum).
+    """
+
+    simulations: list[ModeSimulation]
+    slopes: dict[str, tuple[float, bool]]
+    known_profiles: int
+    worst_spread: float
+    current: ModeSimulation
+    best: ModeSimulation
+    overshoot: bool
+    change_allowed: bool
+    gain_reference: ModeSimulation | None = None
+    blocked_note: str = ""
+    selection_note: str = ""
+    exploration_note: str = ""
+    cold_start: bool = False
+
+
 class MPCController:
     """Background-only learned model + MPC-lite scaffold."""
 
@@ -632,6 +689,19 @@ class MPCController:
         (0.6 degC below the user's in median on the production trace while the
         strongest speed ran), and regulating the fan on it chased that drift.
         When ``user_target_temp`` is None, ``target_temp`` is used for both.
+
+        The decision is made in steps, each a method of its own:
+
+        1. :meth:`_prepare_cycle` -- errors, dead time, gates, bias update;
+        2. the shortcuts that skip the optimisation: a disturbance
+           (:meth:`_disturbed_payload`), a setpoint boost
+           (:meth:`_boost_payload`), a setpoint drop (:meth:`_setpoint_drop_payload`);
+        3. :meth:`_simulate_candidates` -- every speed over the horizon;
+        4. :meth:`_apply_rank_guards` -- which moves the ladder allows;
+        5. :meth:`_apply_change_gates` -- min interval, hysteresis, step-down hold;
+        6. :meth:`_apply_exploration` -- measurement under load, probe;
+        7. :meth:`_apply_cold_start` -- the step law while nothing is learned;
+        8. :meth:`_decision_payload` -- status, reason, payload.
         """
         _LOGGER.debug(
             "MPC evaluate: hvac=%s current_temp=%.2f target=%.2f user_target=%s slope=%.3f current_fan=%s minutes_since_change=%.1f window_open=%s",
@@ -670,6 +740,71 @@ class MPCController:
                 would_change_now="no",
             )
 
+        cycle = self._prepare_cycle(
+            current_temp=current_temp,
+            comfort_target=comfort_target,
+            regulation_offset=regulation_offset,
+            vtherm_slope=vtherm_slope,
+            hvac_mode=hvac_mode,
+            fan_modes=fan_modes,
+            current_fan=current_fan,
+            minutes_since_change=minutes_since_change,
+            is_window_open=is_window_open,
+            is_defrost_active=is_defrost_active,
+            is_hvac_idle=is_hvac_idle,
+        )
+
+        if is_window_open or is_defrost_active or is_hvac_idle:
+            return self._disturbed_payload(cycle, is_window_open=is_window_open, is_defrost_active=is_defrost_active)
+
+        if self._setpoint_boost_active and cycle.current_error <= self._deadband:
+            self._setpoint_boost_active = False
+        if self._setpoint_boost_active:
+            return self._boost_payload(cycle)
+
+        # Setpoint drop: when the user moves the setpoint far away (e.g. night
+        # setpoint), there is no point running the full MPC cost optimisation --
+        # the answer is always the lowest mode. Only a genuine move of the user's
+        # setpoint qualifies (see _track_setpoint). A room that is merely past
+        # the setpoint by as much, with no setpoint change, is an Overshoot: it
+        # runs the normal selection, restricted to the lowest speed the guards
+        # allow, and starts no learning cooldown.
+        overshoot = False
+        if cycle.current_error < THRESHOLD_TARGET_DROP:
+            overshoot = not self._setpoint_drop_active
+        else:
+            self._setpoint_drop_active = False
+        if cycle.current_error < THRESHOLD_TARGET_DROP and not overshoot:
+            return self._setpoint_drop_payload(cycle)
+
+        selection = self._simulate_candidates(cycle, overshoot)
+        self._apply_rank_guards(cycle, selection)
+        self._apply_change_gates(cycle, selection)
+        self._apply_exploration(cycle, selection)
+        self._apply_cold_start(cycle, selection)
+        return self._decision_payload(cycle, selection)
+
+    def _prepare_cycle(
+        self,
+        *,
+        current_temp: float,
+        comfort_target: float,
+        regulation_offset: float | None,
+        vtherm_slope: float,
+        hvac_mode: str,
+        fan_modes: list[str],
+        current_fan: str | None,
+        minutes_since_change: float,
+        is_window_open: bool,
+        is_defrost_active: bool,
+        is_hvac_idle: bool,
+    ) -> _Cycle:
+        """Establish what the cycle knows before any speed is compared.
+
+        Updates the controller's own memory on the way, in this order: the
+        setpoint tracker, the exploration probe, the escalation baseline and
+        counter, and the disturbance bias.
+        """
         active_fan = current_fan if current_fan in fan_modes else fan_modes[0]
         observed_slope = self._bounded_slope(vtherm_slope)
         current_effective_slope = -observed_slope if hvac_mode == "cool" else observed_slope
@@ -700,8 +835,8 @@ class MPCController:
             self._error_at_lock_start = current_error
             self._growth_breaches = 0
             self._last_breach_minutes = None
-        error_growth_since_change = current_error - self._error_at_lock_start
-        escalation = self._escalation_confirmed(error_growth_since_change, current_error, minutes_since_change)
+        error_growth = current_error - self._error_at_lock_start
+        escalation = self._escalation_confirmed(error_growth, current_error, minutes_since_change)
         effective_min_interval = self._effective_min_interval(dead_time, hvac_mode)
         learning_hold_minutes = gate_dead_time * MIN_ESTABLISHED_RATIO + LEARNING_HOLD_EXTRA_MINUTES
         probe_abandoned = self._active_probe == (active_fan, hvac_mode) and current_error > self._deadband + self.sensor_resolution
@@ -713,13 +848,10 @@ class MPCController:
             minutes_since_change=minutes_since_change,
             learning_hold_minutes=learning_hold_minutes,
             current_error=current_error,
-            error_growth_since_change=error_growth_since_change,
+            error_growth_since_change=error_growth,
         )
         if learning_hold:
             effective_min_interval = max(effective_min_interval, learning_hold_minutes)
-        # An abandoned probe may climb back at once: the room left the band
-        # because of a speed chosen for its information, not for comfort.
-        change_allowed = probe_abandoned or minutes_since_change >= effective_min_interval
         phase = self.detect_phase(minutes_since_change, gate_dead_time)
         monotone_slopes = self.build_monotone_slopes(
             fan_modes,
@@ -757,115 +889,126 @@ class MPCController:
             is_defrost_active=is_defrost_active,
             is_hvac_idle=is_hvac_idle,
         )
+        return _Cycle(
+            current_temp=current_temp,
+            comfort_target=comfort_target,
+            hvac_mode=hvac_mode,
+            fan_modes=fan_modes,
+            active_fan=active_fan,
+            current_index=fan_modes.index(active_fan),
+            current_effective_slope=current_effective_slope,
+            current_mode_slope=current_mode_slope,
+            current_error=current_error,
+            minutes_since_change=minutes_since_change,
+            dead_time=dead_time,
+            phase=phase,
+            monotone_slopes=monotone_slopes,
+            learned_models=learned_models,
+            error_growth=error_growth,
+            escalation=escalation,
+            effective_min_interval=effective_min_interval,
+            learning_hold=learning_hold,
+            probe_abandoned=probe_abandoned,
+            # An abandoned probe may climb back at once: the room left the band
+            # because of a speed chosen for its information, not for comfort.
+            change_allowed=probe_abandoned or minutes_since_change >= effective_min_interval,
+        )
 
-        if is_window_open or is_defrost_active or is_hvac_idle:
-            if is_window_open:
-                reason = "Window open detected: MPC paused"
-            elif is_defrost_active:
-                reason = "Defrost active: MPC paused"
-            else:
-                reason = "HVAC idle: compressor off, MPC paused"
-            return self._payload(
-                status="Disturbed",
-                fan_mode=active_fan,
-                reason=reason,
-                would_change_now="no",
-                dead_time=dead_time,
-                known_profiles=self._count_known_profiles(fan_modes, hvac_mode),
-                disturbance_bias=self._disturbance_bias,
-            )
+    def _shortcut_payload(self, cycle: _Cycle, *, status: str, fan_mode: str, reason: str) -> dict:
+        """Return the payload of a decision taken without the optimisation."""
+        return self._payload(
+            status=status,
+            fan_mode=fan_mode,
+            reason=reason,
+            would_change_now="yes" if status != "Disturbed" and cycle.active_fan != fan_mode else "no",
+            dead_time=cycle.dead_time,
+            known_profiles=self._count_known_profiles(cycle.fan_modes, cycle.hvac_mode),
+            disturbance_bias=self._disturbance_bias,
+        )
 
-        if self._setpoint_boost_active and current_error <= self._deadband:
-            self._setpoint_boost_active = False
-        if self._setpoint_boost_active:
-            strongest_fan = fan_modes[-1]
-            return self._payload(
-                status="Setpoint boost",
-                fan_mode=strongest_fan,
-                reason=f"Setpoint boost: the setpoint asks for more, {current_error:.1f}°C short, strongest speed until within the band",
-                would_change_now="yes" if active_fan != strongest_fan else "no",
-                dead_time=dead_time,
-                known_profiles=self._count_known_profiles(fan_modes, hvac_mode),
-                disturbance_bias=self._disturbance_bias,
-            )
-
-        # Setpoint drop: when the user moves the setpoint far away (e.g. night
-        # setpoint), there is no point running the full MPC cost optimisation --
-        # the answer is always the lowest mode. Only a genuine move of the user's
-        # setpoint qualifies (see _track_setpoint). A room that is merely past
-        # the setpoint by as much, with no setpoint change, is an Overshoot: it
-        # runs the normal selection, restricted to the lowest speed the guards
-        # allow, and starts no learning cooldown.
-        overshoot = False
-        if current_error < THRESHOLD_TARGET_DROP:
-            overshoot = not self._setpoint_drop_active
+    def _disturbed_payload(self, cycle: _Cycle, *, is_window_open: bool, is_defrost_active: bool) -> dict:
+        """Hold the current speed: a window, a defrost or an idle unit makes the room unreadable."""
+        if is_window_open:
+            reason = "Window open detected: MPC paused"
+        elif is_defrost_active:
+            reason = "Defrost active: MPC paused"
         else:
-            self._setpoint_drop_active = False
-        if current_error < THRESHOLD_TARGET_DROP and not overshoot:
-            lowest_fan = fan_modes[0]
-            would_change = "yes" if active_fan != lowest_fan else "no"
-            return self._payload(
-                status="Setpoint drop",
-                fan_mode=lowest_fan,
-                reason=f"Setpoint drop: setpoint moved away ({current_error:.1f}°C), minimum speed",
-                would_change_now=would_change,
-                dead_time=dead_time,
-                known_profiles=self._count_known_profiles(fan_modes, hvac_mode),
-                disturbance_bias=self._disturbance_bias,
-            )
+            reason = "HVAC idle: compressor off, MPC paused"
+        return self._shortcut_payload(cycle, status="Disturbed", fan_mode=cycle.active_fan, reason=reason)
 
+    def _boost_payload(self, cycle: _Cycle) -> dict:
+        """The strongest speed until back within the band (see SETPOINT_BOOST_DEMAND)."""
+        return self._shortcut_payload(
+            cycle,
+            status="Setpoint boost",
+            fan_mode=cycle.fan_modes[-1],
+            reason=f"Setpoint boost: the setpoint asks for more, {cycle.current_error:.1f}°C short, strongest speed until within the band",
+        )
+
+    def _setpoint_drop_payload(self, cycle: _Cycle) -> dict:
+        """The lowest speed after a genuine move of the setpoint away from the demand."""
+        return self._shortcut_payload(
+            cycle,
+            status="Setpoint drop",
+            fan_mode=cycle.fan_modes[0],
+            reason=f"Setpoint drop: setpoint moved away ({cycle.current_error:.1f}°C), minimum speed",
+        )
+
+    def _simulate_candidates(self, cycle: _Cycle, overshoot: bool) -> _Selection:
+        """Simulate every speed over the horizon and start the selection on the current one."""
+        fan_modes = cycle.fan_modes
+        hvac_mode = cycle.hvac_mode
         simulations: list[ModeSimulation] = []
         known_profiles = 0
         worst_spread = 0.0
-        current_index = fan_modes.index(active_fan)
 
-        # Monotone-enforced slope map (built above, before the current mode's own
-        # slope was resolved): higher fan modes are never assigned a lower slope
-        # than lower modes. Modes without a learned profile are absent and fall
-        # back to an estimate anchored on their nearest learned neighbour.
+        # Monotone-enforced slope map (built in _prepare_cycle, before the current
+        # mode's own slope was resolved): higher fan modes are never assigned a
+        # lower slope than lower modes. Modes without a learned profile are absent
+        # and fall back to an estimate anchored on their nearest learned neighbour.
         _LOGGER.debug(
             "MPC %s profiles: fan_mode_order=%s effective_slopes_used=%s",
             hvac_mode,
             fan_modes,
-            {mode: round(slope, 3) for mode, slope in monotone_slopes.items()},
+            {mode: round(slope, 3) for mode, slope in cycle.monotone_slopes.items()},
         )
 
         # Ensure the horizon is at least dead_time + base_horizon so that
         # any mode changes are simulated for at least a full default horizon (e.g. 30 minutes)
         # of their actual candidate slope, preventing the "dead-time blindness".
-        sim_horizon = max(self._horizon_minutes, int(dead_time) + self._horizon_minutes)
+        sim_horizon = max(self._horizon_minutes, int(cycle.dead_time) + self._horizon_minutes)
 
         mode_slopes_snapshot: dict[str, tuple[float, bool]] = {}
         for fan_mode in fan_modes:
             mode_slope, known_profile = self._get_mode_slope(
                 fan_mode,
                 hvac_mode,
-                active_fan,
-                current_effective_slope,
+                cycle.active_fan,
+                cycle.current_effective_slope,
                 fan_modes,
-                monotone_slopes,
+                cycle.monotone_slopes,
             )
-            if not known_profile and fan_mode != active_fan:
-                mode_slope = self._bound_by_current(mode_slope, fan_modes.index(fan_mode), current_index, current_mode_slope)
+            if not known_profile and fan_mode != cycle.active_fan:
+                mode_slope = self._bound_by_current(mode_slope, fan_modes.index(fan_mode), cycle.current_index, cycle.current_mode_slope)
             mode_slopes_snapshot[fan_mode] = (mode_slope, known_profile)
             mode_shape = self._gap_shape(fan_mode, hvac_mode, known_profile)
-            mode_floor = self._ladder_floor(fan_modes, fan_modes.index(fan_mode), learned_models) if known_profile else ()
+            mode_floor = self._ladder_floor(fan_modes, fan_modes.index(fan_mode), cycle.learned_models) if known_profile else ()
             sim = self._simulate_mode(
-                current_temp=current_temp,
-                target_temp=comfort_target,
+                current_temp=cycle.current_temp,
+                target_temp=cycle.comfort_target,
                 hvac_mode=hvac_mode,
                 candidate_fan=fan_mode,
-                current_effective_slope=current_effective_slope,
+                current_effective_slope=cycle.current_effective_slope,
                 candidate_mode_slope=mode_slope,
                 candidate_mode_shape=mode_shape,
                 candidate_floor=mode_floor,
-                dead_time=dead_time,
+                dead_time=cycle.dead_time,
                 candidate_index=fan_modes.index(fan_mode),
-                current_index=current_index,
+                current_index=cycle.current_index,
                 known_profile=known_profile,
                 horizon_minutes=sim_horizon,
             )
-            if self._exploration_ucb and abs(current_error) <= self._deadband:
+            if self._exploration_ucb and abs(cycle.current_error) <= self._deadband:
                 measured_intervals = self._learning.get_mode_measured_minutes(fan_mode, hvac_mode) / SAMPLE_INTERVAL_MINUTES
                 sim.total_cost -= INFO_BONUS / math.sqrt(1.0 + measured_intervals)
             simulations.append(sim)
@@ -876,168 +1019,203 @@ class MPCController:
                     worst_spread = max(worst_spread, spread)
 
         self._last_mode_slopes = {"hvac_mode": hvac_mode, "slopes": mode_slopes_snapshot}
+        current_simulation = next(sim for sim in simulations if sim.fan_mode == cycle.active_fan)
+        return _Selection(
+            simulations=simulations,
+            slopes=mode_slopes_snapshot,
+            known_profiles=known_profiles,
+            worst_spread=worst_spread,
+            current=current_simulation,
+            best=current_simulation,
+            overshoot=overshoot,
+            change_allowed=cycle.change_allowed,
+        )
 
-        current_simulation = next(sim for sim in simulations if sim.fan_mode == active_fan)
-        unfiltered_best = min(simulations, key=lambda item: item.total_cost)
-
-        def _skipped_unmeasured_rung(candidate_index: int) -> str | None:
-            """Return the first viable-looking, unmeasured rung a climb would skip."""
-            if candidate_index <= current_index + 1:
-                return None
-            if current_error > self.out_of_band_error or escalation:
-                return None
-            for rung in fan_modes[current_index + 1 : candidate_index]:
-                rung_slope, _ = mode_slopes_snapshot[rung]
-                if rung_slope > 0 and not self._learning.has_measured_profile(rung, hvac_mode):
-                    return rung
+    def _skipped_unmeasured_rung(self, cycle: _Cycle, selection: _Selection, candidate_index: int) -> str | None:
+        """Return the first viable-looking, unmeasured rung a climb to *candidate_index* would skip."""
+        if candidate_index <= cycle.current_index + 1:
             return None
+        if cycle.current_error > self.out_of_band_error or cycle.escalation:
+            return None
+        for rung in cycle.fan_modes[cycle.current_index + 1 : candidate_index]:
+            rung_slope, _ = selection.slopes[rung]
+            if rung_slope > 0 and not self._learning.has_measured_profile(rung, cycle.hvac_mode):
+                return rung
+        return None
 
-        def _rank_move_capable(sim: ModeSimulation) -> bool:
-            candidate_index = fan_modes.index(sim.fan_mode)
-            if candidate_index >= current_index:
-                # Upward: never skip an intermediate speed that has not been
-                # measured yet and looks able to do the job -- see
-                # MULTI_RANK_JUMP_ERROR.
-                return _skipped_unmeasured_rung(candidate_index) is None
-            if current_index - candidate_index <= 1:
-                return True
-            # Short of the setpoint: one rank at a time. Otherwise only to a
-            # speed whose own full profile shows it sustains progress (see
-            # MIN_VIABLE_MULTI_RANK_STEPDOWN_SLOPE) -- or to any speed in an
-            # Overshoot, a full degree past the setpoint, where losing ground
-            # is the point. Deliberately no exception just past the band: a
-            # room a few tenths warm descends one rank per decision (see the
-            # blocked-drop step below), each rank observed before the next,
-            # rather than diving onto a speed that cannot hold it.
-            if current_error > 0:
-                return False
-            raw_slope = self._learning.get_mode_effective_slope(sim.fan_mode, hvac_mode)
-            if raw_slope is None or self._learning.is_profile_partial(sim.fan_mode, hvac_mode):
-                return overshoot
-            return raw_slope > MIN_VIABLE_MULTI_RANK_STEPDOWN_SLOPE
+    def _rank_move_capable(self, cycle: _Cycle, selection: _Selection, sim: ModeSimulation) -> bool:
+        """True when the ladder guards allow moving from the current speed to *sim*'s."""
+        candidate_index = cycle.fan_modes.index(sim.fan_mode)
+        if candidate_index >= cycle.current_index:
+            # Upward: never skip an intermediate speed that has not been
+            # measured yet and looks able to do the job -- see
+            # MULTI_RANK_JUMP_ERROR.
+            return self._skipped_unmeasured_rung(cycle, selection, candidate_index) is None
+        if cycle.current_index - candidate_index <= 1:
+            return True
+        # Short of the setpoint: one rank at a time. Otherwise only to a
+        # speed whose own full profile shows it sustains progress (see
+        # MIN_VIABLE_MULTI_RANK_STEPDOWN_SLOPE) -- or to any speed in an
+        # Overshoot, a full degree past the setpoint, where losing ground
+        # is the point. Deliberately no exception just past the band: a
+        # room a few tenths warm descends one rank per decision (see the
+        # blocked-drop step in _apply_rank_guards), each rank observed
+        # before the next, rather than diving onto a speed that cannot hold it.
+        if cycle.current_error > 0:
+            return False
+        raw_slope = self._learning.get_mode_effective_slope(sim.fan_mode, cycle.hvac_mode)
+        if raw_slope is None or self._learning.is_profile_partial(sim.fan_mode, cycle.hvac_mode):
+            return selection.overshoot
+        return raw_slope > MIN_VIABLE_MULTI_RANK_STEPDOWN_SLOPE
 
-        eligible_simulations = [sim for sim in simulations if _rank_move_capable(sim)]
-        best = min(eligible_simulations, key=lambda item: item.total_cost)
-        selection_note = ""
-        blocked_note = ""
-        # The simulation whose cost justifies the move: the chosen speed's own,
-        # or the blocked optimum's when the guard reduced the move to one rank.
-        gain_reference = None
+    def _apply_rank_guards(self, cycle: _Cycle, selection: _Selection) -> None:
+        """Pick the cheapest speed the ladder guards allow; in an Overshoot, the lowest one."""
+        fan_modes = cycle.fan_modes
+        current_index = cycle.current_index
+        unfiltered_best = min(selection.simulations, key=lambda item: item.total_cost)
+        eligible_simulations = [sim for sim in selection.simulations if self._rank_move_capable(cycle, selection, sim)]
+        selection.best = min(eligible_simulations, key=lambda item: item.total_cost)
 
-        if unfiltered_best.fan_mode != best.fan_mode:
+        if unfiltered_best.fan_mode != selection.best.fan_mode:
             blocked_index = fan_modes.index(unfiltered_best.fan_mode)
             if blocked_index > current_index:
                 ranks = blocked_index - current_index
-                rung = _skipped_unmeasured_rung(blocked_index)
-                blocked_note = f"Blocked {ranks}-rank jump to {unfiltered_best.fan_mode}: {rung} has no measured profile yet and must be tried first"
+                rung = self._skipped_unmeasured_rung(cycle, selection, blocked_index)
+                selection.blocked_note = f"Blocked {ranks}-rank jump to {unfiltered_best.fan_mode}: {rung} has no measured profile yet and must be tried first"
             else:
                 ranks = current_index - blocked_index
-                blocked_slope = self._learning.get_mode_effective_slope(unfiltered_best.fan_mode, hvac_mode)
-                if current_error > 0:
-                    blocked_note = f"Blocked {ranks}-rank drop to {unfiltered_best.fan_mode}: short of the setpoint, one rank at a time"
-                elif blocked_slope is None or self._learning.is_profile_partial(unfiltered_best.fan_mode, hvac_mode):
-                    blocked_note = f"Blocked {ranks}-rank drop to {unfiltered_best.fan_mode}: it has no full profile yet, one rank at a time"
+                blocked_slope = self._learning.get_mode_effective_slope(unfiltered_best.fan_mode, cycle.hvac_mode)
+                if cycle.current_error > 0:
+                    selection.blocked_note = f"Blocked {ranks}-rank drop to {unfiltered_best.fan_mode}: short of the setpoint, one rank at a time"
+                elif blocked_slope is None or self._learning.is_profile_partial(unfiltered_best.fan_mode, cycle.hvac_mode):
+                    selection.blocked_note = f"Blocked {ranks}-rank drop to {unfiltered_best.fan_mode}: it has no full profile yet, one rank at a time"
                 else:
-                    blocked_note = f"Blocked {ranks}-rank drop to {unfiltered_best.fan_mode}: its own profile ({blocked_slope:.2f}C/h) can't sustain progress, one rank at a time"
-                if fan_modes.index(best.fan_mode) >= current_index:
+                    selection.blocked_note = (
+                        f"Blocked {ranks}-rank drop to {unfiltered_best.fan_mode}: its own profile ({blocked_slope:.2f}C/h) can't sustain progress, one rank at a time"
+                    )
+                if fan_modes.index(selection.best.fan_mode) >= current_index:
                     # The guard caps the step, it does not cancel it: the
                     # cheapest allowed speed can be the current one (two
                     # strong speeds nearly tied), which held superhigh an hour
                     # while every weaker speed was the optimum. Step one rank
                     # toward the optimum, judged on the optimum's gain.
-                    best = simulations[current_index - 1]
-                    gain_reference = unfiltered_best
+                    selection.best = selection.simulations[current_index - 1]
+                    selection.gain_reference = unfiltered_best
 
-        if overshoot:
+        if selection.overshoot:
             # The lowest speed the step-down guard lets us reach, not the cost
             # optimum: the room is a full degree past the setpoint already.
-            best = min(eligible_simulations, key=lambda item: fan_modes.index(item.fan_mode))
+            selection.best = min(eligible_simulations, key=lambda item: fan_modes.index(item.fan_mode))
 
-        if not change_allowed and best.fan_mode != active_fan:
-            best_index = fan_modes.index(best.fan_mode)
-            if best_index > current_index and self._demand_raised:
+    def _apply_change_gates(self, cycle: _Cycle, selection: _Selection) -> None:
+        """Hold the current speed unless the min interval, the hysteresis and the step-down hold let it go.
+
+        The min interval yields to a setpoint that raised the demand and to a
+        confirmed escalation, both upward only.
+        """
+        best = selection.best
+        if best.fan_mode == cycle.active_fan:
+            return
+        best_index = cycle.fan_modes.index(best.fan_mode)
+        if not selection.change_allowed:
+            if best_index > cycle.current_index and self._demand_raised:
                 # The user asked for more: the min interval protects the
                 # measurement of the last change, not a decision made for a
                 # setpoint that no longer exists.
-                selection_note = f"Setpoint raised the demand by {self._demand_raised:.1f}C: {best.fan_mode} bypasses the min interval"
-                change_allowed = True
-            elif best_index > current_index and escalation:
-                selection_note = f"Emergency escalation to {best.fan_mode}: comfort error worsened by {error_growth_since_change:.2f}C since the change bypasses the min interval"
-                change_allowed = True
-            else:
-                selection_note = f"Min interval holds {active_fan} until a change is allowed"
-                best = current_simulation
-        elif change_allowed and best.fan_mode != active_fan and not overshoot:
-            best_index = fan_modes.index(best.fan_mode)
-            required_gain = self._required_switch_gain(
-                current_error=current_error,
-                phase=phase,
-                candidate_index=best_index,
-                current_index=current_index,
-            )
-            actual_gain = current_simulation.total_cost - (gain_reference or best).total_cost
-            if actual_gain < required_gain:
-                selection_note = f"Hysteresis holds {active_fan}: {best.fan_mode} only improves by {actual_gain:.2f} < {required_gain:.2f}"
-                best = current_simulation
-            else:
-                hold_note = self._step_down_hold_note(
-                    candidate=best,
-                    active_fan=active_fan,
-                    hvac_mode=hvac_mode,
-                    target_temp=comfort_target,
-                    current_error=current_error,
-                    candidate_index=best_index,
-                    current_index=current_index,
-                    phase=phase,
+                selection.selection_note = f"Setpoint raised the demand by {self._demand_raised:.1f}C: {best.fan_mode} bypasses the min interval"
+                selection.change_allowed = True
+            elif best_index > cycle.current_index and cycle.escalation:
+                selection.selection_note = (
+                    f"Emergency escalation to {best.fan_mode}: comfort error worsened by {cycle.error_growth:.2f}C since the change bypasses the min interval"
                 )
-                if hold_note:
-                    selection_note = hold_note
-                    best = current_simulation
+                selection.change_allowed = True
+            else:
+                selection.selection_note = f"Min interval holds {cycle.active_fan} until a change is allowed"
+                selection.best = selection.current
+            return
+        if selection.overshoot:
+            return
+        required_gain = self._required_switch_gain(
+            current_error=cycle.current_error,
+            phase=cycle.phase,
+            candidate_index=best_index,
+            current_index=cycle.current_index,
+        )
+        actual_gain = selection.current.total_cost - (selection.gain_reference or best).total_cost
+        if actual_gain < required_gain:
+            selection.selection_note = f"Hysteresis holds {cycle.active_fan}: {best.fan_mode} only improves by {actual_gain:.2f} < {required_gain:.2f}"
+            selection.best = selection.current
+            return
+        hold_note = self._step_down_hold_note(
+            candidate=best,
+            active_fan=cycle.active_fan,
+            hvac_mode=cycle.hvac_mode,
+            target_temp=cycle.comfort_target,
+            current_error=cycle.current_error,
+            candidate_index=best_index,
+            current_index=cycle.current_index,
+            phase=cycle.phase,
+        )
+        if hold_note:
+            selection.selection_note = hold_note
+            selection.best = selection.current
 
-        exploration_note = ""
-        best_index = fan_modes.index(best.fan_mode)
+    def _apply_exploration(self, cycle: _Cycle, selection: _Selection) -> None:
+        """Measure an unmeasured rung on the way up (S3), or probe one rank down (S1)."""
+        fan_modes = cycle.fan_modes
+        hvac_mode = cycle.hvac_mode
+        best_index = fan_modes.index(selection.best.fan_mode)
         # A climb that is not a recovery (escalation, > MULTI_RANK_JUMP_ERROR, overshoot).
-        ordinary_climb = change_allowed and best_index > current_index and not (escalation or overshoot or current_error > MULTI_RANK_JUMP_ERROR)
+        ordinary_climb = (
+            selection.change_allowed and best_index > cycle.current_index and not (cycle.escalation or selection.overshoot or cycle.current_error > MULTI_RANK_JUMP_ERROR)
+        )
         if self._exploration_under_load and ordinary_climb:
-            for rung in fan_modes[current_index + 1 : best_index]:
-                rung_slope, rung_known = mode_slopes_snapshot[rung]
-                rung_progress = self._gap_slope(rung_slope, *self._gap_shape(rung, hvac_mode, rung_known), current_error)
+            for rung in fan_modes[cycle.current_index + 1 : best_index]:
+                rung_slope, rung_known = selection.slopes[rung]
+                rung_progress = self._gap_slope(rung_slope, *self._gap_shape(rung, hvac_mode, rung_known), cycle.current_error)
                 if self._learning.has_measured_profile(rung, hvac_mode) or rung_progress + self._disturbance_bias <= 0:
                     continue
-                best = next(sim for sim in simulations if sim.fan_mode == rung)
-                exploration_note = f"Measuring {rung} under load on the way to {fan_modes[best_index]}"
+                selection.best = next(sim for sim in selection.simulations if sim.fan_mode == rung)
+                selection.exploration_note = f"Measuring {rung} under load on the way to {fan_modes[best_index]}"
                 break
         if (
             self._exploration_probe
-            and change_allowed
-            and best.fan_mode == active_fan
-            and not overshoot
-            and (probe := self._probe_candidate(fan_modes, current_index, hvac_mode, current_error, phase)) is not None
+            and selection.change_allowed
+            and selection.best.fan_mode == cycle.active_fan
+            and not selection.overshoot
+            and (probe := self._probe_candidate(fan_modes, cycle.current_index, hvac_mode, cycle.current_error, cycle.phase)) is not None
         ):
-            best = next(sim for sim in simulations if sim.fan_mode == probe)
+            selection.best = next(sim for sim in selection.simulations if sim.fan_mode == probe)
             self._learning.record_probe(probe, hvac_mode)
             self._active_probe = (probe, hvac_mode)
-            exploration_note = f"Exploration probe: trying {probe}, which has no measured profile, while the room holds"
-        if probe_abandoned:
-            exploration_note = f"Exploration probe abandoned: {current_error:.2f}C short of the setpoint"
+            selection.exploration_note = f"Exploration probe: trying {probe}, which has no measured profile, while the room holds"
+        if cycle.probe_abandoned:
+            selection.exploration_note = f"Exploration probe abandoned: {cycle.current_error:.2f}C short of the setpoint"
 
-        cold_start = known_profiles == 0 and not overshoot
-        if cold_start:
-            law_fan = self._step_law_fan(fan_modes, current_index, current_error)
-            selection_note = ""
-            exploration_note = ""
-            if law_fan != active_fan and not change_allowed and not (fan_modes.index(law_fan) > current_index and escalation):
-                selection_note = f"Min interval holds {active_fan} until a change is allowed"
-                law_fan = active_fan
-            elif law_fan != active_fan:
-                change_allowed = True
-            best = next(sim for sim in simulations if sim.fan_mode == law_fan)
-            blocked_note = ""
+    def _apply_cold_start(self, cycle: _Cycle, selection: _Selection) -> None:
+        """Replace the choice by the step law while no speed of the HVAC mode has a profile."""
+        selection.cold_start = selection.known_profiles == 0 and not selection.overshoot
+        if not selection.cold_start:
+            return
+        active_fan = cycle.active_fan
+        law_fan = self._step_law_fan(cycle.fan_modes, cycle.current_index, cycle.current_error)
+        selection.selection_note = ""
+        selection.exploration_note = ""
+        if law_fan != active_fan and not selection.change_allowed and not (cycle.fan_modes.index(law_fan) > cycle.current_index and cycle.escalation):
+            selection.selection_note = f"Min interval holds {active_fan} until a change is allowed"
+            law_fan = active_fan
+        elif law_fan != active_fan:
+            selection.change_allowed = True
+        selection.best = next(sim for sim in selection.simulations if sim.fan_mode == law_fan)
+        selection.blocked_note = ""
 
-        confidence = self._compute_confidence(known_profiles, len(fan_modes), phase, worst_spread)
-        would_change_now = "yes" if change_allowed and best.fan_mode != active_fan else "no"
+    def _decision_payload(self, cycle: _Cycle, selection: _Selection) -> dict:
+        """Return the payload of an optimised decision: status, reason and predictions."""
+        best = selection.best
+        confidence = self._compute_confidence(selection.known_profiles, len(cycle.fan_modes), cycle.phase, selection.worst_spread)
+        would_change_now = "yes" if selection.change_allowed and best.fan_mode != cycle.active_fan else "no"
         status = "Ready" if confidence >= 0.5 else "Low confidence"
-        if overshoot:
+        if selection.overshoot:
             status = "Overshoot"
         _LOGGER.debug(
             "MPC candidates: %s",
@@ -1049,30 +1227,28 @@ class MPCController:
                     round(sim.predicted_temp_30m, 2),
                     sim.known_profile,
                 )
-                for sim in simulations
+                for sim in selection.simulations
             ],
         )
+        current_error = cycle.current_error
         reason = f"MPC recommends {best.fan_mode}: cost={best.total_cost:.2f}, T+10={best.predicted_temp_10m:.2f}C, T+30={best.predicted_temp_30m:.2f}C"
-        if cold_start:
+        if selection.cold_start:
             reason = f"Cold start: no profile yet, step law on the comfort error ({current_error:+.2f}C) gives {best.fan_mode}"
-        if overshoot:
+        if selection.overshoot:
             reason = f"Overshoot: {-current_error:.1f}C past the setpoint without a setpoint change, lowest allowed speed | {reason}"
-        if blocked_note:
-            reason += f" | {blocked_note}"
-        if selection_note:
-            reason += f" | {selection_note}"
-        if exploration_note:
-            reason += f" | {exploration_note}"
+        for note in (selection.blocked_note, selection.selection_note, selection.exploration_note):
+            if note:
+                reason += f" | {note}"
         # Surface capacity saturation: strongest fan selected yet still well short
         # of target means the HVAC system is capacity-bound, not a control issue.
-        if best.fan_mode == fan_modes[-1] and current_error > self._deadband:
+        if best.fan_mode == cycle.fan_modes[-1] and current_error > self._deadband:
             reason += f" | Saturated: max fan, {current_error:.1f}C from target (capacity-bound)"
         if abs(self._disturbance_bias) >= 0.05:
             reason += f" | Bias={self._disturbance_bias:+.2f}C/h"
-        if not change_allowed:
-            reason += f" | Min interval active ({minutes_since_change:.1f}/{effective_min_interval:.1f} min)"
-            if learning_hold:
-                reason += f" | Learning hold: {active_fan} has no measured profile yet"
+        if not selection.change_allowed:
+            reason += f" | Min interval active ({cycle.minutes_since_change:.1f}/{cycle.effective_min_interval:.1f} min)"
+            if cycle.learning_hold:
+                reason += f" | Learning hold: {cycle.active_fan} has no measured profile yet"
 
         return self._payload(
             status=status,
@@ -1083,8 +1259,8 @@ class MPCController:
             cost=best.total_cost,
             confidence=confidence * 100.0,
             would_change_now=would_change_now,
-            dead_time=dead_time,
-            known_profiles=known_profiles,
+            dead_time=cycle.dead_time,
+            known_profiles=selection.known_profiles,
             disturbance_bias=self._disturbance_bias,
         )
 

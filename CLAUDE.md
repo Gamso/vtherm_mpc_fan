@@ -124,6 +124,7 @@ Tests that need a real Home Assistant core (setup/unload, services, flows) reque
 ## Important Constraints
 
 - **Avoid over-engineering**: only add code that directly addresses the requirement
+- **Function size is enforced**: pylint's `too-many-branches` (12) and `too-many-statements` (50) are on in `.pylintrc`. `MPCController.evaluate()` is a sequence of steps over `_Cycle` / `_Selection` (see `docs/mpc_mode.md`, Implementation Map): a new rule goes into the step it belongs to, or a new step, not back into `evaluate()`
 - **No second-order slope terms**: VTherm slope is already EMA-smoothed; parabolic projection amplifies noise
 - **Learning data integrity**: exclude window-open, defrost, hvac-idle, setpoint-drop cooldown (30 min), and insufficiently-stable periods (< 1.5× dead_time, the same `detect_phase()` the MPC uses, counted from `_regime_start`: the last fan change, the manager's first cycle or the entry into the HVAC mode, whichever is latest) from slope samples; a `None` VTherm slope is never a sample. Do **not** filter near-zero slopes: a speed holding the room produces them, and they measure its intercept
 - **Exploration is a control concern**: a speed that is never measured is never credible on cost and never chosen, so the controller must create the observations (learning hold, climb guard, exploration probe) — no estimator can synthesise them. A fan change made outside the plugin restarts the dead time like one of ours (`_register_fan_change`)
