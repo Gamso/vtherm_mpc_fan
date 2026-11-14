@@ -19,6 +19,7 @@ from .const import (
     DATA_ADD_ENTITIES,
     DATA_ENTITIES,
     DATA_MANAGERS,
+    DATA_STORES,
     DOMAIN,
     VTHERM_AUTO_FAN_NONE,
     VTHERM_CONF_AUTO_FAN_MODE,
@@ -37,6 +38,15 @@ def domain_data(hass: HomeAssistant) -> dict[str, Any]:
 def managers(hass: HomeAssistant) -> dict[str, "MpcFanFeatureManager"]:
     """Return the live managers keyed by VTherm unique_id."""
     return domain_data(hass).setdefault(DATA_MANAGERS, {})
+
+
+def stores(hass: HomeAssistant) -> dict[str, Any]:
+    """Return the learning-data ``Store`` objects by storage key.
+
+    Kept for the whole Home Assistant run, across VTherm reloads: see
+    ``MpcFanFeatureManager._async_ensure_loaded``.
+    """
+    return domain_data(hass).setdefault(DATA_STORES, {})
 
 
 def get_manager(hass: HomeAssistant, unique_id: str) -> "MpcFanFeatureManager | None":

@@ -2226,3 +2226,28 @@ def test_the_profile_summary_exposes_its_uncertainty() -> None:
     profiles = learning.get_mode_profiles("cool", ["low", "high"])
     assert 0 < profiles["high"]["slope_sigma"] < 0.1
     assert profiles["low"]["slope_sigma"] == pytest.approx(0.3)
+
+
+def test_a_burst_of_calls_does_not_clamp_the_observed_slope() -> None:
+    """VTherm runs a cycle on every sensor event: calls seconds apart are not minutes of silence.
+
+    Each call used to count as cycle_minutes without a new reading, so seven
+    calls within seven seconds bounded a -1.5 degC/h slope to -0.4 as if the
+    reading had not moved for half an hour.
+    """
+    mpc = _build_mpc(ThermalLearning())
+    t0 = 1_000_000.0
+    for second in range(7):
+        mpc.evaluate(current_temp=24.0, target_temp=23.5, vtherm_slope=-1.5, hvac_mode="cool", current_fan="medium", minutes_since_change=30.0, now=t0 + second)
+
+    assert mpc._bounded_slope(-1.5) == pytest.approx(-1.5)  # noqa: SLF001
+
+
+def test_a_reading_unchanged_on_the_clock_still_bounds_the_slope() -> None:
+    """Half an hour without a new reading bounds the slope to one sensor step per 30 minutes."""
+    mpc = _build_mpc(ThermalLearning())
+    t0 = 1_000_000.0
+    for minute in (0, 30):
+        mpc.evaluate(current_temp=24.0, target_temp=23.5, vtherm_slope=-1.5, hvac_mode="cool", current_fan="medium", minutes_since_change=30.0, now=t0 + minute * 60)
+
+    assert mpc._bounded_slope(-1.5) == pytest.approx(-mpc.sensor_resolution * 2.0)  # noqa: SLF001

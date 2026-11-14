@@ -361,8 +361,10 @@ class MPCController:
         # Sensor-resolution detector: non-zero changes between consecutive readings.
         self._last_reading: float | None = None
         self._reading_steps: deque[float] = deque(maxlen=SENSOR_RESOLUTION_WINDOW)
-        # Minutes the reading has not changed (see _bounded_slope).
+        # Minutes the reading has not changed (see _bounded_slope), and when it
+        # last changed (epoch seconds) when evaluate() is given the time.
         self._unchanged_minutes = 0.0
+        self._reading_since: float | None = None
         # Setpoint-drop detection works on the *user's* setpoint, cycle to cycle
         # (see _track_setpoint): the comfort setpoint and HVAC mode seen last,
         # and whether a genuine drop is still being followed.
@@ -497,15 +499,29 @@ class MPCController:
         """
         return self._deadband + 0.5 * self.sensor_resolution
 
-    def _observe_reading(self, current_temp: float) -> None:
-        """Feed the sensor-resolution detector with this cycle's temperature."""
+    def _observe_reading(self, current_temp: float, now: float | None = None) -> None:
+        """Feed the sensor-resolution detector with this cycle's temperature.
+
+        With *now* (epoch seconds) the time the reading has been unchanged is
+        measured on the clock: VTherm runs a cycle on every room and outdoor
+        sensor event and the force_fan service runs one at once, so counting
+        cycle_minutes per call made a burst of calls look like half an hour of
+        silence and clamped the observed slope. Without it (offline benches
+        driving evaluate() once per simulated cycle), each call counts as one
+        control cycle.
+        """
         if self._last_reading is not None:
             step = round(abs(current_temp - self._last_reading), 3)
             if step > 0.001:
                 self._reading_steps.append(step)
                 self._unchanged_minutes = 0.0
-            else:
+                self._reading_since = now
+            elif now is None:
                 self._unchanged_minutes += self._cycle_minutes
+            elif self._reading_since is not None:
+                self._unchanged_minutes = max(0.0, (now - self._reading_since) / 60.0)
+        else:
+            self._reading_since = now
         self._last_reading = current_temp
 
     def _bounded_slope(self, vtherm_slope: float) -> float:
@@ -601,8 +617,12 @@ class MPCController:
         is_hvac_idle: bool = False,
         minutes_since_change: float = 0.0,
         user_target_temp: float | None = None,
+        now: float | None = None,
     ) -> dict:
         """Evaluate the best fan mode for the current cycle.
+
+        ``now`` (epoch seconds) is the time of this call; the feature manager
+        passes it, see _observe_reading for why.
 
         ``target_temp`` is the setpoint VTherm sends to the underlying (its
         ``regulated_target_temperature``) and ``user_target_temp`` the user's own
@@ -626,7 +646,7 @@ class MPCController:
         )
         comfort_target = user_target_temp if user_target_temp is not None else target_temp
         regulation_offset = (target_temp - user_target_temp) if user_target_temp is not None else None
-        self._observe_reading(current_temp)
+        self._observe_reading(current_temp, now)
         self._cycle_extras = {"regulation_offset": regulation_offset, "sensor_resolution": self.sensor_resolution}
 
         # Only heat/cool have a defined comfort-error direction and learned profiles.

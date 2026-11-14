@@ -298,12 +298,16 @@ async def test_repeated_slope_readings_are_not_learned_twice() -> None:
 
 @pytest.mark.asyncio
 async def test_a_held_regime_yields_one_sample_per_interval_with_its_dwell() -> None:
-    """An unchanged reading over 20 minutes of established regime gives samples at 0, 10, 20 min."""
+    """An unchanged reading over 20 minutes of established regime gives samples at 0, 10, 20 min.
+
+    The regime starts at the manager's first cycle and is established 1.5 x the
+    default 10-minute dead time later, at minute 15: samples at 15, 25 and 35.
+    """
     runtime = _make_runtime(last_temperature_slope=-0.3)
     manager = await _build_manager(runtime, hass=_hass_with_auto_fan("vtherm-uid"))
     t0 = 2_000_000.0
 
-    for minute in range(0, 25, 5):
+    for minute in range(0, 40, 5):
         with patch("time.time", return_value=t0 + minute * 60):
             await manager.refresh_state()
 
@@ -694,12 +698,13 @@ async def test_slope_samples_wait_for_the_learned_dead_time() -> None:
     manager = await _build_manager(runtime, hass=_hass_with_auto_fan("vtherm-uid"))
     for _ in range(20):
         manager.learning.add_response_event(24.0, "cool")
+    await manager.refresh_state()  # the manager's first cycle starts a regime of its own
 
-    manager._last_change_time = time.time() - 20 * 60  # noqa: SLF001
+    manager._register_fan_change(time.time() - 20 * 60)  # noqa: SLF001
     await manager.refresh_state()
     assert manager.learning.slope_sample_count() == 0
 
-    manager._last_change_time = time.time() - 40 * 60  # noqa: SLF001  (>= 1.5 x 24)
+    manager._register_fan_change(time.time() - 40 * 60)  # noqa: SLF001  (>= 1.5 x 24)
     await manager.refresh_state()
     assert manager.learning.slope_sample_count() == 1
 
@@ -996,8 +1001,12 @@ async def test_an_overshoot_without_a_setpoint_change_starts_no_cooldown() -> No
 @pytest.mark.asyncio
 async def test_learning_samples_carry_the_comfort_error_and_the_offset() -> None:
     """Samples are taken against the user's setpoint and keep the regulation offset."""
+    import time
+
     runtime = _make_runtime(vtherm_hvac_mode="cool", current_temperature=24.3, target_temperature=24.0, regulated_target_temperature=23.4)
     manager = await _build_manager(runtime, hass=_hass_with_auto_fan("vtherm-uid"))
+    await manager.refresh_state()  # the manager's first cycle starts a regime of its own
+    manager._register_fan_change(time.time() - 60 * 60)  # noqa: SLF001  an established regime
 
     await manager.refresh_state()
 
@@ -1086,3 +1095,111 @@ async def test_every_fan_change_is_an_event_line_in_the_vtherm_log(caplog) -> No
 
     assert changed is True
     assert "MpcFanManager-Living room - ---------------------> NEW EVENT: fan mode low -> " in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_no_sample_is_learned_right_after_a_restart() -> None:
+    """A fresh manager does not know when the fan last changed: its first cycle starts a regime.
+
+    The time since the last change used to read as infinite after a restart or
+    reload, so the very first cycle was classified ESTABLISHED and sampled.
+    """
+    runtime = _make_runtime(last_temperature_slope=-0.3)
+    manager = await _build_manager(runtime, hass=_hass_with_auto_fan("vtherm-uid"))
+    t0 = 2_000_000.0
+
+    for minute in (0, 5, 10):
+        with patch("time.time", return_value=t0 + minute * 60):
+            await manager.refresh_state()
+    assert manager.learning.slope_sample_count() == 0
+
+    with patch("time.time", return_value=t0 + 15 * 60):
+        await manager.refresh_state()
+    assert manager.learning.slope_sample_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_switching_the_unit_on_starts_a_new_regime() -> None:
+    """off -> cool is a transient, whatever the fan did while the unit was off."""
+    runtime = _make_runtime(vtherm_hvac_mode="off", last_temperature_slope=0.6)
+    manager = await _build_manager(runtime, hass=_hass_with_auto_fan("vtherm-uid"))
+    t0 = 2_000_000.0
+    for minute in range(0, 60, 5):
+        with patch("time.time", return_value=t0 + minute * 60):
+            await manager.refresh_state()
+
+    runtime.vtherm_hvac_mode = "cool"
+    for minute in (60, 65, 70):
+        with patch("time.time", return_value=t0 + minute * 60):
+            await manager.refresh_state()
+
+    assert manager.learning.slope_sample_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_a_missing_vtherm_slope_is_never_learned() -> None:
+    """VTherm exposes no slope until its window algorithm has readings: 0.0 is a stand-in, not a measurement."""
+    import time
+
+    runtime = _make_runtime(last_temperature_slope=None)
+    manager = await _build_manager(runtime, hass=_hass_with_auto_fan("vtherm-uid"))
+    await manager.refresh_state()
+    manager._register_fan_change(time.time() - 60 * 60)  # noqa: SLF001  an established regime
+
+    await manager.refresh_state()
+    assert manager.learning.slope_sample_count() == 0
+
+    runtime.last_temperature_slope = -0.3
+    await manager.refresh_state()
+    assert manager.learning.slope_sample_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_every_learned_sample_schedules_a_save() -> None:
+    """Samples gathered during a long hold must reach the store without waiting for a fan change."""
+    import time
+
+    manager = await _build_manager(_make_runtime(last_temperature_slope=-0.3), hass=_hass_with_auto_fan("vtherm-uid"))
+    await manager.refresh_state()
+    manager._register_fan_change(time.time() - 60 * 60)  # noqa: SLF001  an established regime
+
+    await manager.refresh_state()
+
+    assert manager.learning.slope_sample_count() == 1
+    manager._store.async_delay_save.assert_called()  # noqa: SLF001
+    assert manager._store.async_delay_save.call_args.args[0]()["slope_samples"]  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_a_rebuilt_manager_reuses_the_store_of_its_predecessor() -> None:
+    """A VTherm reload rebuilds the manager: it must load what the previous one may not have flushed yet."""
+    hass = _make_hass()
+    first = await _build_manager(hass=hass)
+    second = await _build_manager(hass=hass)
+
+    assert second._store is first._store  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_an_open_window_with_an_eco_action_pauses_the_mpc() -> None:
+    """With the eco or frost action VTherm keeps the unit running: the off-reason stays empty."""
+    runtime = _make_runtime(hvac_off_reason=None)
+    runtime.window_manager.is_window_detected = True
+    manager = await _build_manager(runtime)
+
+    await manager.refresh_state()
+
+    assert manager.last_decision["mpc_status"] == "Disturbed"
+    runtime.async_set_underlying_fan_mode.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_closed_or_bypassed_window_does_not_pause_the_mpc() -> None:
+    """is_window_detected is False when closed or bypassed; a runtime without it reads as closed."""
+    runtime = _make_runtime(hvac_off_reason=None)
+    runtime.window_manager.is_window_detected = False
+    manager = await _build_manager(runtime)
+
+    assert manager._is_window_open() is False  # noqa: SLF001
+    del runtime.window_manager
+    assert manager._is_window_open() is False  # noqa: SLF001

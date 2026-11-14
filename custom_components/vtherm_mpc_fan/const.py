@@ -39,6 +39,7 @@ DATA_FACTORY_REGISTERED = "factory_registered"
 DATA_MANAGERS = "managers"
 DATA_ADD_ENTITIES = "add_entities"
 DATA_ENTITIES = "entities"
+DATA_STORES = "stores"
 
 # VTherm reports this reason when it stopped the underlying because a window opened.
 HVAC_OFF_REASON_WINDOW = "hvac_off_window_detection"
