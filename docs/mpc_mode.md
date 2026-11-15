@@ -149,6 +149,12 @@ effective_slope(error) = a + b * error      (b clamped to >= 0)
 - **Robust fit**: `b` is the weighted median of the pairwise slopes (Theil–Sen; at most
   `THEIL_SEN_MAX_POINTS` samples, evenly spread in time), `a` the weighted median of `y − b·x`;
   legacy samples weigh `LEGACY_SAMPLE_WEIGHT`.
+- **Error bins**: in both medians (and in `b_pool`), the samples of one comfort-error bin
+  (`ERROR_BIN_WIDTH`, 0.25 °C) weigh at most `ERROR_BIN_MAX_SAMPLES` (6) together
+  (`balance_by_error`). A speed that holds the room adds one ~0 °C/h sample per 10 min at the same
+  error; uncapped, 7 h of holding outvoted the samples taken far from the setpoint and a speed
+  measured at 3 °C/h one degree away was reported at 0. `n_eff`, R² and the uncertainty still count
+  every sample.
 - **Autocorrelation and shrinkage**: `n_eff = Σw / (1 + 2ρ)`, ρ the lag-1 autocorrelation of the
   residuals within a run of samples; `b ← (n_eff·b + GAIN_PRIOR_SAMPLES·b_pool) / (n_eff +
   GAIN_PRIOR_SAMPLES)`, `b_pool` the within-speed Theil–Sen gain pooled over the HVAC mode's speeds.
