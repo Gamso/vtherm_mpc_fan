@@ -472,3 +472,23 @@ def test_a_thin_profile_gain_is_shrunk_toward_the_pooled_gain() -> None:
 
     _, gain = learning.get_mode_slope_model("low", "heat")
     assert 0.3 < gain < 2.0
+
+
+def test_hours_of_holding_do_not_erase_the_capacity_measured_far_from_the_setpoint() -> None:
+    """A speed parked at the setpoint keeps the slope it showed one degree away.
+
+    Production, 2026-11-14: heat/superhigh held the room for 7 h, one sample per
+    10 min at an error of 0-0.2 degC and ~0 degC/h. They were 75% of the profile,
+    so the pairs between two of them set the Theil-Sen gain to 0 and the median
+    intercept followed: 0 degC/h reported "at 1 degC", against the ~3 degC/h of
+    every sample taken past 0.4 degC. The ladder collapsed with it and the
+    controller stayed on the strongest speed.
+    """
+    learning = ThermalLearning()
+    for error, slope, count in [(0.0, 0.0, 70), (0.2, 0.0, 45), (0.4, 3.0, 5), (0.6, 3.2, 8), (0.8, 3.1, 5), (1.0, 3.0, 4)]:
+        for _ in range(count):
+            learning.add_slope_sample("superhigh", slope, error, hvac_mode="heat")
+
+    assert learning.get_mode_effective_slope("superhigh", "heat") > 1.5
+    # The holding samples still pull the modelled slope down near the setpoint.
+    assert learning.get_mode_effective_slope_at("superhigh", "heat", 0.0) < learning.get_mode_effective_slope("superhigh", "heat") - 1.0

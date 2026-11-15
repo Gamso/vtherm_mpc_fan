@@ -72,6 +72,17 @@ GAIN_PRIOR_SAMPLES = 10.0
 # O(n^2), so at most THEIL_SEN_MAX_POINTS samples, evenly spread in time, enter
 # the estimator; every sample still enters the effective sample size.
 THEIL_SEN_MAX_POINTS = 150
+# A speed that holds the room produces one sample per SAMPLE_INTERVAL_MINUTES,
+# all at the same comfort error and all near 0 degC/h: hours of holding outvoted
+# the few samples taken far from the setpoint, in the median of the pairwise
+# slopes as in the median of the intercepts, and a speed measured at 3 degC/h
+# one degree away was reported at 0. In the estimators of the line, the samples
+# of one error bin (ERROR_BIN_WIDTH wide) therefore weigh at most
+# ERROR_BIN_MAX_SAMPLES together: past that, more of the same error says
+# nothing new about how the slope varies with it. A sparse bin keeps its
+# weight, so a lone contaminated sample still cannot drag the fit.
+ERROR_BIN_WIDTH = 0.25  # degC
+ERROR_BIN_MAX_SAMPLES = float(MIN_MEASURED_PROFILE_SAMPLES)
 # Uncertainty assumed for a profile the user seeded by hand (degC/h): a guess,
 # not a measurement.
 SEEDED_SLOPE_SIGMA = 0.3
@@ -210,6 +221,19 @@ def weighted_theil_sen(points: list[tuple[float, float, float]]) -> tuple[float,
     slope = weighted_median(slopes, weights)
     intercept = weighted_median([y - slope * x for x, y, _ in points], [w for _, _, w in points])
     return intercept, slope
+
+
+def balance_by_error(points: list[tuple[float, float, float]]) -> list[tuple[float, float, float]]:
+    """Return ``(x, y, w)`` points with each error bin's total weight capped.
+
+    The points of a bin whose weights add up to more than ERROR_BIN_MAX_SAMPLES
+    are scaled down together to that total (see ERROR_BIN_WIDTH); the others
+    are returned unchanged.
+    """
+    totals: Counter = Counter()
+    for x, _, w in points:
+        totals[round(x / ERROR_BIN_WIDTH)] += w
+    return [(x, y, w * min(1.0, ERROR_BIN_MAX_SAMPLES / totals[round(x / ERROR_BIN_WIDTH)])) for x, y, w in points]
 
 
 def thin_evenly(items: list, limit: int) -> list:
@@ -673,7 +697,10 @@ class ThermalLearning:
 
         total = sum(w for _, _, w in points)
         error_max = max(x for x, _, _ in points)
-        robust = weighted_theil_sen(thin_evenly(points, THEIL_SEN_MAX_POINTS))
+        # The line's estimators read the points with each error bin capped; the
+        # sample size, the fit quality and the uncertainty keep every sample.
+        balanced = balance_by_error(points)
+        robust = weighted_theil_sen(balance_by_error(thin_evenly(points, THEIL_SEN_MAX_POINTS)))
         if robust is None:
             # All samples taken at (nearly) the same error: no slope can be fitted.
             median_y = weighted_median([y for _, y, _ in points], [w for _, _, w in points])
@@ -694,7 +721,7 @@ class ThermalLearning:
         gain_b = max(0.0, gain_b)
         pooled = self._pooled_gain(hvac_mode)
         gain_b = (n_eff * gain_b + GAIN_PRIOR_SAMPLES * pooled) / (n_eff + GAIN_PRIOR_SAMPLES)
-        intercept_a = weighted_median([y - gain_b * x for x, y, _ in points], [w for _, _, w in points])
+        intercept_a = weighted_median([y - gain_b * x for x, y, _ in balanced], [w for _, _, w in balanced])
 
         # Coefficient of determination against the (clamped, shrunk) fitted line.
         mean_y = sum(w * y for _, y, w in points) / total
@@ -778,7 +805,7 @@ class ThermalLearning:
         slopes: list[float] = []
         weights: list[float] = []
         for points in by_fan.values():
-            thinned = thin_evenly(points, THEIL_SEN_MAX_POINTS)
+            thinned = balance_by_error(thin_evenly(points, THEIL_SEN_MAX_POINTS))
             for index, (x_i, y_i, w_i) in enumerate(thinned):
                 for x_j, y_j, w_j in thinned[index + 1 :]:
                     if abs(x_j - x_i) >= 1e-6:
