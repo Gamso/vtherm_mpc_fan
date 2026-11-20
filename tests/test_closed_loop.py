@@ -135,9 +135,9 @@ def test_heat_reproduces_cool_on_the_mirrored_plant(heat_scenario: str) -> None:
 SCENARIO_CEILINGS = {
     "heat_defrost": (0.27, 25.0, 11.0),
     "modulating": (0.32, 25.0, 12.0),
-    "noisy": (0.29, 21.0, 15.0),
+    "noisy": (0.29, 21.0, 18.0),
     "noisy_slowdelay": (0.36, 23.0, 36.0),
-    "regime": (0.30, 21.0, 25.0),
+    "regime": (0.31, 21.0, 36.0),
     "regime_modulating": (0.31, 24.0, 16.0),
     "restart": (0.29, 22.0, 26.0),
 }

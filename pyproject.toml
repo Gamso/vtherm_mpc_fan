@@ -6,3 +6,9 @@ line-length = 180
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 pythonpath = ["."]
+# Home Assistant aliases httpx to httpx2 on import and refuses to if httpx is
+# already loaded. respx (a dependency of pytest-homeassistant, unused here)
+# ships a pytest plugin that imports httpx; pytest loads plugins in the order
+# the distributions are found on disk, which varies with the runner, so the
+# test session crashed at start-up on some CI machines only.
+addopts = "-p no:respx"
