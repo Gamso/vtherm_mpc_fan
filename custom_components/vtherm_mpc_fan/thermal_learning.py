@@ -65,22 +65,30 @@ MIN_AUTOCORRELATION_PAIRS = 5
 # cannot then invent a steep gain from a few autocorrelated points.
 GAIN_PRIOR_SAMPLES = 10.0
 
-# The line is fitted by a weighted Theil-Sen estimator (weighted median of the
-# pairwise slopes, then weighted median of the intercepts): a few contaminated
-# samples (a door opened, a transient mislabelled established) cannot drag it,
-# where least squares followed any three outliers out of fifteen. Pairs are
-# O(n^2), so at most THEIL_SEN_MAX_POINTS samples, evenly spread in time, enter
-# the estimator; every sample still enters the effective sample size.
+# The slope a speed shows against the comfort error is closer to a step than to
+# a line on a self-regulating unit: ~0 degC/h while it holds the room, its full
+# capacity a few tenths of a degree away. And a holding speed adds one sample
+# per SAMPLE_INTERVAL_MINUTES, so the holding samples are always the majority:
+# any estimator voting over all the samples (Theil-Sen until 1.3.1, with each
+# error bin capped in 1.3.1) reported the holding slope "at 1 degC" as soon as
+# the far samples were few -- 0.12 degC/h for a speed measured at 2-3 degC/h on
+# its 10 samples past 0.5 degC, against 125 at the setpoint.
+# The line is therefore a *resistant line*: it joins the weighted medians of the
+# samples in the lower and in the upper half of the measured error envelope.
+# Each half speaks for itself whatever its population, and inside a half the
+# median ignores a few contaminated samples (a door opened, a transient
+# mislabelled established). A half holding fewer than GROUP_MIN_SAMPLES samples
+# fits no line. The envelope ends are the errors at least ENVELOPE_MIN_SAMPLES
+# samples reach, and the line is never evaluated past the upper one: a step
+# rises between the two medians and is flat beyond.
+GROUP_MIN_SAMPLES = 3
+ENVELOPE_MIN_SAMPLES = 2
+# The gain pooled over the speeds of an HVAC mode (see GAIN_PRIOR_SAMPLES) is
+# the weighted median of the pairwise slopes within each speed. Pairs are
+# O(n^2), so at most THEIL_SEN_MAX_POINTS samples per speed, evenly spread in
+# time, enter it, the samples of one error bin (ERROR_BIN_WIDTH wide) weighing
+# at most ERROR_BIN_MAX_SAMPLES together.
 THEIL_SEN_MAX_POINTS = 150
-# A speed that holds the room produces one sample per SAMPLE_INTERVAL_MINUTES,
-# all at the same comfort error and all near 0 degC/h: hours of holding outvoted
-# the few samples taken far from the setpoint, in the median of the pairwise
-# slopes as in the median of the intercepts, and a speed measured at 3 degC/h
-# one degree away was reported at 0. In the estimators of the line, the samples
-# of one error bin (ERROR_BIN_WIDTH wide) therefore weigh at most
-# ERROR_BIN_MAX_SAMPLES together: past that, more of the same error says
-# nothing new about how the slope varies with it. A sparse bin keeps its
-# weight, so a lone contaminated sample still cannot drag the fit.
 ERROR_BIN_WIDTH = 0.25  # degC
 ERROR_BIN_MAX_SAMPLES = float(MIN_MEASURED_PROFILE_SAMPLES)
 # Uncertainty assumed for a profile the user seeded by hand (degC/h): a guess,
@@ -119,7 +127,8 @@ class ProfileFit:
     offset_gain: float = 0.0
     offset_base: float = 0.0
     offset_trend: float = 0.0
-    # Largest comfort error the measurements covered (None: a seed, no envelope).
+    # Largest comfort error the measurements covered, a lone sample aside (see
+    # ENVELOPE_MIN_SAMPLES; None: a seed, no envelope).
     # The line is never evaluated past it: a speed only ever seen near the
     # setpoint says nothing about what it does 1 degC away.
     error_max: float | None = None
@@ -201,26 +210,32 @@ def weighted_median(values: list[float], weights: list[float]) -> float:
     return pairs[-1][0]
 
 
-def weighted_theil_sen(points: list[tuple[float, float, float]]) -> tuple[float, float] | None:
-    """Weighted Theil-Sen fit of y on x over ``(x, y, w)``: (intercept, slope).
+def error_envelope(points: list[tuple[float, float, float]]) -> tuple[float, float]:
+    """Return the ``(low, high)`` errors at least ENVELOPE_MIN_SAMPLES of the ``(x, y, w)`` points reach.
 
-    The slope is the weighted median of the pairwise slopes (pair weight
-    w_i * w_j, pairs with no x spread skipped), the intercept the weighted
-    median of y - slope * x. None when no pair has an x spread.
+    A lone sample taken far from the others does not stretch the envelope: the
+    profile is not measured where a single reading stands.
     """
-    slopes: list[float] = []
-    weights: list[float] = []
-    for index, (x_i, y_i, w_i) in enumerate(points):
-        for x_j, y_j, w_j in points[index + 1 :]:
-            if abs(x_j - x_i) < 1e-6:
-                continue
-            slopes.append((y_j - y_i) / (x_j - x_i))
-            weights.append(w_i * w_j)
-    if not slopes:
+    errors = sorted(x for x, _, _ in points)
+    rank = min(ENVELOPE_MIN_SAMPLES, len(errors)) - 1
+    return errors[rank], errors[-1 - rank]
+
+
+def resistant_line(lower: list[tuple[float, float, float]], upper: list[tuple[float, float, float]]) -> tuple[float, float, float] | None:
+    """Resistant line of y on x over two groups of ``(x, y, w)``: ``(pivot_x, pivot_y, slope)``.
+
+    The line joins the weighted medians of the two groups; the pivot is the
+    lower group's, which the line goes through. None when a group holds fewer
+    than GROUP_MIN_SAMPLES points or the two medians share one x.
+    """
+    if min(len(lower), len(upper)) < GROUP_MIN_SAMPLES:
         return None
-    slope = weighted_median(slopes, weights)
-    intercept = weighted_median([y - slope * x for x, y, _ in points], [w for _, _, w in points])
-    return intercept, slope
+    (x_low, y_low), (x_high, y_high) = [
+        (weighted_median([x for x, _, _ in group], [w for _, _, w in group]), weighted_median([y for _, y, _ in group], [w for _, _, w in group])) for group in (lower, upper)
+    ]
+    if x_high - x_low < 1e-6:
+        return None
+    return x_low, y_low, (y_high - y_low) / (x_high - x_low)
 
 
 def balance_by_error(points: list[tuple[float, float, float]]) -> list[tuple[float, float, float]]:
@@ -648,10 +663,11 @@ class ThermalLearning:
 
             effective_slope(error) = a + b * error
 
-        fitted by weighted least squares over the profile's (error,
-        effective_slope) samples, legacy samples weighing LEGACY_SAMPLE_WEIGHT.
-        ``error`` is the signed comfort error (positive = needs more
-        cooling/heating). ``effective_slope`` is positive when moving towards
+        fitted as a resistant line (see GROUP_MIN_SAMPLES) over the profile's
+        (error, effective_slope) samples, legacy samples weighing
+        LEGACY_SAMPLE_WEIGHT. ``error`` is the comfort error (positive = needs
+        more cooling/heating), floored at 0 as the model is when evaluated: past
+        the setpoint there is no gap. ``effective_slope`` is positive when moving towards
         target (raw VTherm slope is inverted in cooling). When the regulation
         offset varied enough, a shrunk second term models it (see ProfileFit).
 
@@ -663,7 +679,7 @@ class ThermalLearning:
         ``None`` for the constant fallback (no real regression was performed).
 
         Falls back to a constant model ``(median_effective_slope, 0.0, None)`` when
-        the error has no spread. A profile that is not measured yet (see
+        no line can be fitted (no error spread, or a half of the envelope too thin). A profile that is not measured yet (see
         :meth:`has_measured_profile`) but was seeded blends the seeded and
         measured medians.
 
@@ -677,7 +693,7 @@ class ThermalLearning:
         # Only samples that carry a stored error are measurements; the others are
         # synthetic (set_mode_effective_slope) or predate the error column.
         measured = sorted((s for s in matching if is_measurement(s)), key=lambda s: s[0])
-        points = [(s[4], sign * s[2], sample_weight(s)) for s in measured]
+        points = [(max(s[4], 0.0), sign * s[2], sample_weight(s)) for s in measured]
         constants = [sign * s[2] for s in matching if not is_measurement(s)]
         if not self._covers_measured_profile(measured):
             if not constants:
@@ -696,13 +712,15 @@ class ThermalLearning:
             return ProfileFit(median_constant + weight * (median_measured - median_constant), 0.0, None, slope_sigma=SEEDED_SLOPE_SIGMA)
 
         total = sum(w for _, _, w in points)
-        error_max = max(x for x, _, _ in points)
-        # The line's estimators read the points with each error bin capped; the
-        # sample size, the fit quality and the uncertainty keep every sample.
-        balanced = balance_by_error(points)
-        robust = weighted_theil_sen(balance_by_error(thin_evenly(points, THEIL_SEN_MAX_POINTS)))
-        if robust is None:
-            # All samples taken at (nearly) the same error: no slope can be fitted.
+        error_low, error_max = error_envelope(points)
+        split = (error_low + error_max) / 2.0
+        lower = [p for p in points if p[0] <= split]
+        upper = [p for p in points if p[0] > split]
+        line = resistant_line(lower, upper)
+        if line is None:
+            # No line can be fitted: the constant model, at the median slope,
+            # measured as far as the half that holds most of the samples.
+            error_max = max(x for x, _, _ in max(lower, upper, key=len))
             median_y = weighted_median([y for _, y, _ in points], [w for _, _, w in points])
             residuals = [y - median_y for _, y, _ in points]
             n_eff = self._effective_sample_count(measured, residuals, total)
@@ -716,12 +734,14 @@ class ThermalLearning:
             )
             return self._fit_offset_term(constant, measured, sign, hvac_mode)
 
-        intercept_a, gain_b = robust
-        n_eff = self._effective_sample_count(measured, [y - (intercept_a + gain_b * x) for x, y, _ in points], total)
+        pivot_x, pivot_y, gain_b = line
         gain_b = max(0.0, gain_b)
+        n_eff = self._effective_sample_count(measured, [y - (pivot_y + gain_b * (x - pivot_x)) for x, y, _ in points], total)
         pooled = self._pooled_gain(hvac_mode)
         gain_b = (n_eff * gain_b + GAIN_PRIOR_SAMPLES * pooled) / (n_eff + GAIN_PRIOR_SAMPLES)
-        intercept_a = weighted_median([y - gain_b * x for x, y, _ in balanced], [w for _, _, w in balanced])
+        # The shrunk line still goes through the lower half's medians: what the
+        # speed does near the setpoint is the best measured part of the profile.
+        intercept_a = pivot_y - gain_b * pivot_x
 
         # Coefficient of determination against the (clamped, shrunk) fitted line.
         mean_y = sum(w * y for _, y, w in points) / total

@@ -146,19 +146,24 @@ Each profile therefore learns a linear model over its `(comfort_error, effective
 effective_slope(error) = a + b * error      (b clamped to >= 0)
 ```
 
-- **Robust fit**: `b` is the weighted median of the pairwise slopes (Theil–Sen; at most
-  `THEIL_SEN_MAX_POINTS` samples, evenly spread in time), `a` the weighted median of `y − b·x`;
-  legacy samples weigh `LEGACY_SAMPLE_WEIGHT`.
-- **Error bins**: in both medians (and in `b_pool`), the samples of one comfort-error bin
-  (`ERROR_BIN_WIDTH`, 0.25 °C) weigh at most `ERROR_BIN_MAX_SAMPLES` (6) together
-  (`balance_by_error`). A speed that holds the room adds one ~0 °C/h sample per 10 min at the same
-  error; uncapped, 7 h of holding outvoted the samples taken far from the setpoint and a speed
-  measured at 3 °C/h one degree away was reported at 0. `n_eff`, R² and the uncertainty still count
-  every sample.
+- **Resistant line**: the line joins the weighted medians (error and slope) of the samples in the
+  lower and in the upper half of the measured error envelope (`resistant_line`; the envelope ends
+  are the errors at least `ENVELOPE_MIN_SAMPLES` = 2 samples reach, errors floored at 0). `b` is
+  the slope between the two, `a` puts the line through the lower medians. A half with fewer than
+  `GROUP_MIN_SAMPLES` = 3 samples fits no line: the profile is the constant median slope, measured
+  as far as the half holding most of the samples. Legacy samples weigh `LEGACY_SAMPLE_WEIGHT`.
+- **Why not a vote over all the samples**: on a self-regulating unit the slope against the error is
+  closer to a step than to a line (~0 °C/h while the speed holds the room, full capacity a few
+  tenths of a degree away), and a holding speed adds one sample per 10 min. The holding samples are
+  always the majority, so Theil–Sen (until 1.3.1, error bins capped in 1.3.1) reported the holding
+  slope "at 1 °C": 0.12 °C/h for a speed measured at 2–3 °C/h on its 10 samples past 0.5 °C, against
+  125 at the setpoint. Each half of the envelope now speaks for itself whatever its population.
 - **Autocorrelation and shrinkage**: `n_eff = Σw / (1 + 2ρ)`, ρ the lag-1 autocorrelation of the
   residuals within a run of samples; `b ← (n_eff·b + GAIN_PRIOR_SAMPLES·b_pool) / (n_eff +
-  GAIN_PRIOR_SAMPLES)`, `b_pool` the within-speed Theil–Sen gain pooled over the HVAC mode's speeds.
-- **No extrapolation**: the envelope `error_max` is the largest error measured;
+  GAIN_PRIOR_SAMPLES)`, `b_pool` the within-speed pairwise-slope median pooled over the HVAC mode's speeds (at most
+  `THEIL_SEN_MAX_POINTS` samples per speed, each error bin capped by `balance_by_error`).
+- **No extrapolation**: the envelope `error_max` is the largest error at least two samples reached
+  (a lone far reading does not stretch it);
   `get_mode_effective_slope()` reports the line at `reference_error = min(REFERENCE_SLOPE_ERROR,
   error_max)`, and the simulator caps the error at `error_max`. A profile with `error_max <
   REFERENCE_SLOPE_ERROR` is *partial* (`is_profile_partial()`); the multi-rank step-down guard treats
@@ -438,16 +443,22 @@ Ranges over seeds 0–2 (72 h each), the ceilings of `SCENARIO_CEILINGS` sitting
 
 | Scenario | Comfort MAE (°C) | Short (%) | Past (%) |
 |----------|------------------|-----------|----------|
-| heat_defrost | 0.25–0.26 | 20–23 | 6–9 |
+| heat_defrost | 0.23–0.26 | 20–23 | 1–6 |
 | modulating | 0.30–0.31 | 22–23 | 8–10 |
-| noisy | 0.25–0.28 | 19 | 7–13 |
-| noisy_slowdelay | 0.32–0.35 | 20–21 | 25–33 |
-| regime | 0.28–0.29 | 19 | 14–22 |
-| regime_modulating | 0.29–0.30 | 21 | 13–14 |
-| restart | 0.26–0.28 | 19–20 | 11–23 |
+| noisy | 0.27–0.28 | 19 | 12–16 |
+| noisy_slowdelay | 0.31–0.34 | 20–21 | 24–31 |
+| regime | 0.28–0.30 | 19 | 17–34 |
+| regime_modulating | 0.29–0.30 | 21 | 14 |
+| restart | 0.27–0.28 | 19 | 13–20 |
 
 The controller before the ladder envelope scored 0.348 MAE / 41 % past the setpoint on `noisy` seed 2
 and 0.432 / 51 % on `noisy_slowdelay` seed 2, and climbed in 3 % of the random cases of
 `tests/test_robustness.py` past the band. Noise through the real fit is mostly absorbed by the gain
 shrinkage; the worst scenarios remain the slow plant with noisy fits and the restarts, whose
 time past the setpoint varies most with the seed.
+
+The resistant line (1.3.2) is less efficient than Theil–Sen on the evenly sampled, linear profiles
+these scenarios seed: over seeds 0–5 the time past the setpoint went from 19.7 % to 15.6 % on
+`noisy` but from 20.2 % to 24.8 % on `regime` (seeds 0 and 1: 14 → 34 % and 18 → 25 %), the other
+scenarios within ±2 points. The seed moves these figures more than the estimator does (`noisy`
+under 1.3.1: 7–41 % over the six seeds).
