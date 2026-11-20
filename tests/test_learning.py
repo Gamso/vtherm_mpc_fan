@@ -492,3 +492,54 @@ def test_hours_of_holding_do_not_erase_the_capacity_measured_far_from_the_setpoi
     assert learning.get_mode_effective_slope("superhigh", "heat") > 1.5
     # The holding samples still pull the modelled slope down near the setpoint.
     assert learning.get_mode_effective_slope_at("superhigh", "heat", 0.0) < learning.get_mode_effective_slope("superhigh", "heat") - 1.0
+
+
+#: heat/Super High, production 2026-11-17 to 20: {comfort error: [(slope, samples), ...]}, slopes rounded to 0.1.
+SUPER_HIGH_PRODUCTION = {
+    -1.0: [(0.0, 10), (0.1, 1), (0.5, 3)],
+    -0.8: [(0.0, 1), (0.6, 3)],
+    -0.6: [(-0.3, 1)],
+    -0.4: [(-0.6, 2), (0.3, 1), (0.6, 1), (0.7, 1)],
+    -0.2: [(-0.6, 2), (0.0, 3), (0.1, 3), (0.3, 1), (0.8, 2), (1.0, 2), (1.1, 1), (1.2, 1), (1.4, 1)],
+    0.0: [(-0.6, 2), (-0.4, 1), (-0.2, 3), (-0.1, 5), (0.0, 41), (0.1, 2), (0.3, 1), (1.0, 1), (1.4, 1), (1.6, 1)],
+    0.2: [(-0.6, 2), (-0.3, 2), (-0.1, 6), (0.0, 14), (2.4, 1), (2.5, 2)],
+    0.4: [(-0.2, 3), (2.0, 1), (2.3, 1), (3.3, 1), (3.4, 1)],
+    0.6: [(4.0, 1)],
+    0.8: [(4.1, 1)],
+    1.2: [(1.8, 1)],
+}
+
+
+def test_a_few_far_samples_set_the_capacity_against_a_majority_of_holding_ones() -> None:
+    """Ten samples far from the setpoint outweigh 125 holding ones in what the speed does there.
+
+    Under 1.3.1 these production samples (125 within 0.2 degC of the setpoint
+    at ~0 degC/h, 10 past it at 2-4 degC/h) gave 0.12 degC/h, under Medium's
+    0.41: capping each error bin left the holding bins in the majority. The
+    halves of the error envelope are now fitted apart, so their populations no
+    longer matter, and the line stops at the last error two samples reached.
+    """
+    learning = ThermalLearning()
+    for error, slopes in SUPER_HIGH_PRODUCTION.items():
+        for slope, count in slopes:
+            for _ in range(count):
+                learning.add_slope_sample("Super High", slope, error, hvac_mode="heat")
+
+    fit = learning.get_mode_fit("Super High", "heat")
+    assert 2.0 < learning.get_mode_effective_slope("Super High", "heat") < 4.1
+    assert fit.error_max == pytest.approx(0.8)
+    assert learning.get_mode_effective_slope_at("Super High", "heat", 0.0) == pytest.approx(0.0, abs=0.1)
+
+
+def test_a_speed_only_seen_holding_stays_a_constant_profile() -> None:
+    """With fewer than three samples in the upper half of the envelope, no gain is read..."""
+    learning = ThermalLearning()
+    for error, slope, count in [(0.0, 0.0, 40), (0.2, -0.05, 1), (0.4, 3.4, 1)]:
+        for _ in range(count):
+            learning.add_slope_sample("High", slope, error, hvac_mode="heat")
+
+    fit = learning.get_mode_fit("High", "heat")
+    assert fit.gain == 0.0
+    assert fit.intercept == pytest.approx(0.0, abs=0.01)
+    # ...and the profile is not reported as measured where two readings stand.
+    assert fit.error_max == 0.0
