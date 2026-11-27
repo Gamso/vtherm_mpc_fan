@@ -1169,6 +1169,44 @@ def test_gap_model_does_not_plunge_past_target() -> None:
     assert result["mpc_predicted_temperature_30m"] >= 23.7
 
 
+def _run_saturated_boost(vtherm_slope: float) -> MPCController:
+    """Run three cycles of the strongest speed far short of a heat setpoint, the room rising at *vtherm_slope*."""
+    learning = ThermalLearning()
+    _prime_learning_profiles(learning)
+    mpc = _build_mpc(learning)
+    for step, temp in enumerate((19.0, 19.2, 19.4)):
+        mpc.evaluate(
+            current_temp=temp,
+            target_temp=20.0,
+            vtherm_slope=vtherm_slope,
+            hvac_mode="heat",
+            current_fan="high",
+            minutes_since_change=30.0 + 5.0 * step,
+            now=1_000_000.0 + 300.0 * step,
+        )
+    return mpc
+
+
+def test_a_boost_on_the_saturated_strongest_speed_is_not_learned_as_an_external_gain() -> None:
+    """The room rising faster than the strongest speed's profile during a boost leaves the bias at 0.
+
+    Production, 2026-11-23 to 27: after each heat boost the bias reached +0.7 to
+    +1.25 degC/h, was added to every candidate, and the controller stepped down
+    from Super High 0.2 degC short of the setpoint, predicting 20.4-20.8 degC
+    at 30 minutes; the room fell back to 19.6 within five.
+    """
+    mpc = _run_saturated_boost(vtherm_slope=3.0)  # profile: 1.5 degC/h
+
+    assert mpc.disturbance_bias == pytest.approx(0.0, abs=1e-9)
+
+
+def test_a_load_the_saturated_strongest_speed_cannot_beat_is_still_learned() -> None:
+    """While saturated, the room rising slower than the profile still lowers the bias."""
+    mpc = _run_saturated_boost(vtherm_slope=0.5)  # profile: 1.5 degC/h
+
+    assert mpc.disturbance_bias < -0.3
+
+
 def test_gap_aware_disturbance_bias_stays_small_without_disturbance() -> None:
     """When the observed slope matches the gap model at the current error, bias stays ~0."""
     learning = ThermalLearning()
