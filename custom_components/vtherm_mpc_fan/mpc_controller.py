@@ -888,6 +888,7 @@ class MPCController:
             is_window_open=is_window_open,
             is_defrost_active=is_defrost_active,
             is_hvac_idle=is_hvac_idle,
+            saturated=active_fan == fan_modes[-1] and current_error > self._deadband - 0.5 * self.sensor_resolution,
         )
         return _Cycle(
             current_temp=current_temp,
@@ -1702,8 +1703,24 @@ class MPCController:
         is_window_open: bool,
         is_defrost_active: bool = False,
         is_hvac_idle: bool = False,
+        saturated: bool = False,
     ) -> None:
-        """Track slow external disturbances such as solar gains or occupancy."""
+        """Track slow external disturbances such as solar gains or occupancy.
+
+        While *saturated* -- the strongest speed running short of the setpoint,
+        outside the band or on its edge reading, i.e. a boost -- a positive
+        residual counts as 0. The room then rises on the unit's full output at
+        errors where the profile mostly holds samples taken while the speed was
+        holding the room (~0 degC/h): the residual measures that, not an
+        external gain. Learned, it was added to every candidate, and the first
+        weaker speed looked able to finish the climb (heat/High predicted at
+        +1.1 degC/h for +0.27): the controller stepped down 0.2 degC short and
+        the room fell back, evening after evening. A negative residual is
+        learned as usual: a load the strongest speed cannot beat is a real
+        disturbance, and it is what keeps a weaker speed from being chosen too
+        early (freezing the bias outright left the room short longer under a
+        heavy load).
+        """
         if is_window_open or is_defrost_active or is_hvac_idle:
             self._disturbance_bias *= DISTURBANCE_DECAY
             if is_window_open:
@@ -1730,6 +1747,8 @@ class MPCController:
             return
 
         residual = observed_effective_slope - expected_effective_slope
+        if saturated:
+            residual = min(residual, 0.0)
         updated = ((1 - DISTURBANCE_EMA_ALPHA) * self._disturbance_bias) + (DISTURBANCE_EMA_ALPHA * residual)
         self._disturbance_bias = max(-MAX_DISTURBANCE_BIAS, min(MAX_DISTURBANCE_BIAS, updated))
         _LOGGER.debug(

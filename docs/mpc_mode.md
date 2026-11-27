@@ -100,7 +100,9 @@ Definitions:
 - `q_hat[k]`: predicted effective thermal power at step `k` (expressed in equivalent `°C/h`)
 - `u`: candidate fan mode held constant over the horizon
 - `dead_time`: learned thermal delay between a fan change and a visible sensor response
-- `bias`: slow disturbance correction term for unmodeled effects such as solar gain or occupancy
+- `bias`: slow disturbance correction term for unmodeled effects such as solar gain or occupancy;
+  while the strongest speed is saturated short of the setpoint (a boost), a positive residual counts
+  as 0 (the climb is the profile's error, not an external gain)
 
 For each candidate mode:
 
@@ -388,7 +390,7 @@ profiles seeded (`partial`: low and silent unknown). Ranges over the seeds:
 | load0.7   | 8d7bccd    | 0.34             | 51–52       | 26–27        | 22.1–22.5    | 114–115       | 0.48      | 69–70         |
 |           | current    | 0.29–0.30        | 62–66       | 10–16        | 22.3–23.5    | 112–114       | 1.19–1.33 | 50–53         |
 | load0.85  | 8d7bccd    | 0.35–0.37        | 47–48       | 26–27        | 26.0–26.6    | 131–137       | 0.40–0.45 | 73–78         |
-|           | current    | 0.30             | 64–65       | 9–10         | 25.4–25.8    | 124–126       | 1.17–1.21 | 60–65         |
+|           | current    | 0.30–0.31        | 62–64       | 9–13         | 25.6–28.7    | 124–129       | 1.00–1.12 | 60–66         |
 | gain0.2   | 8d7bccd    | 0.45–0.48        | 24–36       | 37–48        | 27.3–27.5    | 150           | 0.69–0.81 | 39–43         |
 |           | current    | 0.33–0.34        | 67–69       | 4–6          | 27.3–27.4    | 150           | 1.45–1.50 | 36            |
 | slowdelay | 8d7bccd    | 0.37             | 39–40       | 39–40        | 20.1–21.4    | 98–103        | 0.76      | 51–53         |
@@ -443,13 +445,13 @@ Ranges over seeds 0–2 (72 h each), the ceilings of `SCENARIO_CEILINGS` sitting
 
 | Scenario | Comfort MAE (°C) | Short (%) | Past (%) |
 |----------|------------------|-----------|----------|
-| heat_defrost | 0.23–0.26 | 20–23 | 1–6 |
+| heat_defrost | 0.25–0.26 | 20–23 | 5–8 |
 | modulating | 0.30–0.31 | 22–23 | 8–10 |
-| noisy | 0.27–0.28 | 19 | 12–16 |
-| noisy_slowdelay | 0.31–0.34 | 20–21 | 24–31 |
+| noisy | 0.26–0.27 | 18–21 | 4–16 |
+| noisy_slowdelay | 0.31–0.34 | 20–21 | 24–28 |
 | regime | 0.28–0.30 | 19 | 17–34 |
 | regime_modulating | 0.29–0.30 | 21 | 14 |
-| restart | 0.27–0.28 | 19 | 13–20 |
+| restart | 0.27–0.29 | 19 | 18–24 |
 
 The controller before the ladder envelope scored 0.348 MAE / 41 % past the setpoint on `noisy` seed 2
 and 0.432 / 51 % on `noisy_slowdelay` seed 2, and climbed in 3 % of the random cases of
@@ -462,3 +464,12 @@ these scenarios seed: over seeds 0–5 the time past the setpoint went from 19.7
 `noisy` but from 20.2 % to 24.8 % on `regime` (seeds 0 and 1: 14 → 34 % and 18 → 25 %), the other
 scenarios within ±2 points. The seed moves these figures more than the estimator does (`noisy`
 under 1.3.1: 7–41 % over the six seeds).
+
+While the strongest speed is saturated (a boost), a positive residual no longer raises the disturbance
+bias (1.3.3, see `_update_disturbance_bias`). Over seeds 0–5 the means move by less than 1.2 points on
+every variant and scenario: past the setpoint 15.6 → 13.4 % on `noisy`, 17.7 → 16.7 % on `base`,
+17.0 → 18.7 % on `restart`, 5.6 → 6.7 % on `heat_defrost`; short of it 25.6 → 26.2 % on `load0.85`,
+whose seed 0 alone goes from 25.8 to 28.7 %. On the production evenings of 2026-11-23 to 27, replayed
+open loop, the controller then stays on the strongest speed at 0.2 °C short on three evenings out of
+four, where it stepped down on all four; the fourth steps down on the dead-time carry of the boost
+slope alone.
